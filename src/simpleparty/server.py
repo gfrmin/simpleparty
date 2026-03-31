@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SimpleParty - Video directory browser with shuffle and fscrypt support."""
+"""SimpleParty - Easily enjoy your private video collection."""
 
 import argparse
 import json
@@ -7,7 +7,9 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import urllib.parse
+from functools import partial
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -18,8 +20,13 @@ VIDEO_EXTENSIONS = frozenset({
 
 BROWSER_NATIVE = frozenset({'.mp4', '.webm', '.ogv', '.m4v'})
 
-HAS_FFMPEG = shutil.which('ffmpeg') is not None
-HAS_VLC = shutil.which('cvlc') is not None
+# Set in main() based on CLI flags and system availability
+_config = {
+    'has_ffmpeg': False,
+    'has_vlc': False,
+    'allow_delete': True,
+    'allow_transcode': True,
+}
 
 MIME_TYPES = {
     '.mp4': 'video/mp4',
@@ -239,6 +246,9 @@ def serve_lock(handler, root):
 
 
 def serve_delete(handler, root):
+    if not _config['allow_delete']:
+        send_json(handler, {'ok': False, 'error': 'Delete disabled'}, 403)
+        return
     body = read_json_body(handler)
     rel_path = body.get('path', '')
     resolved = safe_resolve(root, rel_path)
@@ -266,7 +276,7 @@ def serve_video(handler, root):
         return
 
     # Transcode non-browser-native formats if possible
-    if _needs_transcode(resolved) and (HAS_FFMPEG or HAS_VLC):
+    if _config['allow_transcode'] and _needs_transcode(resolved) and (_config['has_ffmpeg'] or _config['has_vlc']):
         _serve_transcoded(handler, resolved)
         return
 
@@ -306,7 +316,7 @@ def serve_video(handler, root):
 
 
 def _serve_transcoded(handler, path):
-    if HAS_FFMPEG:
+    if _config['has_ffmpeg']:
         cmd = [
             'ffmpeg', '-i', str(path), '-c:v', 'copy', '-c:a', 'aac',
             '-movflags', 'frag_keyframe+empty_moov',
@@ -921,21 +931,47 @@ navigateTo(decodeURIComponent(window.location.hash.slice(1)) || '');
 # --- Main ---
 
 def main():
-    parser = argparse.ArgumentParser(description='SimpleParty - Video directory browser')
+    parser = argparse.ArgumentParser(
+        description='SimpleParty - Easily enjoy your private video collection',
+    )
     parser.add_argument('root', help='Root directory to serve')
     parser.add_argument('-p', '--port', type=int, default=1312, help='Port (default: 1312)')
+    parser.add_argument('-b', '--bind', default='0.0.0.0', help='Bind address (default: 0.0.0.0)')
+    parser.add_argument('--no-delete', action='store_true', help='Disable video deletion')
+    parser.add_argument('--no-transcode', action='store_true', help='Disable ffmpeg/VLC transcoding')
     args = parser.parse_args()
 
     root = str(Path(args.root).resolve())
     if not Path(root).is_dir():
-        print(f'Error: {root} is not a directory', file=__import__('sys').stderr)
+        print(f'Error: {root} is not a directory', file=sys.stderr)
         raise SystemExit(1)
 
-    from functools import partial
+    # Configure runtime settings
+    _config['has_ffmpeg'] = shutil.which('ffmpeg') is not None
+    _config['has_vlc'] = shutil.which('cvlc') is not None
+    _config['allow_delete'] = not args.no_delete
+    _config['allow_transcode'] = not args.no_transcode
+
     handler = partial(RequestHandler, root)
-    server = ThreadedServer(('0.0.0.0', args.port), handler)
-    transcoder = 'ffmpeg' if HAS_FFMPEG else 'cvlc' if HAS_VLC else 'none'
-    print(f'SimpleParty serving {root} on http://0.0.0.0:{args.port} (transcoder: {transcoder})')
+    server = ThreadedServer((args.bind, args.port), handler)
+
+    features = []
+    if _config['allow_transcode']:
+        if _config['has_ffmpeg']:
+            features.append('transcode: ffmpeg')
+        elif _config['has_vlc']:
+            features.append('transcode: vlc')
+    if _config['allow_delete']:
+        features.append('delete: on')
+    if shutil.which('fscrypt'):
+        features.append('fscrypt: on')
+
+    url = f'http://{args.bind}:{args.port}'
+    print(f'SimpleParty serving {root}')
+    print(f'  {url}')
+    if features:
+        print(f'  [{", ".join(features)}]')
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
