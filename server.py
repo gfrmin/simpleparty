@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -14,6 +15,11 @@ from socketserver import ThreadingMixIn
 VIDEO_EXTENSIONS = frozenset({
     '.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4v', '.ogv',
 })
+
+BROWSER_NATIVE = frozenset({'.mp4', '.webm', '.ogv', '.m4v'})
+
+HAS_FFMPEG = shutil.which('ffmpeg') is not None
+HAS_VLC = shutil.which('cvlc') is not None
 
 MIME_TYPES = {
     '.mp4': 'video/mp4',
@@ -232,6 +238,24 @@ def serve_lock(handler, root):
     send_json(handler, {'ok': ok, 'error': msg if not ok else None})
 
 
+def serve_delete(handler, root):
+    body = read_json_body(handler)
+    rel_path = body.get('path', '')
+    resolved = safe_resolve(root, rel_path)
+    if resolved is None or not resolved.is_file() or not is_video(resolved.name):
+        send_json(handler, {'ok': False, 'error': 'Invalid video path'}, 400)
+        return
+    try:
+        os.remove(resolved)
+        send_json(handler, {'ok': True})
+    except OSError as e:
+        send_json(handler, {'ok': False, 'error': str(e)}, 500)
+
+
+def _needs_transcode(path):
+    return path.suffix.lower() not in BROWSER_NATIVE
+
+
 def serve_video(handler, root):
     parsed = urllib.parse.urlparse(handler.path)
     rel_path = urllib.parse.unquote(parsed.path[len('/video/'):])
@@ -239,6 +263,11 @@ def serve_video(handler, root):
 
     if resolved is None or not resolved.is_file():
         handler.send_error(404)
+        return
+
+    # Transcode non-browser-native formats if possible
+    if _needs_transcode(resolved) and (HAS_FFMPEG or HAS_VLC):
+        _serve_transcoded(handler, resolved)
         return
 
     file_size = resolved.stat().st_size
@@ -274,6 +303,46 @@ def serve_video(handler, root):
     handler.end_headers()
     if handler.command != 'HEAD':
         _stream_file(handler, resolved)
+
+
+def _serve_transcoded(handler, path):
+    if HAS_FFMPEG:
+        cmd = [
+            'ffmpeg', '-i', str(path), '-c:v', 'copy', '-c:a', 'aac',
+            '-movflags', 'frag_keyframe+empty_moov',
+            '-f', 'mp4', '-loglevel', 'error', 'pipe:1',
+        ]
+    else:
+        cmd = [
+            'cvlc', str(path),
+            '--sout', '#transcode{acodec=mpga}:std{access=file,mux=mp4,dst=-}',
+            'vlc://quit', '--no-repeat', '--no-loop',
+        ]
+
+    handler.send_response(200)
+    handler.send_header('Content-Type', 'video/mp4')
+    handler.send_header('Transfer-Encoding', 'chunked')
+    handler.end_headers()
+
+    if handler.command == 'HEAD':
+        return
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        while True:
+            chunk = proc.stdout.read(65536)
+            if not chunk:
+                break
+            handler.wfile.write(f'{len(chunk):x}\r\n'.encode())
+            handler.wfile.write(chunk)
+            handler.wfile.write(b'\r\n')
+        handler.wfile.write(b'0\r\n\r\n')
+        proc.wait()
+    except BrokenPipeError:
+        proc.kill()
+    except Exception:
+        if proc.poll() is None:
+            proc.kill()
 
 
 def _stream_range(handler, path, start, length):
@@ -332,6 +401,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             serve_unlock(self, self.root)
         elif path == '/api/lock':
             serve_lock(self, self.root)
+        elif path == '/api/delete':
+            serve_delete(self, self.root)
         else:
             self.send_error(404)
 
@@ -363,12 +434,13 @@ SPA_HTML = """<!DOCTYPE html>
 html{height:100%}
 body{
   font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
-  background:#0f0f1a;color:#e2e8f0;min-height:100%;overflow-x:hidden;
+  background:#0f0f1a;color:#e2e8f0;min-height:100%;overflow-x:hidden;max-width:100vw;
 }
 nav{
   position:sticky;top:0;background:#1a1a2e;padding:12px 16px;
   display:flex;align-items:center;gap:4px;
   border-bottom:1px solid #2d2d44;z-index:10;flex-wrap:wrap;min-height:48px;
+  overflow:hidden;max-width:100vw;
 }
 .crumb{
   color:#94a3b8;cursor:pointer;padding:4px 6px;border-radius:4px;
@@ -407,7 +479,7 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .item{
   display:flex;align-items:center;gap:10px;padding:12px 14px;
   background:#16213e;border-radius:8px;cursor:pointer;min-height:48px;
-  transition:background .15s;border:2px solid transparent;
+  transition:background .15s;border:2px solid transparent;min-width:0;overflow:hidden;
 }
 .item:hover{background:#1e3054}
 .item.playing{border-color:#7c3aed}
@@ -415,6 +487,7 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .item-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;flex:1}
 .item-size{color:#64748b;font-size:12px;flex-shrink:0}
 .empty{grid-column:1/-1;color:#64748b;text-align:center;padding:40px 20px;font-size:15px}
+.action-bar{grid-column:1/-1;display:flex;gap:8px;padding-bottom:4px}
 
 .modal{
   display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);
@@ -464,6 +537,7 @@ kbd{
     <span id="now-playing"></span>
     <button class="btn" id="next-btn" title="Next (n)">Next &#9654;</button>
     <button class="btn" id="shuffle-btn" title="Shuffle (s)">&#8645; Shuffle</button>
+    <button class="btn btn-lock" id="delete-btn" title="Delete (d)">&#128465;</button>
   </div>
 </div>
 <div id="file-list"></div>
@@ -611,6 +685,51 @@ function toggleShuffle() {
   }
 }
 
+function shufflePlay() {
+  if (!state.videos.length) return;
+  const playlist = fisherYates(state.videos.map((_, i) => i));
+  const idx = playlist[0];
+  update({ shuffled: true, playlist, playlistPos: 0, currentVideo: idx });
+  video.src = videoUrl(state.videos[idx].path);
+  video.play();
+  $('player-area').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+async function doDelete() {
+  if (state.currentVideo < 0) return;
+  const v = state.videos[state.currentVideo];
+  if (!confirm('Delete ' + v.name + '?')) return;
+  try {
+    const resp = await fetch('/api/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: v.path }),
+    });
+    const data = await resp.json();
+    if (!data.ok) return;
+
+    video.pause();
+    video.removeAttribute('src');
+
+    const removedIdx = state.currentVideo;
+    const videos = state.videos.filter((_, i) => i !== removedIdx);
+    const playlist = state.playlist
+      .filter(i => i !== removedIdx)
+      .map(i => i > removedIdx ? i - 1 : i);
+
+    if (!videos.length) {
+      update({ videos, playlist, playlistPos: -1, currentVideo: -1, shuffled: false });
+      return;
+    }
+
+    const pos = Math.min(state.playlistPos, playlist.length - 1);
+    const newIdx = playlist[pos];
+    update({ videos, playlist, playlistPos: pos, currentVideo: newIdx });
+    video.src = videoUrl(videos[newIdx].path);
+    video.play();
+  } catch (e) {}
+}
+
 // --- fscrypt ---
 
 async function doUnlock() {
@@ -641,16 +760,23 @@ async function doUnlock() {
 async function doLock(path) {
   if (!confirm('Lock this directory?')) return;
   try {
-    await fetch('/api/lock', {
+    const resp = await fetch('/api/lock', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path }),
     });
+    const data = await resp.json();
+    if (!data.ok) {
+      alert('Lock failed: ' + (data.error || 'unknown error'));
+      return;
+    }
     video.pause();
     video.removeAttribute('src');
     const parent = path.includes('/') ? path.substring(0, path.lastIndexOf('/')) : '';
     navigateTo(parent);
-  } catch (e) {}
+  } catch (e) {
+    alert('Lock failed: network error');
+  }
 }
 
 function goBack() {
@@ -703,6 +829,12 @@ function renderList() {
   const list = $('file-list');
   let html = '';
 
+  if (state.videos.length) {
+    html += '<div class="action-bar">'
+      + '<button class="btn" id="shuffle-play-btn" title="Shuffle Play">&#8645; Shuffle Play</button>'
+      + '</div>';
+  }
+
   for (const dir of state.dirs) {
     const icon = dir.encrypted ? (dir.unlocked ? '&#128275;' : '&#128274;') : '&#128193;';
     html += '<div class="item" data-nav="' + esc(dir.path) + '">'
@@ -743,6 +875,7 @@ function renderModal() {
 // --- Events ---
 
 document.addEventListener('click', e => {
+  if (e.target.closest('#shuffle-play-btn')) { shufflePlay(); return; }
   const nav = e.target.closest('[data-nav]');
   if (nav) { navigateTo(nav.dataset.nav); return; }
   const vid = e.target.closest('[data-video]');
@@ -754,6 +887,7 @@ document.addEventListener('click', e => {
 $('prev-btn').addEventListener('click', prevVideo);
 $('next-btn').addEventListener('click', nextVideo);
 $('shuffle-btn').addEventListener('click', toggleShuffle);
+$('delete-btn').addEventListener('click', doDelete);
 $('modal-submit').addEventListener('click', doUnlock);
 $('modal-cancel').addEventListener('click', () => update({ modalPath: null, modalError: null, pendingPath: null }));
 $('modal-pass').addEventListener('keydown', e => { if (e.key === 'Enter') doUnlock(); });
@@ -763,7 +897,7 @@ video.addEventListener('ended', nextVideo);
 const shortcuts = {
   'n': nextVideo, 'ArrowRight': nextVideo,
   'p': prevVideo, 'ArrowLeft': prevVideo,
-  's': toggleShuffle,
+  's': toggleShuffle, 'd': doDelete,
   'f': () => { if (video.src) { document.fullscreenElement ? document.exitFullscreen() : video.requestFullscreen(); } },
   ' ': () => { if (video.src) { video.paused ? video.play() : video.pause(); } },
   'm': () => { if (video.src) video.muted = !video.muted; },
@@ -800,7 +934,8 @@ def main():
     from functools import partial
     handler = partial(RequestHandler, root)
     server = ThreadedServer(('0.0.0.0', args.port), handler)
-    print(f'SimpleParty serving {root} on http://0.0.0.0:{args.port}')
+    transcoder = 'ffmpeg' if HAS_FFMPEG else 'cvlc' if HAS_VLC else 'none'
+    print(f'SimpleParty serving {root} on http://0.0.0.0:{args.port} (transcoder: {transcoder})')
     try:
         server.serve_forever()
     except KeyboardInterrupt:
