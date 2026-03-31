@@ -30,12 +30,18 @@ uvx simpleparty /path/to/videos
 simpleparty /path/to/videos
 ```
 
+With no arguments, serves the current directory:
+
+```sh
+cd ~/Videos && simpleparty
+```
+
 Then open http://localhost:1312 in your browser (or use your machine's hostname/IP from another device).
 
 ### Options
 
 ```
-simpleparty /path/to/videos [options]
+simpleparty [/path/to/videos] [options]
 
   -p, --port PORT       Port to listen on (default: 1312)
   -b, --bind ADDR       Bind address (default: 0.0.0.0)

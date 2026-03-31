@@ -934,7 +934,7 @@ def main():
     parser = argparse.ArgumentParser(
         description='SimpleParty - Easily enjoy your private video collection',
     )
-    parser.add_argument('root', help='Root directory to serve')
+    parser.add_argument('root', nargs='?', default='.', help='Root directory to serve (default: current directory)')
     parser.add_argument('-p', '--port', type=int, default=1312, help='Port (default: 1312)')
     parser.add_argument('-b', '--bind', default='0.0.0.0', help='Bind address (default: 0.0.0.0)')
     parser.add_argument('--no-delete', action='store_true', help='Disable video deletion')
