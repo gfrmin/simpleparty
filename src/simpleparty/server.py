@@ -500,8 +500,41 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
 
 # --- Video serving ---
 
+def _is_mpegts(path):
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(377)
+        return len(header) >= 377 and header[0] == 0x47 and header[188] == 0x47 and header[376] == 0x47
+    except OSError:
+        return False
+
+
 def _needs_transcode(path):
-    return path.suffix.lower() not in BROWSER_NATIVE
+    if path.suffix.lower() not in BROWSER_NATIVE:
+        return True
+    return path.suffix.lower() == '.mp4' and _is_mpegts(path)
+
+
+def _remux_mpegts(path):
+    tmp = path.with_suffix('.tmp.mp4')
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-fflags', '+genpts', '-i', str(path),
+             '-c', 'copy', '-bsf:a', 'aac_adtstoasc',
+             '-f', 'mp4', '-loglevel', 'error', '-y', str(tmp)],
+            capture_output=True, timeout=300,
+        )
+        if result.returncode == 0:
+            os.replace(str(tmp), str(path))
+            return True
+        return False
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _serve_transcoded(handler, path):
@@ -664,8 +697,11 @@ def handle_video(handler, root):
         return
 
     if _config['allow_transcode'] and _needs_transcode(resolved) and (_config['has_ffmpeg'] or _config['has_vlc']):
-        _serve_transcoded(handler, resolved)
-        return
+        if _is_mpegts(resolved) and _config['has_ffmpeg'] and _remux_mpegts(resolved):
+            pass  # file is now a proper MP4, fall through to normal serving
+        else:
+            _serve_transcoded(handler, resolved)
+            return
 
     file_size = resolved.stat().st_size
     content_type = MIME_TYPES.get(resolved.suffix.lower(), 'application/octet-stream')
@@ -752,6 +788,8 @@ def handle_lock(handler, root):
 # --- Server ---
 
 class RequestHandler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
     def __init__(self, root, *args, **kwargs):
         self.root = root
         super().__init__(*args, **kwargs)
