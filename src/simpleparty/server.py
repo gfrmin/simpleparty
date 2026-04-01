@@ -4,12 +4,14 @@
 import argparse
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
 import urllib.parse
 from functools import partial
+from html import escape as esc
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -20,7 +22,6 @@ VIDEO_EXTENSIONS = frozenset({
 
 BROWSER_NATIVE = frozenset({'.mp4', '.webm', '.ogv', '.m4v'})
 
-# Set in main() based on CLI flags and system availability
 _config = {
     'has_ffmpeg': False,
     'has_vlc': False,
@@ -39,26 +40,22 @@ MIME_TYPES = {
 }
 
 
-# --- Pure functions: filesystem ---
+# --- Filesystem ---
 
 def is_video(name):
     return Path(name).suffix.lower() in VIDEO_EXTENSIONS
 
 
-def safe_resolve(root, relative):
-    root_resolved = Path(root).resolve()
-    resolved = (root_resolved / relative).resolve()
-    root_str = str(root_resolved)
-    resolved_str = str(resolved)
-    if resolved_str != root_str and not resolved_str.startswith(root_str + os.sep):
-        return None
-    return resolved
+def resolve_path(root, relative):
+    """Resolve a path relative to root, following symlinks."""
+    if not relative:
+        return Path(root).resolve()
+    return (Path(root) / relative).resolve()
 
 
 def list_directory(root, rel_path):
-    resolved = safe_resolve(root, rel_path)
-    if resolved is None:
-        return {'error': 'Invalid path'}
+    """List directory contents. Returns dict with dirs, videos, or error/locked."""
+    resolved = resolve_path(root, rel_path)
 
     if not resolved.exists():
         locked = find_locked_ancestor(root, rel_path)
@@ -80,17 +77,16 @@ def list_directory(root, rel_path):
 
     encrypted_root = find_encrypted_ancestor(root, rel_path)
 
-    dirs = []
-    videos = []
+    dirs, videos = [], []
     for name in entries:
         if name.startswith('.'):
             continue
         full = resolved / name
+        child_path = os.path.join(rel_path, name) if rel_path else name
         if full.is_dir():
             dir_status = get_fscrypt_status(full)
             dirs.append({
-                'name': name,
-                'path': os.path.join(rel_path, name) if rel_path else name,
+                'name': name, 'path': child_path,
                 'encrypted': dir_status['encrypted'],
                 'unlocked': dir_status['unlocked'],
             })
@@ -99,21 +95,15 @@ def list_directory(root, rel_path):
                 size = full.stat().st_size
             except OSError:
                 size = 0
-            videos.append({
-                'name': name,
-                'path': os.path.join(rel_path, name) if rel_path else name,
-                'size': size,
-            })
+            videos.append({'name': name, 'path': child_path, 'size': size})
 
     return {
-        'path': rel_path,
-        'dirs': dirs,
-        'videos': videos,
+        'path': rel_path, 'dirs': dirs, 'videos': videos,
         'encryptedDir': encrypted_root,
     }
 
 
-# --- Pure functions: fscrypt ---
+# --- fscrypt ---
 
 def get_fscrypt_status(dir_path):
     try:
@@ -145,7 +135,7 @@ def fscrypt_unlock(dir_path, passphrase):
         )
         return proc.returncode == 0, (stdout.decode() + stderr.decode()).strip()
     except subprocess.TimeoutExpired:
-        proc.kill()  # noqa: F821 - proc is always bound when TimeoutExpired fires
+        proc.kill()
         return False, 'Timed out'
     except FileNotFoundError:
         return False, 'fscrypt not found'
@@ -194,125 +184,324 @@ def find_locked_ancestor(root, rel_path):
     return None
 
 
-# --- HTTP helpers ---
+# --- URL + format helpers ---
 
-def send_json(handler, data, status=200):
-    body = json.dumps(data).encode('utf-8')
-    handler.send_response(status)
-    handler.send_header('Content-Type', 'application/json')
-    handler.send_header('Content-Length', str(len(body)))
-    handler.end_headers()
-    handler.wfile.write(body)
+def parse_query(url):
+    params = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    return {k: v[0] for k, v in params.items()}
 
 
-def read_json_body(handler):
-    length = int(handler.headers.get('Content-Length', 0))
-    return json.loads(handler.rfile.read(length))
+def url_for_browse(path=''):
+    return '/' if not path else '/browse?' + urllib.parse.urlencode({'path': path})
 
 
-# --- Route handlers ---
-
-def serve_browse(handler, root):
-    parsed = urllib.parse.urlparse(handler.path)
-    params = urllib.parse.parse_qs(parsed.query)
-    rel_path = params.get('path', [''])[0]
-    result = list_directory(root, rel_path)
-    status = 403 if result.get('locked') else 400 if 'error' in result else 200
-    send_json(handler, result, status)
-
-
-def serve_unlock(handler, root):
-    body = read_json_body(handler)
-    rel_path = body.get('path', '')
-    passphrase = body.get('passphrase', '')
-    resolved = safe_resolve(root, rel_path)
-    if resolved is None:
-        send_json(handler, {'ok': False, 'error': 'Invalid path'}, 400)
-        return
-    ok, msg = fscrypt_unlock(resolved, passphrase)
-    del passphrase, body
-    send_json(handler, {'ok': ok, 'error': msg if not ok else None})
+def url_for_play(dir_path, idx, shuffle=False, seed=None, pos=None):
+    params = {'path': dir_path, 'idx': str(idx)}
+    if shuffle:
+        params['shuffle'] = '1'
+        if seed is not None:
+            params['seed'] = str(seed)
+        if pos is not None:
+            params['pos'] = str(pos)
+    return '/play?' + urllib.parse.urlencode(params)
 
 
-def serve_lock(handler, root):
-    body = read_json_body(handler)
-    rel_path = body.get('path', '')
-    resolved = safe_resolve(root, rel_path)
-    if resolved is None:
-        send_json(handler, {'ok': False, 'error': 'Invalid path'}, 400)
-        return
-    ok, msg = fscrypt_lock(resolved)
-    send_json(handler, {'ok': ok, 'error': msg if not ok else None})
+def url_for_video(path):
+    return '/video/' + '/'.join(urllib.parse.quote(p, safe='') for p in path.split('/'))
 
 
-def serve_delete(handler, root):
-    if not _config['allow_delete']:
-        send_json(handler, {'ok': False, 'error': 'Delete disabled'}, 403)
-        return
-    body = read_json_body(handler)
-    rel_path = body.get('path', '')
-    resolved = safe_resolve(root, rel_path)
-    if resolved is None or not resolved.is_file() or not is_video(resolved.name):
-        send_json(handler, {'ok': False, 'error': 'Invalid video path'}, 400)
-        return
+def fmt_size(b):
+    if b < 1024:
+        return f'{b} B'
+    if b < 1048576:
+        return f'{b / 1024:.1f} KB'
+    if b < 1073741824:
+        return f'{b / 1048576:.1f} MB'
+    return f'{b / 1073741824:.1f} GB'
+
+
+def shuffle_indices(n, seed):
+    rng = random.Random(seed)
+    indices = list(range(n))
+    rng.shuffle(indices)
+    return indices
+
+
+def safe_int(s, default=0):
     try:
-        os.remove(resolved)
-        send_json(handler, {'ok': True})
-    except OSError as e:
-        send_json(handler, {'ok': False, 'error': str(e)}, 500)
+        return int(s)
+    except (ValueError, TypeError):
+        return default
 
+
+# --- HTML rendering ---
+
+CSS = """\
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{height:100%}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+  background:#0f0f1a;color:#e2e8f0;min-height:100%;overflow-x:hidden;max-width:100vw;
+}
+a{color:inherit;text-decoration:none}
+nav{
+  position:sticky;top:0;background:#1a1a2e;padding:12px 16px;
+  display:flex;align-items:center;gap:4px;
+  border-bottom:1px solid #2d2d44;z-index:10;flex-wrap:wrap;min-height:48px;
+  overflow:hidden;max-width:100vw;
+}
+.crumb{
+  color:#94a3b8;padding:4px 6px;border-radius:4px;
+  font-size:15px;white-space:nowrap;
+}
+.crumb:hover{color:#c4b5fd;background:rgba(167,139,250,0.1)}
+.crumb-sep{color:#4a4a6a;padding:0 2px;user-select:none}
+.nav-spacer{flex:1}
+.btn{
+  background:#16213e;color:#e2e8f0;border:1px solid #2d2d44;
+  padding:8px 14px;border-radius:6px;cursor:pointer;font-size:14px;
+  min-height:40px;white-space:nowrap;transition:all .15s;
+  display:inline-flex;align-items:center;
+}
+.btn:hover{background:#1e3054;border-color:#a78bfa}
+.btn.active{background:#7c3aed;color:#fff;border-color:#7c3aed}
+.btn-lock{border-color:#991b1b}
+.btn-lock:hover{background:#7f1d1d;border-color:#dc2626}
+#player-area{background:#000}
+video{width:100%;max-height:70vh;display:block;background:#000}
+#controls{
+  display:flex;align-items:center;padding:8px 16px;gap:8px;
+  background:#1a1a2e;border-bottom:1px solid #2d2d44;flex-wrap:wrap;
+}
+#now-playing{
+  flex:1;text-align:center;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;color:#94a3b8;font-size:13px;padding:0 8px;
+}
+#file-list{
+  padding:16px;
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;
+}
+.item{
+  display:flex;align-items:center;gap:10px;padding:12px 14px;
+  background:#16213e;border-radius:8px;min-height:48px;
+  transition:background .15s;border:2px solid transparent;min-width:0;overflow:hidden;
+}
+.item:hover{background:#1e3054}
+.item.playing{border-color:#7c3aed}
+.item-link{display:flex;align-items:center;gap:10px;flex:1;min-width:0}
+.item-icon{font-size:18px;flex-shrink:0;line-height:1}
+.item-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;flex:1}
+.item-size{color:#64748b;font-size:12px;flex-shrink:0}
+.btn-del{
+  background:none;border:none;color:#64748b;cursor:pointer;font-size:16px;
+  padding:4px;border-radius:4px;flex-shrink:0;line-height:1;
+}
+.btn-del:hover{color:#f87171;background:rgba(248,113,113,0.1)}
+.empty{grid-column:1/-1;color:#64748b;text-align:center;padding:40px 20px;font-size:15px}
+.action-bar{grid-column:1/-1;display:flex;gap:8px;padding-bottom:4px}
+.unlock-box{
+  max-width:380px;margin:40px auto;background:#1a1a2e;border:1px solid #2d2d44;
+  border-radius:12px;padding:24px;
+}
+.unlock-box h3{margin-bottom:16px;font-size:18px}
+.unlock-box input[type="password"]{
+  width:100%;padding:12px;background:#0f0f1a;border:1px solid #2d2d44;
+  border-radius:6px;color:#e2e8f0;font-size:16px;outline:none;
+}
+.unlock-box input:focus{border-color:#7c3aed}
+.unlock-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+.unlock-error{color:#f87171;font-size:13px;margin-top:10px;min-height:1.2em}
+.error-page{color:#f87171;text-align:center;padding:60px 20px;font-size:16px}
+@media(max-width:640px){
+  #file-list{grid-template-columns:1fr;padding:8px;gap:6px}
+  nav{padding:8px 12px}
+  #controls{padding:6px 12px;justify-content:center}
+}"""
+
+
+def render_page(title, body):
+    return (
+        '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">\n'
+        f'<title>{esc(title)}</title>\n'
+        f'<style>{CSS}</style>\n'
+        '<script src="https://unpkg.com/htmx.org@2.0.4"></script>\n'
+        '</head>\n<body>\n'
+        f'{body}\n'
+        '</body>\n</html>'
+    )
+
+
+def render_nav(path, encrypted_dir=None):
+    parts = path.split('/') if path else []
+    pieces = ['<a class="crumb" href="/">SimpleParty</a>']
+    acc = ''
+    for part in parts:
+        acc += ('/' if acc else '') + part
+        pieces.append(f'<span class="crumb-sep">/</span>')
+        pieces.append(f'<a class="crumb" href="{esc(url_for_browse(acc))}">{esc(part)}</a>')
+    pieces.append('<span class="nav-spacer"></span>')
+    if encrypted_dir is not None:
+        parent = str(Path(encrypted_dir).parent)
+        if parent == '.':
+            parent = ''
+        pieces.append(
+            f'<form hx-post="/lock" hx-confirm="Lock this directory?" style="display:inline">'
+            f'<input type="hidden" name="path" value="{esc(encrypted_dir)}">'
+            f'<input type="hidden" name="redirect" value="{esc(url_for_browse(parent))}">'
+            f'<button type="submit" class="btn btn-lock">Lock</button>'
+            f'</form>'
+        )
+    return '<nav>' + ''.join(pieces) + '</nav>'
+
+
+def render_file_list(data, current_idx=-1):
+    pieces = ['<div id="file-list">']
+
+    if data['videos']:
+        shuffle_url = '/play?' + urllib.parse.urlencode({'path': data['path'], 'shuffle': '1'})
+        pieces.append(
+            f'<div class="action-bar">'
+            f'<a class="btn" href="{esc(shuffle_url)}">\u21C5 Shuffle Play</a>'
+            f'</div>'
+        )
+
+    for d in data['dirs']:
+        if d['encrypted'] and not d['unlocked']:
+            icon = '\U0001F512'
+        elif d['encrypted']:
+            icon = '\U0001F513'
+        else:
+            icon = '\U0001F4C1'
+        pieces.append(
+            f'<a class="item" href="{esc(url_for_browse(d["path"]))}">'
+            f'<span class="item-icon">{icon}</span>'
+            f'<span class="item-name">{esc(d["name"])}</span>'
+            f'</a>'
+        )
+
+    for i, v in enumerate(data['videos']):
+        cls = ' playing' if i == current_idx else ''
+        play_url = url_for_play(data['path'], i)
+        pieces.append(f'<div class="item{cls}">')
+        pieces.append(
+            f'<a class="item-link" href="{esc(play_url)}">'
+            f'<span class="item-icon">\U0001F3AC</span>'
+            f'<span class="item-name">{esc(v["name"])}</span>'
+            f'<span class="item-size">{fmt_size(v["size"])}</span>'
+            f'</a>'
+        )
+        if _config['allow_delete']:
+            pieces.append(
+                f'<form hx-post="/delete" hx-target="closest .item" hx-swap="delete" '
+                f'hx-confirm="Delete {esc(v["name"])}?">'
+                f'<input type="hidden" name="path" value="{esc(v["path"])}">'
+                f'<button type="submit" class="btn-del" title="Delete">\U0001F5D1</button>'
+                f'</form>'
+            )
+        pieces.append('</div>')
+
+    if not data['dirs'] and not data['videos']:
+        pieces.append('<div class="empty">Empty directory</div>')
+
+    pieces.append('</div>')
+    return ''.join(pieces)
+
+
+def render_browse_page(data):
+    title = f'SimpleParty \u2014 {data["path"].split("/")[-1]}' if data['path'] else 'SimpleParty'
+    body = render_nav(data['path'], data.get('encryptedDir'))
+    body += render_file_list(data)
+    return render_page(title, body)
+
+
+def render_locked_page(path, encrypted_dir, redirect_path=None, error=None):
+    body = render_nav(path)
+    dir_name = encrypted_dir.split('/')[-1] if encrypted_dir else 'directory'
+    redir = redirect_path or path
+    parent = str(Path(path).parent) if '/' in path else ''
+    if parent == '.':
+        parent = ''
+    body += (
+        f'<div class="unlock-box">'
+        f'<h3>Unlock {esc(dir_name)}</h3>'
+        f'<form hx-post="/unlock" hx-target="#unlock-error" hx-swap="innerHTML">'
+        f'<input type="hidden" name="path" value="{esc(encrypted_dir)}">'
+        f'<input type="hidden" name="redirect" value="{esc(url_for_browse(redir))}">'
+        f'<input type="password" name="passphrase" placeholder="Passphrase" autofocus>'
+        f'<div id="unlock-error" class="unlock-error">{esc(error) if error else ""}</div>'
+        f'<div class="unlock-actions">'
+        f'<a class="btn" href="{esc(url_for_browse(parent))}">Cancel</a>'
+        f'<button class="btn active" type="submit">Unlock</button>'
+        f'</div></form></div>'
+    )
+    return render_page('SimpleParty \u2014 Unlock', body)
+
+
+def render_error_page(path, error):
+    body = render_nav(path)
+    body += f'<div class="error-page">{esc(error)}</div>'
+    return render_page('SimpleParty \u2014 Error', body)
+
+
+def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info):
+    v = data['videos'][idx]
+    video_src = url_for_video(v['path'])
+    browse_url = url_for_browse(data['path'])
+
+    body = render_nav(data['path'], data.get('encryptedDir'))
+    body += (
+        f'<div id="player-area">'
+        f'<video id="video" src="{esc(video_src)}" controls playsinline autoplay></video>'
+        f'<div id="controls">'
+        f'<a class="btn" href="{esc(prev_url)}" title="Previous (p)">\u25C0 Prev</a>'
+        f'<span id="now-playing">{esc(v["name"])} ({pos_info})</span>'
+        f'<a class="btn" href="{esc(next_url)}" title="Next (n)">Next \u25B6</a>'
+        f'<a class="btn{" active" if is_shuffled else ""}" '
+        f'href="{esc(shuffle_url)}" title="Shuffle (s)">\u21C5 Shuffle</a>'
+    )
+    if _config['allow_delete']:
+        body += (
+            f'<form id="delete-form" hx-post="/delete" hx-confirm="Delete {esc(v["name"])}?">'
+            f'<input type="hidden" name="path" value="{esc(v["path"])}">'
+            f'<input type="hidden" name="redirect" value="{esc(browse_url)}">'
+            f'<button type="submit" class="btn btn-lock" title="Delete (d)">'
+            f'\U0001F5D1</button></form>'
+        )
+    body += '</div></div>'
+
+    body += render_file_list(data, current_idx=idx)
+
+    body += (
+        '<script>\n'
+        f'const video=document.getElementById("video");\n'
+        f'const nextUrl={json.dumps(next_url)};\n'
+        f'const prevUrl={json.dumps(prev_url)};\n'
+        f'const browseUrl={json.dumps(browse_url)};\n'
+        'video.addEventListener("ended",()=>{window.location.href=nextUrl});\n'
+        'document.addEventListener("keydown",e=>{\n'
+        '  if(e.target.tagName==="INPUT")return;\n'
+        '  switch(e.key){\n'
+        '    case"n":case"ArrowRight":window.location.href=nextUrl;break;\n'
+        '    case"p":case"ArrowLeft":window.location.href=prevUrl;break;\n'
+        '    case" ":e.preventDefault();video.paused?video.play():video.pause();break;\n'
+        '    case"f":e.preventDefault();document.fullscreenElement?document.exitFullscreen():video.requestFullscreen();break;\n'
+        '    case"m":video.muted=!video.muted;break;\n'
+        '    case"Escape":window.location.href=browseUrl;break;\n'
+        '    case"d":document.querySelector("#delete-form button")?.click();break;\n'
+        '  }\n'
+        '});\n'
+        '</script>'
+    )
+
+    return render_page(f'SimpleParty \u2014 {v["name"]}', body)
+
+
+# --- Video serving ---
 
 def _needs_transcode(path):
     return path.suffix.lower() not in BROWSER_NATIVE
-
-
-def serve_video(handler, root):
-    parsed = urllib.parse.urlparse(handler.path)
-    rel_path = urllib.parse.unquote(parsed.path[len('/video/'):])
-    resolved = safe_resolve(root, rel_path)
-
-    if resolved is None or not resolved.is_file():
-        handler.send_error(404)
-        return
-
-    # Transcode non-browser-native formats if possible
-    if _config['allow_transcode'] and _needs_transcode(resolved) and (_config['has_ffmpeg'] or _config['has_vlc']):
-        _serve_transcoded(handler, resolved)
-        return
-
-    file_size = resolved.stat().st_size
-    content_type = MIME_TYPES.get(resolved.suffix.lower(), 'application/octet-stream')
-    range_header = handler.headers.get('Range')
-
-    if range_header:
-        match = re.match(r'bytes=(\d+)-(\d*)', range_header)
-        if match:
-            start = int(match.group(1))
-            end = int(match.group(2)) if match.group(2) else file_size - 1
-            end = min(end, file_size - 1)
-            if start > end or start >= file_size:
-                handler.send_response(416)
-                handler.send_header('Content-Range', f'bytes */{file_size}')
-                handler.end_headers()
-                return
-            length = end - start + 1
-            handler.send_response(206)
-            handler.send_header('Content-Type', content_type)
-            handler.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
-            handler.send_header('Content-Length', str(length))
-            handler.send_header('Accept-Ranges', 'bytes')
-            handler.end_headers()
-            if handler.command != 'HEAD':
-                _stream_range(handler, resolved, start, length)
-            return
-
-    handler.send_response(200)
-    handler.send_header('Content-Type', content_type)
-    handler.send_header('Content-Length', str(file_size))
-    handler.send_header('Accept-Ranges', 'bytes')
-    handler.end_headers()
-    if handler.command != 'HEAD':
-        _stream_file(handler, resolved)
 
 
 def _serve_transcoded(handler, path):
@@ -382,7 +571,185 @@ def _stream_file(handler, path):
         pass
 
 
-# --- Request handler ---
+# --- HTTP helpers ---
+
+def send_html(handler, content, status=200):
+    body = content.encode('utf-8')
+    handler.send_response(status)
+    handler.send_header('Content-Type', 'text/html; charset=utf-8')
+    handler.send_header('Content-Length', str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def send_redirect(handler, url):
+    handler.send_response(302)
+    handler.send_header('Location', url)
+    handler.send_header('Content-Length', '0')
+    handler.end_headers()
+
+
+def send_hx_redirect(handler, url):
+    handler.send_response(200)
+    handler.send_header('HX-Redirect', url)
+    handler.send_header('Content-Length', '0')
+    handler.end_headers()
+
+
+def read_form_body(handler):
+    length = int(handler.headers.get('Content-Length', 0))
+    body = handler.rfile.read(length).decode('utf-8')
+    params = urllib.parse.parse_qs(body)
+    return {k: v[0] for k, v in params.items()}
+
+
+# --- Route handlers ---
+
+def handle_browse(handler, root):
+    params = parse_query(handler.path)
+    rel_path = params.get('path', '')
+    data = list_directory(root, rel_path)
+    if data.get('locked'):
+        send_html(handler, render_locked_page(rel_path, data['encryptedDir']))
+    elif 'error' in data:
+        status = 404 if data['error'] == 'Not found' else 400
+        send_html(handler, render_error_page(rel_path, data['error']), status)
+    else:
+        send_html(handler, render_browse_page(data))
+
+
+def handle_play(handler, root):
+    params = parse_query(handler.path)
+    dir_path = params.get('path', '')
+    data = list_directory(root, dir_path)
+
+    if data.get('locked'):
+        send_html(handler, render_locked_page(dir_path, data['encryptedDir']))
+        return
+    if 'error' in data or not data.get('videos'):
+        send_redirect(handler, url_for_browse(dir_path))
+        return
+
+    n = len(data['videos'])
+    shuffled = params.get('shuffle') == '1'
+
+    if shuffled:
+        seed = safe_int(params.get('seed'), random.randint(0, 2**31))
+        pos = safe_int(params.get('pos')) % n
+        order = shuffle_indices(n, seed)
+        idx = order[pos]
+        next_pos = (pos + 1) % n
+        prev_pos = (pos - 1) % n
+        next_url = url_for_play(dir_path, order[next_pos], shuffle=True, seed=seed, pos=next_pos)
+        prev_url = url_for_play(dir_path, order[prev_pos], shuffle=True, seed=seed, pos=prev_pos)
+        pos_info = f'{pos + 1}/{n}'
+        shuffle_url = url_for_play(dir_path, idx)
+    else:
+        idx = max(0, min(safe_int(params.get('idx')), n - 1))
+        next_url = url_for_play(dir_path, (idx + 1) % n)
+        prev_url = url_for_play(dir_path, (idx - 1) % n)
+        pos_info = f'{idx + 1}/{n}'
+        shuffle_url = '/play?' + urllib.parse.urlencode({'path': dir_path, 'shuffle': '1'})
+
+    send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info))
+
+
+def handle_video(handler, root):
+    parsed = urllib.parse.urlparse(handler.path)
+    rel_path = urllib.parse.unquote(parsed.path[len('/video/'):])
+    resolved = resolve_path(root, rel_path)
+
+    if not resolved.is_file():
+        handler.send_error(404)
+        return
+
+    if _config['allow_transcode'] and _needs_transcode(resolved) and (_config['has_ffmpeg'] or _config['has_vlc']):
+        _serve_transcoded(handler, resolved)
+        return
+
+    file_size = resolved.stat().st_size
+    content_type = MIME_TYPES.get(resolved.suffix.lower(), 'application/octet-stream')
+    range_header = handler.headers.get('Range')
+
+    if range_header:
+        match = re.match(r'bytes=(\d+)-(\d*)', range_header)
+        if match:
+            start = int(match.group(1))
+            end = int(match.group(2)) if match.group(2) else file_size - 1
+            end = min(end, file_size - 1)
+            if start > end or start >= file_size:
+                handler.send_response(416)
+                handler.send_header('Content-Range', f'bytes */{file_size}')
+                handler.end_headers()
+                return
+            length = end - start + 1
+            handler.send_response(206)
+            handler.send_header('Content-Type', content_type)
+            handler.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
+            handler.send_header('Content-Length', str(length))
+            handler.send_header('Accept-Ranges', 'bytes')
+            handler.end_headers()
+            if handler.command != 'HEAD':
+                _stream_range(handler, resolved, start, length)
+            return
+
+    handler.send_response(200)
+    handler.send_header('Content-Type', content_type)
+    handler.send_header('Content-Length', str(file_size))
+    handler.send_header('Accept-Ranges', 'bytes')
+    handler.end_headers()
+    if handler.command != 'HEAD':
+        _stream_file(handler, resolved)
+
+
+def handle_delete(handler, root):
+    if not _config['allow_delete']:
+        handler.send_error(403, 'Delete disabled')
+        return
+    form = read_form_body(handler)
+    rel_path = form.get('path', '')
+    redirect_url = form.get('redirect')
+    resolved = resolve_path(root, rel_path)
+    if not resolved.is_file() or not is_video(resolved.name):
+        handler.send_error(400, 'Invalid video path')
+        return
+    try:
+        os.remove(resolved)
+    except OSError as e:
+        handler.send_error(500, str(e))
+        return
+    if redirect_url:
+        send_hx_redirect(handler, redirect_url)
+    else:
+        handler.send_response(200)
+        handler.send_header('Content-Length', '0')
+        handler.end_headers()
+
+
+def handle_unlock(handler, root):
+    form = read_form_body(handler)
+    encrypted_path = form.get('path', '')
+    passphrase = form.get('passphrase', '')
+    redirect_url = form.get('redirect', url_for_browse(encrypted_path))
+    resolved = resolve_path(root, encrypted_path)
+    ok, msg = fscrypt_unlock(resolved, passphrase)
+    del passphrase
+    if ok:
+        send_hx_redirect(handler, redirect_url)
+    else:
+        send_html(handler, esc(msg or 'Unlock failed'))
+
+
+def handle_lock(handler, root):
+    form = read_form_body(handler)
+    path = form.get('path', '')
+    redirect_url = form.get('redirect', url_for_browse(''))
+    resolved = resolve_path(root, path)
+    fscrypt_lock(resolved)
+    send_hx_redirect(handler, redirect_url)
+
+
+# --- Server ---
 
 class RequestHandler(BaseHTTPRequestHandler):
     def __init__(self, root, *args, **kwargs):
@@ -391,35 +758,30 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
-        if path == '/':
-            body = SPA_HTML.encode('utf-8')
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif path.startswith('/api/browse'):
-            serve_browse(self, self.root)
+        if path == '/' or path == '/browse':
+            handle_browse(self, self.root)
+        elif path == '/play':
+            handle_play(self, self.root)
         elif path.startswith('/video/'):
-            serve_video(self, self.root)
+            handle_video(self, self.root)
         else:
             self.send_error(404)
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
-        if path == '/api/unlock':
-            serve_unlock(self, self.root)
-        elif path == '/api/lock':
-            serve_lock(self, self.root)
-        elif path == '/api/delete':
-            serve_delete(self, self.root)
+        if path == '/delete':
+            handle_delete(self, self.root)
+        elif path == '/unlock':
+            handle_unlock(self, self.root)
+        elif path == '/lock':
+            handle_lock(self, self.root)
         else:
             self.send_error(404)
 
     def do_HEAD(self):
         path = urllib.parse.urlparse(self.path).path
         if path.startswith('/video/'):
-            serve_video(self, self.root)
+            handle_video(self, self.root)
         else:
             self.do_GET()
 
@@ -427,508 +789,6 @@ class RequestHandler(BaseHTTPRequestHandler):
 class ThreadedServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
-
-# --- SPA HTML ---
-# Note: All user-provided data (filenames, paths) is escaped via esc() which
-# handles &, <, >, ", and ' before insertion into the DOM. The only unescaped
-# HTML consists of hardcoded icon entities and structural markup.
-
-SPA_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>SimpleParty</title>
-<style>
-*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
-html{height:100%}
-body{
-  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
-  background:#0f0f1a;color:#e2e8f0;min-height:100%;overflow-x:hidden;max-width:100vw;
-}
-nav{
-  position:sticky;top:0;background:#1a1a2e;padding:12px 16px;
-  display:flex;align-items:center;gap:4px;
-  border-bottom:1px solid #2d2d44;z-index:10;flex-wrap:wrap;min-height:48px;
-  overflow:hidden;max-width:100vw;
-}
-.crumb{
-  color:#94a3b8;cursor:pointer;padding:4px 6px;border-radius:4px;
-  font-size:15px;white-space:nowrap;
-}
-.crumb:hover{color:#c4b5fd;background:rgba(167,139,250,0.1)}
-.crumb-sep{color:#4a4a6a;padding:0 2px;user-select:none}
-.nav-spacer{flex:1}
-
-.btn{
-  background:#16213e;color:#e2e8f0;border:1px solid #2d2d44;
-  padding:8px 14px;border-radius:6px;cursor:pointer;font-size:14px;
-  min-height:40px;white-space:nowrap;transition:all .15s;
-}
-.btn:hover{background:#1e3054;border-color:#a78bfa}
-.btn.active{background:#7c3aed;color:#fff;border-color:#7c3aed}
-.btn-lock{border-color:#991b1b}
-.btn-lock:hover{background:#7f1d1d;border-color:#dc2626}
-
-#player-area{display:none;background:#000}
-#player-area.visible{display:block}
-video{width:100%;max-height:70vh;display:block;background:#000}
-#controls{
-  display:flex;align-items:center;padding:8px 16px;gap:8px;
-  background:#1a1a2e;border-bottom:1px solid #2d2d44;
-}
-#now-playing{
-  flex:1;text-align:center;overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap;color:#94a3b8;font-size:13px;padding:0 8px;
-}
-
-#file-list{
-  padding:16px;
-  display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;
-}
-.item{
-  display:flex;align-items:center;gap:10px;padding:12px 14px;
-  background:#16213e;border-radius:8px;cursor:pointer;min-height:48px;
-  transition:background .15s;border:2px solid transparent;min-width:0;overflow:hidden;
-}
-.item:hover{background:#1e3054}
-.item.playing{border-color:#7c3aed}
-.item-icon{font-size:18px;flex-shrink:0;line-height:1}
-.item-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;flex:1}
-.item-size{color:#64748b;font-size:12px;flex-shrink:0}
-.empty{grid-column:1/-1;color:#64748b;text-align:center;padding:40px 20px;font-size:15px}
-.action-bar{grid-column:1/-1;display:flex;gap:8px;padding-bottom:4px}
-
-.modal{
-  display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);
-  align-items:center;justify-content:center;z-index:100;
-}
-.modal.visible{display:flex}
-.modal-box{
-  background:#1a1a2e;border:1px solid #2d2d44;border-radius:12px;
-  padding:24px;width:90%;max-width:380px;
-}
-.modal-box h3{margin-bottom:16px;font-size:18px}
-.modal-box input[type="password"]{
-  width:100%;padding:12px;background:#0f0f1a;border:1px solid #2d2d44;
-  border-radius:6px;color:#e2e8f0;font-size:16px;outline:none;
-}
-.modal-box input:focus{border-color:#7c3aed}
-.modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
-.modal-error{color:#f87171;font-size:13px;margin-top:10px;min-height:1.2em}
-
-.loading{opacity:.5;pointer-events:none}
-
-#shortcuts{
-  position:fixed;bottom:12px;right:12px;background:#1a1a2e;
-  border:1px solid #2d2d44;border-radius:8px;padding:10px 14px;
-  font-size:12px;color:#64748b;line-height:1.6;
-  opacity:0;transition:opacity .2s;pointer-events:none;
-}
-#shortcuts.visible{opacity:1}
-kbd{
-  background:#0f0f1a;border:1px solid #2d2d44;border-radius:3px;
-  padding:1px 5px;font-family:monospace;font-size:11px;
-}
-
-@media(max-width:640px){
-  #file-list{grid-template-columns:1fr;padding:8px;gap:6px}
-  nav{padding:8px 12px}
-  #controls{padding:6px 12px;flex-wrap:wrap;justify-content:center}
-}
-</style>
-</head>
-<body>
-<nav id="nav"></nav>
-<div id="player-area">
-  <video id="video" controls playsinline></video>
-  <div id="controls">
-    <button class="btn" id="prev-btn" title="Previous (p)">&#9664; Prev</button>
-    <span id="now-playing"></span>
-    <button class="btn" id="next-btn" title="Next (n)">Next &#9654;</button>
-    <button class="btn" id="shuffle-btn" title="Shuffle (s)">&#8645; Shuffle</button>
-    <button class="btn btn-lock" id="delete-btn" title="Delete (d)">&#128465;</button>
-  </div>
-</div>
-<div id="file-list"></div>
-
-<div class="modal" id="modal">
-  <div class="modal-box">
-    <h3 id="modal-title">Unlock Directory</h3>
-    <input type="password" id="modal-pass" placeholder="Passphrase" autocomplete="off">
-    <div class="modal-error" id="modal-error"></div>
-    <div class="modal-actions">
-      <button class="btn" id="modal-cancel">Cancel</button>
-      <button class="btn active" id="modal-submit">Unlock</button>
-    </div>
-  </div>
-</div>
-
-<div id="shortcuts">
-  <kbd>n</kbd> next &middot; <kbd>p</kbd> prev &middot; <kbd>s</kbd> shuffle<br>
-  <kbd>f</kbd> fullscreen &middot; <kbd>space</kbd> play/pause &middot; <kbd>esc</kbd> back<br>
-  <kbd>?</kbd> toggle this help
-</div>
-
-<script>
-'use strict';
-
-let state = {
-  path: '', dirs: [], videos: [], encryptedDir: null,
-  currentVideo: -1, playlist: [], playlistPos: -1,
-  shuffled: false, loading: false,
-  modalPath: null, modalError: null, pendingPath: null,
-};
-
-const $ = id => document.getElementById(id);
-const video = $('video');
-
-// All user-provided strings (filenames, paths) pass through esc() before
-// DOM insertion, preventing script injection from crafted filenames.
-function esc(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-          .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-}
-
-function fmtSize(b) {
-  if (b < 1024) return b + ' B';
-  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
-  if (b < 1073741824) return (b / 1048576).toFixed(1) + ' MB';
-  return (b / 1073741824).toFixed(1) + ' GB';
-}
-
-function videoUrl(path) {
-  return '/video/' + path.split('/').map(encodeURIComponent).join('/');
-}
-
-function fisherYates(arr) {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
-
-function update(changes) {
-  Object.assign(state, changes);
-  render();
-}
-
-// --- Navigation ---
-
-async function navigateTo(path) {
-  update({ loading: true });
-  try {
-    const resp = await fetch('/api/browse?path=' + encodeURIComponent(path));
-    const data = await resp.json();
-
-    if (data.locked) {
-      update({ loading: false, modalPath: data.encryptedDir, modalError: null, pendingPath: path });
-      return;
-    }
-    if (data.error) {
-      update({ loading: false });
-      return;
-    }
-
-    video.pause();
-    video.removeAttribute('src');
-
-    const playlist = data.videos.map((_, i) => i);
-    update({
-      path: data.path || '', dirs: data.dirs || [], videos: data.videos || [],
-      encryptedDir: data.encryptedDir, currentVideo: -1,
-      playlist, playlistPos: -1, shuffled: false,
-      loading: false, modalPath: null, pendingPath: null,
-    });
-
-    history.replaceState(null, '', '#' + (data.path || ''));
-    document.title = data.path ? 'SimpleParty - ' + data.path.split('/').pop() : 'SimpleParty';
-    window.scrollTo(0, 0);
-  } catch (e) {
-    update({ loading: false });
-  }
-}
-
-function selectVideo(index) {
-  const pos = state.playlist.indexOf(index);
-  update({ currentVideo: index, playlistPos: pos >= 0 ? pos : 0 });
-  video.src = videoUrl(state.videos[index].path);
-  video.play();
-  $('player-area').scrollIntoView({ behavior: 'smooth', block: 'start' });
-}
-
-function nextVideo() {
-  if (!state.playlist.length) return;
-  let pos = state.playlistPos + 1;
-  if (pos >= state.playlist.length) pos = 0;
-  const idx = state.playlist[pos];
-  update({ currentVideo: idx, playlistPos: pos });
-  video.src = videoUrl(state.videos[idx].path);
-  video.play();
-}
-
-function prevVideo() {
-  if (!state.playlist.length) return;
-  let pos = state.playlistPos - 1;
-  if (pos < 0) pos = state.playlist.length - 1;
-  const idx = state.playlist[pos];
-  update({ currentVideo: idx, playlistPos: pos });
-  video.src = videoUrl(state.videos[idx].path);
-  video.play();
-}
-
-function toggleShuffle() {
-  if (!state.videos.length) return;
-  if (state.shuffled) {
-    const playlist = state.videos.map((_, i) => i);
-    const pos = state.currentVideo >= 0 ? state.currentVideo : -1;
-    update({ shuffled: false, playlist, playlistPos: pos });
-  } else {
-    let playlist = fisherYates(state.videos.map((_, i) => i));
-    if (state.currentVideo >= 0) {
-      const idx = playlist.indexOf(state.currentVideo);
-      if (idx > 0) [playlist[0], playlist[idx]] = [playlist[idx], playlist[0]];
-    }
-    update({ shuffled: true, playlist, playlistPos: state.currentVideo >= 0 ? 0 : -1 });
-  }
-}
-
-function shufflePlay() {
-  if (!state.videos.length) return;
-  const playlist = fisherYates(state.videos.map((_, i) => i));
-  const idx = playlist[0];
-  update({ shuffled: true, playlist, playlistPos: 0, currentVideo: idx });
-  video.src = videoUrl(state.videos[idx].path);
-  video.play();
-  $('player-area').scrollIntoView({ behavior: 'smooth', block: 'start' });
-}
-
-async function doDelete() {
-  if (state.currentVideo < 0) return;
-  const v = state.videos[state.currentVideo];
-  if (!confirm('Delete ' + v.name + '?')) return;
-  try {
-    const resp = await fetch('/api/delete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: v.path }),
-    });
-    const data = await resp.json();
-    if (!data.ok) return;
-
-    video.pause();
-    video.removeAttribute('src');
-
-    const removedIdx = state.currentVideo;
-    const videos = state.videos.filter((_, i) => i !== removedIdx);
-    const playlist = state.playlist
-      .filter(i => i !== removedIdx)
-      .map(i => i > removedIdx ? i - 1 : i);
-
-    if (!videos.length) {
-      update({ videos, playlist, playlistPos: -1, currentVideo: -1, shuffled: false });
-      return;
-    }
-
-    const pos = Math.min(state.playlistPos, playlist.length - 1);
-    const newIdx = playlist[pos];
-    update({ videos, playlist, playlistPos: pos, currentVideo: newIdx });
-    video.src = videoUrl(videos[newIdx].path);
-    video.play();
-  } catch (e) {}
-}
-
-// --- fscrypt ---
-
-async function doUnlock() {
-  const pass = $('modal-pass').value;
-  if (!pass) return;
-  update({ loading: true, modalError: null });
-  try {
-    const resp = await fetch('/api/unlock', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: state.modalPath, passphrase: pass }),
-    });
-    const data = await resp.json();
-    $('modal-pass').value = '';
-    if (data.ok) {
-      const pending = state.pendingPath || state.modalPath;
-      update({ modalPath: null, modalError: null, loading: false, pendingPath: null });
-      navigateTo(pending);
-    } else {
-      update({ modalError: data.error || 'Unlock failed', loading: false });
-    }
-  } catch (e) {
-    $('modal-pass').value = '';
-    update({ modalError: 'Network error', loading: false });
-  }
-}
-
-async function doLock(path) {
-  if (!confirm('Lock this directory?')) return;
-  try {
-    const resp = await fetch('/api/lock', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path }),
-    });
-    const data = await resp.json();
-    if (!data.ok) {
-      alert('Lock failed: ' + (data.error || 'unknown error'));
-      return;
-    }
-    video.pause();
-    video.removeAttribute('src');
-    const parent = path.includes('/') ? path.substring(0, path.lastIndexOf('/')) : '';
-    navigateTo(parent);
-  } catch (e) {
-    alert('Lock failed: network error');
-  }
-}
-
-function goBack() {
-  if (state.modalPath) {
-    update({ modalPath: null, modalError: null, pendingPath: null });
-    return;
-  }
-  if (!state.path) return;
-  const parent = state.path.includes('/')
-    ? state.path.substring(0, state.path.lastIndexOf('/'))
-    : '';
-  navigateTo(parent);
-}
-
-// --- Render ---
-
-function render() {
-  renderNav();
-  renderPlayer();
-  renderList();
-  renderModal();
-}
-
-function renderNav() {
-  const parts = state.path ? state.path.split('/') : [];
-  let html = '<span class="crumb" data-nav="">SimpleParty</span>';
-  let acc = '';
-  for (const part of parts) {
-    acc += (acc ? '/' : '') + part;
-    html += '<span class="crumb-sep">/</span>';
-    html += '<span class="crumb" data-nav="' + esc(acc) + '">' + esc(part) + '</span>';
-  }
-  html += '<span class="nav-spacer"></span>';
-  if (state.encryptedDir != null) {
-    html += '<button class="btn btn-lock" data-lock="' + esc(state.encryptedDir) + '">Lock</button>';
-  }
-  $('nav').innerHTML = html;
-}
-
-function renderPlayer() {
-  const area = $('player-area');
-  if (state.currentVideo < 0) { area.classList.remove('visible'); return; }
-  area.classList.add('visible');
-  const v = state.videos[state.currentVideo];
-  $('now-playing').textContent = v.name + ' (' + (state.playlistPos + 1) + '/' + state.playlist.length + ')';
-  $('shuffle-btn').classList.toggle('active', state.shuffled);
-}
-
-function renderList() {
-  const list = $('file-list');
-  let html = '';
-
-  if (state.videos.length) {
-    html += '<div class="action-bar">'
-      + '<button class="btn" id="shuffle-play-btn" title="Shuffle Play">&#8645; Shuffle Play</button>'
-      + '</div>';
-  }
-
-  for (const dir of state.dirs) {
-    const icon = dir.encrypted ? (dir.unlocked ? '&#128275;' : '&#128274;') : '&#128193;';
-    html += '<div class="item" data-nav="' + esc(dir.path) + '">'
-      + '<span class="item-icon">' + icon + '</span>'
-      + '<span class="item-name">' + esc(dir.name) + '</span></div>';
-  }
-
-  for (let i = 0; i < state.videos.length; i++) {
-    const v = state.videos[i];
-    const cls = i === state.currentVideo ? ' playing' : '';
-    html += '<div class="item' + cls + '" data-video="' + i + '">'
-      + '<span class="item-icon">&#127916;</span>'
-      + '<span class="item-name">' + esc(v.name) + '</span>'
-      + '<span class="item-size">' + fmtSize(v.size) + '</span></div>';
-  }
-
-  if (!state.dirs.length && !state.videos.length && !state.loading) {
-    html = '<div class="empty">Empty directory</div>';
-  }
-
-  list.innerHTML = html;
-  list.classList.toggle('loading', state.loading);
-}
-
-function renderModal() {
-  const modal = $('modal');
-  if (state.modalPath != null) {
-    modal.classList.add('visible');
-    $('modal-error').textContent = state.modalError || '';
-    $('modal-title').textContent = 'Unlock ' + (state.modalPath || 'directory');
-    setTimeout(() => $('modal-pass').focus(), 50);
-  } else {
-    modal.classList.remove('visible');
-    $('modal-pass').value = '';
-  }
-}
-
-// --- Events ---
-
-document.addEventListener('click', e => {
-  if (e.target.closest('#shuffle-play-btn')) { shufflePlay(); return; }
-  const nav = e.target.closest('[data-nav]');
-  if (nav) { navigateTo(nav.dataset.nav); return; }
-  const vid = e.target.closest('[data-video]');
-  if (vid) { selectVideo(parseInt(vid.dataset.video)); return; }
-  const lock = e.target.closest('[data-lock]');
-  if (lock) { doLock(lock.dataset.lock); return; }
-});
-
-$('prev-btn').addEventListener('click', prevVideo);
-$('next-btn').addEventListener('click', nextVideo);
-$('shuffle-btn').addEventListener('click', toggleShuffle);
-$('delete-btn').addEventListener('click', doDelete);
-$('modal-submit').addEventListener('click', doUnlock);
-$('modal-cancel').addEventListener('click', () => update({ modalPath: null, modalError: null, pendingPath: null }));
-$('modal-pass').addEventListener('keydown', e => { if (e.key === 'Enter') doUnlock(); });
-
-video.addEventListener('ended', nextVideo);
-
-const shortcuts = {
-  'n': nextVideo, 'ArrowRight': nextVideo,
-  'p': prevVideo, 'ArrowLeft': prevVideo,
-  's': toggleShuffle, 'd': doDelete,
-  'f': () => { if (video.src) { document.fullscreenElement ? document.exitFullscreen() : video.requestFullscreen(); } },
-  ' ': () => { if (video.src) { video.paused ? video.play() : video.pause(); } },
-  'm': () => { if (video.src) video.muted = !video.muted; },
-  'Escape': goBack,
-  '?': () => $('shortcuts').classList.toggle('visible'),
-};
-
-document.addEventListener('keydown', e => {
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-  const action = shortcuts[e.key];
-  if (action) { e.preventDefault(); action(); }
-});
-
-// Init
-navigateTo(decodeURIComponent(window.location.hash.slice(1)) || '');
-</script>
-</body>
-</html>"""
-
-
-# --- Main ---
 
 def main():
     parser = argparse.ArgumentParser(
@@ -946,7 +806,6 @@ def main():
         print(f'Error: {root} is not a directory', file=sys.stderr)
         raise SystemExit(1)
 
-    # Configure runtime settings
     _config['has_ffmpeg'] = shutil.which('ffmpeg') is not None
     _config['has_vlc'] = shutil.which('cvlc') is not None
     _config['allow_delete'] = not args.no_delete
