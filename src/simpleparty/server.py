@@ -267,7 +267,7 @@ nav{
 .btn.active{background:#7c3aed;color:#fff;border-color:#7c3aed}
 .btn-lock{border-color:#991b1b}
 .btn-lock:hover{background:#7f1d1d;border-color:#dc2626}
-#player-area{background:#000}
+#player-area{position:sticky;top:0;z-index:5;background:#000}
 video{width:100%;max-height:70vh;display:block;background:#000}
 #controls{
   display:flex;align-items:center;padding:8px 16px;gap:8px;
@@ -356,10 +356,10 @@ def render_nav(path, encrypted_dir=None):
     return '<nav>' + ''.join(pieces) + '</nav>'
 
 
-def render_file_list(data, current_idx=-1):
+def render_file_list(data, current_idx=-1, show_shuffle=True):
     pieces = ['<div id="file-list">']
 
-    if data['videos']:
+    if show_shuffle and data['videos']:
         shuffle_url = '/play?' + urllib.parse.urlencode({'path': data['path'], 'shuffle': '1'})
         pieces.append(
             f'<div class="action-bar">'
@@ -471,7 +471,7 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         )
     body += '</div></div>'
 
-    body += render_file_list(data, current_idx=idx)
+    body += render_file_list(data, current_idx=idx, show_shuffle=False)
 
     body += (
         '<script>\n'
@@ -480,6 +480,7 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         f'const prevUrl={json.dumps(prev_url)};\n'
         f'const browseUrl={json.dumps(browse_url)};\n'
         'video.addEventListener("ended",()=>{window.location.href=nextUrl});\n'
+        'video.play().catch(()=>{});\n'
         'document.addEventListener("keydown",e=>{\n'
         '  if(e.target.tagName==="INPUT")return;\n'
         '  switch(e.key){\n'
