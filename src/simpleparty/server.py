@@ -570,7 +570,7 @@ def _serve_transcoded(handler, path):
             handler.wfile.write(b'\r\n')
         handler.wfile.write(b'0\r\n\r\n')
         proc.wait()
-    except BrokenPipeError:
+    except (BrokenPipeError, ConnectionResetError):
         proc.kill()
     except Exception:
         if proc.poll() is None:
@@ -588,7 +588,7 @@ def _stream_range(handler, path, start, length):
                     break
                 handler.wfile.write(chunk)
                 remaining -= len(chunk)
-    except BrokenPipeError:
+    except (BrokenPipeError, ConnectionResetError):
         pass
 
 
@@ -600,7 +600,7 @@ def _stream_file(handler, path):
                 if not chunk:
                     break
                 handler.wfile.write(chunk)
-    except BrokenPipeError:
+    except (BrokenPipeError, ConnectionResetError):
         pass
 
 
