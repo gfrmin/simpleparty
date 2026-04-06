@@ -28,7 +28,8 @@ _config = {
     'has_vlc': False,
     'allow_delete': True,
     'allow_transcode': True,
-    'allow_tag': False,
+    'allow_tag': True,
+    'allow_ai_tag': False,
     'ollama_url': 'http://localhost:11434',
     'tag_model': 'huihui_ai/qwen3-vl-abliterated:8b',
     'tag_jobs': {},  # path -> progress dict
@@ -377,7 +378,7 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None):
     if show_shuffle and data['videos']:
         shuffle_url = '/play?' + urllib.parse.urlencode({'path': data['path'], 'shuffle': '1'})
         tag_html = ''
-        if _config['allow_tag']:
+        if _config['allow_ai_tag']:
             path_param = esc(data['path'])
             tag_html = (
                 f'<form hx-post="/tag" style="display:inline">'
@@ -870,8 +871,8 @@ def handle_lock(handler, root):
 
 
 def handle_tag(handler, root):
-    if not _config['allow_tag']:
-        handler.send_error(403, 'Tagging not enabled')
+    if not _config['allow_ai_tag']:
+        handler.send_error(403, 'AI tagging not available')
         return
     from simpleparty.tagger import tag_directory
 
@@ -917,7 +918,7 @@ def handle_tag_status(handler, root):
     done = progress.get('done', 0)
     total = progress.get('total', 0)
     current = progress.get('current', '')
-    text = f'Tagging {done}/{total}'
+    text = f'Tagging {done}/{total} (runs in background)'
     if current:
         text += f' \u2014 {esc(current)}'
     text += '\u2026'
@@ -1026,7 +1027,7 @@ def main():
     parser.add_argument('-b', '--bind', default='0.0.0.0', help='Bind address (default: 0.0.0.0)')
     parser.add_argument('--no-delete', action='store_true', help='Disable video deletion')
     parser.add_argument('--no-transcode', action='store_true', help='Disable ffmpeg/VLC transcoding')
-    parser.add_argument('--tag', action='store_true', help='Enable AI video tagging (requires Ollama + ffmpeg)')
+    parser.add_argument('--no-tag', action='store_true', help='Disable all tagging features')
     parser.add_argument('--tag-model', default='huihui_ai/qwen3-vl-abliterated:8b',
                         help='Ollama vision model for tagging (default: huihui_ai/qwen3-vl-abliterated:8b)')
     parser.add_argument('--ollama-url', default='http://localhost:11434', help='Ollama API URL (default: http://localhost:11434)')
@@ -1042,17 +1043,20 @@ def main():
     _config['allow_delete'] = not args.no_delete
     _config['allow_transcode'] = not args.no_transcode
 
-    if args.tag:
+    if args.no_tag:
+        _config['allow_tag'] = False
+        _config['allow_ai_tag'] = False
+    else:
         from simpleparty.tagger import check_prereqs
         ok, errors = check_prereqs(args.ollama_url, args.tag_model)
         if ok:
-            _config['allow_tag'] = True
+            _config['allow_ai_tag'] = True
             _config['ollama_url'] = args.ollama_url
             _config['tag_model'] = args.tag_model
         else:
             for e in errors:
                 print(f'  tag: {e}', file=sys.stderr)
-            print('  Tagging disabled due to missing requirements.', file=sys.stderr)
+            print('  AI tagging unavailable (manual tagging still works).', file=sys.stderr)
 
     handler = partial(RequestHandler, root)
     server = ThreadedServer((args.bind, args.port), handler)
@@ -1067,11 +1071,14 @@ def main():
         features.append('delete: on')
     if shutil.which('fscrypt'):
         features.append('fscrypt: on')
-    if _config['allow_tag']:
+    if _config['allow_ai_tag']:
         features.append(f'tag: {_config["tag_model"]}')
+    elif _config['allow_tag']:
+        features.append('tag: manual only')
 
+    from simpleparty import __version__
     url = f'http://{args.bind}:{args.port}'
-    print(f'SimpleParty serving {root}')
+    print(f'SimpleParty {__version__} serving {root}')
     print(f'  {url}')
     if features:
         print(f'  [{", ".join(features)}]')

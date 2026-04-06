@@ -50,7 +50,7 @@ simpleparty [/path/to/videos] [options]
   -b, --bind ADDR       Bind address (default: 0.0.0.0)
   --no-delete           Disable the delete button
   --no-transcode        Disable ffmpeg/VLC transcoding
-  --tag                 Enable AI video tagging (requires Ollama + ffmpeg)
+  --no-tag              Disable all tagging features
   --tag-model MODEL     Ollama vision model (default: huihui_ai/qwen3-vl-abliterated:8b)
   --ollama-url URL      Ollama API URL (default: http://localhost:11434)
 ```
@@ -78,27 +78,27 @@ These are auto-detected at startup and require no configuration:
 
 ## AI tagging
 
-SimpleParty can automatically generate tags and descriptions for your videos using a local vision language model via [Ollama](https://ollama.com). This is fully opt-in and runs entirely on your machine — no data leaves your network.
+Tagging is always available — you can manually add or edit tags from the video player page, no setup required. Tags are stored in a `.simpleparty-tags.json` file per directory.
 
-### Setup
+For **AI-powered automatic tagging**, SimpleParty uses a local vision language model via [Ollama](https://ollama.com). This runs entirely on your machine — no data leaves your network. If Ollama and ffmpeg are available, a "Tag" button appears in the directory browser. Click it to tag all untagged videos in that directory. Tagging runs in the background — you can close the browser and it will keep going as long as the server is running.
+
+### AI tagging setup
 
 1. Install [Ollama](https://ollama.com)
 2. Pull a vision model: `ollama pull huihui_ai/qwen3-vl-abliterated:8b`
-3. Start SimpleParty with `--tag`:
+3. Start SimpleParty — AI tagging is auto-detected:
 
 ```sh
-simpleparty /path/to/videos --tag
+simpleparty /path/to/videos
 ```
 
-A "Tag" button will appear in the directory browser. Click it to start tagging all untagged videos in that directory. Tags are stored in a `.simpleparty-tags.json` file per directory. Already-tagged videos are skipped on subsequent runs.
-
-You can also manually add or edit tags from the video player page — no AI required.
-
-### Requirements
+### AI tagging requirements
 
 - **Ollama** running locally (or specify `--ollama-url`)
 - **ffmpeg** for extracting video keyframes
 - A GPU with ~8GB VRAM for the default 8B model (NVIDIA recommended)
+
+If these aren't available, SimpleParty still works — you just won't see the AI "Tag" button. Manual tagging always works.
 
 ## Why not Jellyfin/Plex?
 
