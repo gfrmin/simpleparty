@@ -346,20 +346,35 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .error-page{color:#f87171;text-align:center;padding:60px 20px;font-size:16px}
 .item-tags{color:#64748b;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;padding-top:2px}
 .tag-progress{color:#94a3b8;font-size:13px;padding:8px 0}
-.tag-filter{padding:12px 16px;border-bottom:1px solid #2d2d44}
-.tag-search{background:#0f0f1a;border:1px solid #2d2d44;border-radius:6px;color:#e2e8f0;padding:6px 10px;font-size:13px;width:200px;margin-bottom:8px;margin-right:8px}
-.tag-search:focus{border-color:#7c3aed;outline:none}
-.tag-pills{display:flex;flex-wrap:wrap;gap:6px}
-.tag-pill{display:inline-block;background:#2d2d44;color:#a78bfa;padding:4px 10px;border-radius:12px;font-size:12px;white-space:nowrap;cursor:pointer;text-decoration:none;transition:all .15s}
+.tag-filter{padding:8px 16px;border-bottom:1px solid #2d2d44;display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.tag-selected-pills{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.tag-pill{display:inline-flex;align-items:center;background:#2d2d44;color:#a78bfa;padding:4px 10px;border-radius:12px;font-size:12px;white-space:nowrap;cursor:pointer;text-decoration:none;transition:all .15s;gap:4px}
 .tag-pill:hover{background:#3d3d5c}
 .tag-pill.active{background:#7c3aed;color:#fff}
 .tag-pill-count{color:#64748b;font-size:11px}
 .tag-pill.active .tag-pill-count{color:rgba(255,255,255,0.7)}
+.tag-pill-x{font-size:10px;opacity:0.7;margin-left:2px}
+.tag-pill-x:hover{opacity:1}
 .tag-clear{color:#94a3b8;font-size:12px;cursor:pointer;text-decoration:underline;padding:4px 8px}
+.tag-dropdown-wrap{position:relative;display:inline-block}
+.tag-search{background:#0f0f1a;border:1px solid #2d2d44;border-radius:6px;color:#e2e8f0;padding:6px 10px;font-size:13px;width:220px}
+.tag-search:focus{border-color:#7c3aed;outline:none}
+.tag-dropdown{display:none;position:absolute;top:100%;left:0;z-index:50;background:#1a1a2e;border:1px solid #2d2d44;border-radius:6px;margin-top:4px;max-height:240px;overflow-y:auto;min-width:220px;box-shadow:0 4px 12px rgba(0,0,0,0.4)}
+.tag-dropdown.open{display:block}
+.tag-dropdown a{display:flex;justify-content:space-between;padding:6px 12px;color:#a78bfa;text-decoration:none;font-size:12px;transition:background .1s}
+.tag-dropdown a:hover{background:#2d2d44}
+.tag-dropdown a .cnt{color:#64748b;font-size:11px}
 .video-meta{padding:8px 16px;background:#1a1a2e;border-bottom:1px solid #2d2d44;display:flex;flex-wrap:wrap;align-items:center;gap:8px}
 .video-meta .item-tags{width:100%}
 .video-meta input[type="text"]{background:#0f0f1a;border:1px solid #2d2d44;border-radius:6px;color:#e2e8f0;padding:6px 10px;font-size:13px;flex:1;min-width:200px}
 .video-meta input:focus{border-color:#7c3aed;outline:none}
+.video-desc{color:#94a3b8;font-size:12px;line-height:1.5;width:100%;padding-bottom:4px}
+.video-tag-pills{display:flex;flex-wrap:wrap;gap:6px;align-items:center;width:100%}
+.video-tag-pill{display:inline-flex;align-items:center;background:#2d2d44;color:#a78bfa;padding:4px 10px;border-radius:12px;font-size:12px;white-space:nowrap;gap:4px}
+.video-tag-remove{background:none;border:none;color:#a78bfa;cursor:pointer;font-size:10px;padding:0 0 0 2px;opacity:0.6;line-height:1}
+.video-tag-remove:hover{opacity:1;color:#f87171}
+.video-tag-add{background:#0f0f1a;border:1px solid #2d2d44;border-radius:12px;color:#e2e8f0;padding:4px 10px;font-size:12px;width:120px;outline:none}
+.video-tag-add:focus{border-color:#7c3aed}
 @media(max-width:640px){
   #file-list{grid-template-columns:1fr;padding:8px;gap:6px}
   nav{padding:8px 12px}
@@ -478,10 +493,24 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
     return ''.join(pieces)
 
 
+def _compute_viable_tags(tags_map, selected_tags):
+    """Return set of lowercased tags that can be added without producing zero results."""
+    selected_lower = {t.lower() for t in selected_tags} if selected_tags else set()
+    viable = set()
+    for video_data in tags_map.values():
+        vtags = {t.lower().strip() for t in video_data.get('tags', [])}
+        if selected_lower <= vtags:
+            viable |= vtags
+    # Remove already-selected tags from viable set
+    viable -= selected_lower
+    return viable
+
+
 def render_tag_filter(tags_map, selected_tags, path):
-    """Render searchable, clickable tag filter bar."""
+    """Render tag filter: selected pills + searchable dropdown of viable tags."""
     if not tags_map:
         return ''
+    # Count all tags
     counts = {}
     for video_data in tags_map.values():
         for tag in video_data.get('tags', []):
@@ -490,41 +519,69 @@ def render_tag_filter(tags_map, selected_tags, path):
                 counts[key] = counts.get(key, 0) + 1
     if not counts:
         return ''
-    sorted_tags = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+
     selected_lower = {t.lower() for t in selected_tags} if selected_tags else set()
+    viable = _compute_viable_tags(tags_map, selected_tags)
 
     pieces = ['<div class="tag-filter">']
-    pieces.append('<input type="text" id="tag-search" class="tag-search" placeholder="Search tags...">')
-    if selected_tags:
-        pieces.append(f'<a class="tag-clear" href="{esc(url_for_browse(path))}">Clear filters</a>')
-    pieces.append('<div class="tag-pills">')
 
-    for tag, count in sorted_tags:
-        is_active = tag in selected_lower
-        if is_active:
-            # Click removes this tag
-            new_tags = [t for t in selected_tags if t.lower() != tag]
-            href = url_for_browse(path, tags=new_tags if new_tags else None)
-        else:
-            # Click adds this tag
+    # Selected tag pills
+    if selected_tags:
+        pieces.append('<div class="tag-selected-pills">')
+        for tag in selected_tags:
+            remove_tags = [t for t in selected_tags if t.lower() != tag.lower()]
+            href = url_for_browse(path, tags=remove_tags if remove_tags else None)
+            pieces.append(
+                f'<a class="tag-pill active" href="{esc(href)}">'
+                f'{esc(tag)} <span class="tag-pill-x">\u00d7</span></a>'
+            )
+        pieces.append(
+            f'<a class="tag-clear" href="{esc(url_for_browse(path))}">Clear all</a>'
+        )
+        pieces.append('</div>')
+
+    # Search input + dropdown
+    viable_sorted = sorted(
+        [(tag, counts[tag]) for tag in viable if tag in counts],
+        key=lambda x: (-x[1], x[0]),
+    )
+
+    if viable_sorted:
+        pieces.append('<div class="tag-dropdown-wrap">')
+        pieces.append(
+            '<input type="text" id="tag-search" class="tag-search" '
+            'placeholder="Filter by tag\u2026" autocomplete="off">'
+        )
+        pieces.append('<div class="tag-dropdown" id="tag-dropdown">')
+        for tag, count in viable_sorted:
             new_tags = list(selected_tags or []) + [tag]
             href = url_for_browse(path, tags=new_tags)
-        active_cls = ' active' if is_active else ''
-        label = esc(tag)
-        if count > 1:
-            label += f' <span class="tag-pill-count">({count})</span>'
-        pieces.append(f'<a class="tag-pill{active_cls}" href="{esc(href)}">{label}</a>')
+            cnt = f' <span class="cnt">({count})</span>' if count > 1 else ''
+            pieces.append(f'<a href="{esc(href)}">{esc(tag)}{cnt}</a>')
+        pieces.append('</div></div>')
 
-    pieces.append('</div>')
-    pieces.append(
-        '<script>'
-        'document.getElementById("tag-search").addEventListener("input",function(){'
-        'var q=this.value.toLowerCase();'
-        'document.querySelectorAll(".tag-pill").forEach(function(p){'
-        'p.style.display=p.textContent.toLowerCase().includes(q)?"":"none"'
-        '})});'
-        '</script>'
-    )
+        # JS: show/hide dropdown, filter, close on outside click
+        pieces.append(
+            '<script>'
+            '(function(){'
+            'var s=document.getElementById("tag-search"),'
+            'd=document.getElementById("tag-dropdown"),'
+            'items=d.querySelectorAll("a");'
+            # Show dropdown on focus (with top items visible)
+            's.addEventListener("focus",function(){d.classList.add("open")});'
+            # Filter on input
+            's.addEventListener("input",function(){'
+            'var q=this.value.toLowerCase();'
+            'items.forEach(function(a){'
+            'a.style.display=a.textContent.toLowerCase().includes(q)?"":"none"'
+            '});d.classList.add("open")});'
+            # Close on outside click
+            'document.addEventListener("click",function(e){'
+            'if(!e.target.closest(".tag-dropdown-wrap"))d.classList.remove("open")});'
+            '})();'
+            '</script>'
+        )
+
     pieces.append('</div>')
     return ''.join(pieces)
 
@@ -566,6 +623,39 @@ def render_error_page(path, error):
     return render_page('SimpleParty \u2014 Error', body)
 
 
+def render_video_tags_inline(rel_path, video_name, tags_list):
+    """Render tag pills with inline add/remove for the video play page."""
+    pieces = ['<div class="video-tag-pills">']
+    for i, tag in enumerate(tags_list):
+        remaining = ', '.join(t for j, t in enumerate(tags_list) if j != i)
+        pieces.append(
+            f'<span class="video-tag-pill">{esc(tag)}'
+            f'<form hx-post="/save-tags" hx-target="#video-meta" hx-swap="innerHTML" '
+            f'style="display:inline;margin:0;padding:0">'
+            f'<input type="hidden" name="path" value="{esc(rel_path)}">'
+            f'<input type="hidden" name="video" value="{esc(video_name)}">'
+            f'<input type="hidden" name="tags" value="{esc(remaining)}">'
+            f'<button type="submit" class="video-tag-remove" title="Remove tag">\u00d7</button>'
+            f'</form></span>'
+        )
+    # Inline add input
+    all_csv = ', '.join(tags_list)
+    prefix = (all_csv + ', ') if all_csv else ''
+    pieces.append(
+        f'<form hx-post="/save-tags" hx-target="#video-meta" hx-swap="innerHTML" '
+        f'style="display:inline;margin:0;padding:0" data-prefix="{esc(prefix)}" '
+        f'onsubmit="var f=this,i=f.querySelector(&quot;.video-tag-add&quot;);'
+        f'f.querySelector(&quot;[name=tags]&quot;).value=f.dataset.prefix+i.value;return true">'
+        f'<input type="hidden" name="path" value="{esc(rel_path)}">'
+        f'<input type="hidden" name="video" value="{esc(video_name)}">'
+        f'<input type="hidden" name="tags" value="">'
+        f'<input type="text" class="video-tag-add" placeholder="add tag\u2026">'
+        f'</form>'
+    )
+    pieces.append('</div>')
+    return ''.join(pieces)
+
+
 def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info, tags_map=None, selected_tags=None):
     v = data['videos'][idx]
     video_src = url_for_video(v['path'])
@@ -593,20 +683,14 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
     body += '</div></div>'
 
     if _config['allow_tag']:
-        video_tags = tags_map.get(v['name'], {}).get('tags', []) if tags_map else []
-        tags_csv = ', '.join(video_tags)
-        body += (
-            f'<div class="video-meta" id="video-meta">'
-            f'<form hx-post="/save-tags" hx-target="#video-meta" hx-swap="innerHTML" '
-            f'style="display:flex;align-items:center;gap:8px;width:100%">'
-            f'<input type="hidden" name="path" value="{esc(data["path"])}">'
-            f'<input type="hidden" name="video" value="{esc(v["name"])}">'
-            f'<input type="text" name="tags" value="{esc(tags_csv)}" '
-            f'placeholder="Add tags (comma-separated)">'
-            f'<button class="btn" type="submit">Save</button>'
-            f'</form>'
-            f'</div>'
-        )
+        video_entry = tags_map.get(v['name'], {}) if tags_map else {}
+        video_tags = video_entry.get('tags', [])
+        video_desc = video_entry.get('description', '')
+        body += f'<div class="video-meta" id="video-meta">'
+        if video_desc:
+            body += f'<div class="video-desc">{esc(video_desc)}</div>'
+        body += render_video_tags_inline(data['path'], v['name'], video_tags)
+        body += '</div>'
 
     body += render_file_list(data, current_idx=idx, show_shuffle=False, tags_map=tags_map, selected_tags=selected_tags)
 
@@ -1025,20 +1109,8 @@ def handle_save_tags(handler, root):
     all_tags[video_name] = entry
     save_tags(resolved, all_tags)
 
-    # Return updated form HTML for HTMX swap
-    tags_csv = ', '.join(tags_list)
-    html = (
-        f'<form hx-post="/save-tags" hx-target="#video-meta" hx-swap="innerHTML" '
-        f'style="display:flex;align-items:center;gap:8px;width:100%">'
-        f'<input type="hidden" name="path" value="{esc(rel_path)}">'
-        f'<input type="hidden" name="video" value="{esc(video_name)}">'
-        f'<input type="text" name="tags" value="{esc(tags_csv)}" '
-        f'placeholder="Add tags (comma-separated)">'
-        f'<button class="btn" type="submit">Save</button>'
-        f'<span style="color:#4ade80;font-size:12px">\u2713 Saved</span>'
-        f'</form>'
-    )
-    send_html(handler, html)
+    # Return updated pill HTML for HTMX swap
+    send_html(handler, render_video_tags_inline(rel_path, video_name, tags_list))
 
 
 # --- Server ---
