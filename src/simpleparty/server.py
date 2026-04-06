@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import urllib.parse
 from functools import partial
 from html import escape as esc
@@ -27,6 +28,10 @@ _config = {
     'has_vlc': False,
     'allow_delete': True,
     'allow_transcode': True,
+    'allow_tag': False,
+    'ollama_url': 'http://localhost:11434',
+    'tag_model': 'huihui_ai/qwen3-vl-abliterated:8b',
+    'tag_jobs': {},  # path -> progress dict
 }
 
 MIME_TYPES = {
@@ -285,6 +290,7 @@ video{width:100%;max-height:70vh;display:block;background:#000}
   display:flex;align-items:center;gap:10px;padding:12px 14px;
   background:#16213e;border-radius:8px;min-height:48px;
   transition:background .15s;border:2px solid transparent;min-width:0;overflow:hidden;
+  flex-wrap:wrap;
 }
 .item:hover{background:#1e3054}
 .item.playing{border-color:#7c3aed}
@@ -312,6 +318,15 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .unlock-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
 .unlock-error{color:#f87171;font-size:13px;margin-top:10px;min-height:1.2em}
 .error-page{color:#f87171;text-align:center;padding:60px 20px;font-size:16px}
+.item-tags{color:#64748b;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;padding-top:2px}
+.tag-progress{color:#94a3b8;font-size:13px;padding:8px 0}
+.tag-summary{padding:12px 16px;display:flex;flex-wrap:wrap;gap:6px;border-bottom:1px solid #2d2d44}
+.tag-pill{display:inline-block;background:#2d2d44;color:#a78bfa;padding:4px 10px;border-radius:12px;font-size:12px;white-space:nowrap}
+.tag-pill-count{color:#64748b;font-size:11px}
+.video-meta{padding:8px 16px;background:#1a1a2e;border-bottom:1px solid #2d2d44;display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.video-meta .item-tags{width:100%}
+.video-meta input[type="text"]{background:#0f0f1a;border:1px solid #2d2d44;border-radius:6px;color:#e2e8f0;padding:6px 10px;font-size:13px;flex:1;min-width:200px}
+.video-meta input:focus{border-color:#7c3aed;outline:none}
 @media(max-width:640px){
   #file-list{grid-template-columns:1fr;padding:8px;gap:6px}
   nav{padding:8px 12px}
@@ -356,14 +371,27 @@ def render_nav(path, encrypted_dir=None):
     return '<nav>' + ''.join(pieces) + '</nav>'
 
 
-def render_file_list(data, current_idx=-1, show_shuffle=True):
+def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None):
     pieces = ['<div id="file-list">']
 
     if show_shuffle and data['videos']:
         shuffle_url = '/play?' + urllib.parse.urlencode({'path': data['path'], 'shuffle': '1'})
+        tag_html = ''
+        if _config['allow_tag']:
+            path_param = esc(data['path'])
+            tag_html = (
+                f'<form hx-post="/tag" style="display:inline">'
+                f'<input type="hidden" name="path" value="{path_param}">'
+                f'<button class="btn">\U0001F3F7 Tag</button>'
+                f'</form>'
+                f'<span hx-get="/tag-status?{urllib.parse.urlencode({"path": data["path"]})}" '
+                f'hx-trigger="load,every 5s" hx-swap="innerHTML" '
+                f'class="tag-progress"></span>'
+            )
         pieces.append(
             f'<div class="action-bar">'
             f'<a class="btn" href="{esc(shuffle_url)}">\u21C5 Shuffle Play</a>'
+            f'{tag_html}'
             f'</div>'
         )
 
@@ -400,6 +428,11 @@ def render_file_list(data, current_idx=-1, show_shuffle=True):
                 f'<button type="submit" class="btn-del" title="Delete">\U0001F5D1</button>'
                 f'</form>'
             )
+        if tags_map and v['name'] in tags_map:
+            video_tags = tags_map[v['name']].get('tags', [])
+            if video_tags:
+                tags_text = esc(' \u00B7 '.join(video_tags[:8]))
+                pieces.append(f'<div class="item-tags">{tags_text}</div>')
         pieces.append('</div>')
 
     if not data['dirs'] and not data['videos']:
@@ -409,10 +442,34 @@ def render_file_list(data, current_idx=-1, show_shuffle=True):
     return ''.join(pieces)
 
 
-def render_browse_page(data):
+def render_tag_summary(tags_map):
+    """Render a tag cloud showing all tags in the directory with counts."""
+    if not tags_map:
+        return ''
+    counts = {}
+    for video_data in tags_map.values():
+        for tag in video_data.get('tags', []):
+            key = tag.lower().strip()
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return ''
+    sorted_tags = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+    pieces = ['<div class="tag-summary">']
+    for tag, count in sorted_tags:
+        label = esc(tag)
+        if count > 1:
+            label += f' <span class="tag-pill-count">({count})</span>'
+        pieces.append(f'<span class="tag-pill">{label}</span>')
+    pieces.append('</div>')
+    return ''.join(pieces)
+
+
+def render_browse_page(data, tags_map=None):
     title = f'SimpleParty \u2014 {data["path"].split("/")[-1]}' if data['path'] else 'SimpleParty'
     body = render_nav(data['path'], data.get('encryptedDir'))
-    body += render_file_list(data)
+    body += render_tag_summary(tags_map)
+    body += render_file_list(data, tags_map=tags_map)
     return render_page(title, body)
 
 
@@ -445,7 +502,7 @@ def render_error_page(path, error):
     return render_page('SimpleParty \u2014 Error', body)
 
 
-def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info):
+def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info, tags_map=None):
     v = data['videos'][idx]
     video_src = url_for_video(v['path'])
     browse_url = url_for_browse(data['path'])
@@ -471,7 +528,23 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         )
     body += '</div></div>'
 
-    body += render_file_list(data, current_idx=idx, show_shuffle=False)
+    if _config['allow_tag']:
+        video_tags = tags_map.get(v['name'], {}).get('tags', []) if tags_map else []
+        tags_csv = ', '.join(video_tags)
+        body += (
+            f'<div class="video-meta" id="video-meta">'
+            f'<form hx-post="/save-tags" hx-target="#video-meta" hx-swap="innerHTML" '
+            f'style="display:flex;align-items:center;gap:8px;width:100%">'
+            f'<input type="hidden" name="path" value="{esc(data["path"])}">'
+            f'<input type="hidden" name="video" value="{esc(v["name"])}">'
+            f'<input type="text" name="tags" value="{esc(tags_csv)}" '
+            f'placeholder="Add tags (comma-separated)">'
+            f'<button class="btn" type="submit">Save</button>'
+            f'</form>'
+            f'</div>'
+        )
+
+    body += render_file_list(data, current_idx=idx, show_shuffle=False, tags_map=tags_map)
 
     body += (
         '<script>\n'
@@ -649,7 +722,12 @@ def handle_browse(handler, root):
         status = 404 if data['error'] == 'Not found' else 400
         send_html(handler, render_error_page(rel_path, data['error']), status)
     else:
-        send_html(handler, render_browse_page(data))
+        tags_map = None
+        if _config['allow_tag']:
+            from simpleparty.tagger import load_tags
+            resolved = resolve_path(root, rel_path)
+            tags_map = load_tags(resolved)
+        send_html(handler, render_browse_page(data, tags_map=tags_map))
 
 
 def handle_play(handler, root):
@@ -685,7 +763,12 @@ def handle_play(handler, root):
         pos_info = f'{idx + 1}/{n}'
         shuffle_url = '/play?' + urllib.parse.urlencode({'path': dir_path, 'shuffle': '1'})
 
-    send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info))
+    tags_map = None
+    if _config['allow_tag']:
+        from simpleparty.tagger import load_tags
+        resolved = resolve_path(root, dir_path)
+        tags_map = load_tags(resolved)
+    send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info, tags_map=tags_map))
 
 
 def handle_video(handler, root):
@@ -786,6 +869,105 @@ def handle_lock(handler, root):
     send_hx_redirect(handler, redirect_url)
 
 
+def handle_tag(handler, root):
+    if not _config['allow_tag']:
+        handler.send_error(403, 'Tagging not enabled')
+        return
+    from simpleparty.tagger import tag_directory
+
+    form = read_form_body(handler)
+    rel_path = form.get('path', '')
+    resolved = resolve_path(root, rel_path)
+    if not resolved.is_dir():
+        handler.send_error(400, 'Not a directory')
+        return
+
+    resolved_str = str(resolved)
+    # Don't start a new job if one is already running for this directory
+    existing = _config['tag_jobs'].get(resolved_str)
+    if existing and existing.get('running'):
+        send_hx_redirect(handler, url_for_browse(rel_path))
+        return
+
+    progress = {'running': True, 'done': 0, 'total': 0, 'current': ''}
+    _config['tag_jobs'][resolved_str] = progress
+
+    t = threading.Thread(
+        target=tag_directory,
+        args=(_config['ollama_url'], _config['tag_model'], resolved_str, progress),
+        daemon=True,
+    )
+    t.start()
+    send_hx_redirect(handler, url_for_browse(rel_path))
+
+
+def handle_tag_status(handler, root):
+    if not _config['allow_tag']:
+        send_html(handler, '')
+        return
+    params = parse_query(handler.path)
+    rel_path = params.get('path', '')
+    resolved = str(resolve_path(root, rel_path))
+
+    progress = _config['tag_jobs'].get(resolved)
+    if not progress or not progress.get('running'):
+        send_html(handler, '')
+        return
+
+    done = progress.get('done', 0)
+    total = progress.get('total', 0)
+    current = progress.get('current', '')
+    text = f'Tagging {done}/{total}'
+    if current:
+        text += f' \u2014 {esc(current)}'
+    text += '\u2026'
+    send_html(handler, text)
+
+
+def handle_save_tags(handler, root):
+    if not _config['allow_tag']:
+        handler.send_error(403, 'Tagging not enabled')
+        return
+    from simpleparty.tagger import load_tags, save_tags
+
+    form = read_form_body(handler)
+    rel_path = form.get('path', '')
+    video_name = form.get('video', '')
+    raw_tags = form.get('tags', '')
+
+    resolved = resolve_path(root, rel_path)
+    if not resolved.is_dir() or not video_name:
+        handler.send_error(400, 'Invalid request')
+        return
+
+    tags_list = [t.strip() for t in raw_tags.split(',') if t.strip()]
+
+    all_tags = load_tags(resolved)
+    entry = all_tags.get(video_name, {})
+    entry['tags'] = tags_list
+    entry.setdefault('description', '')
+    entry.setdefault('model', 'manual')
+    from datetime import datetime, timezone
+    entry['tagged_at'] = datetime.now(timezone.utc).isoformat()
+    all_tags[video_name] = entry
+    save_tags(resolved, all_tags)
+
+    # Return updated form HTML for HTMX swap
+    tags_csv = ', '.join(tags_list)
+    html = (
+        f'<form hx-post="/save-tags" hx-target="#video-meta" hx-swap="innerHTML" '
+        f'style="display:flex;align-items:center;gap:8px;width:100%">'
+        f'<input type="hidden" name="path" value="{esc(rel_path)}">'
+        f'<input type="hidden" name="video" value="{esc(video_name)}">'
+        f'<input type="text" name="tags" value="{esc(tags_csv)}" '
+        f'placeholder="Add tags (comma-separated)">'
+        f'<button class="btn" type="submit">Save</button>'
+        f'<span style="color:#4ade80;font-size:12px">\u2713 Saved</span>'
+        f'</form>'
+    )
+    send_html(handler, html)
+
+
 # --- Server ---
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -803,6 +985,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             handle_play(self, self.root)
         elif path.startswith('/video/'):
             handle_video(self, self.root)
+        elif path == '/tag-status':
+            handle_tag_status(self, self.root)
         else:
             self.send_error(404)
 
@@ -814,6 +998,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             handle_unlock(self, self.root)
         elif path == '/lock':
             handle_lock(self, self.root)
+        elif path == '/tag':
+            handle_tag(self, self.root)
+        elif path == '/save-tags':
+            handle_save_tags(self, self.root)
         else:
             self.send_error(404)
 
@@ -838,6 +1026,10 @@ def main():
     parser.add_argument('-b', '--bind', default='0.0.0.0', help='Bind address (default: 0.0.0.0)')
     parser.add_argument('--no-delete', action='store_true', help='Disable video deletion')
     parser.add_argument('--no-transcode', action='store_true', help='Disable ffmpeg/VLC transcoding')
+    parser.add_argument('--tag', action='store_true', help='Enable AI video tagging (requires Ollama + ffmpeg)')
+    parser.add_argument('--tag-model', default='huihui_ai/qwen3-vl-abliterated:8b',
+                        help='Ollama vision model for tagging (default: huihui_ai/qwen3-vl-abliterated:8b)')
+    parser.add_argument('--ollama-url', default='http://localhost:11434', help='Ollama API URL (default: http://localhost:11434)')
     args = parser.parse_args()
 
     root = str(Path(args.root).resolve())
@@ -849,6 +1041,18 @@ def main():
     _config['has_vlc'] = shutil.which('cvlc') is not None
     _config['allow_delete'] = not args.no_delete
     _config['allow_transcode'] = not args.no_transcode
+
+    if args.tag:
+        from simpleparty.tagger import check_prereqs
+        ok, errors = check_prereqs(args.ollama_url, args.tag_model)
+        if ok:
+            _config['allow_tag'] = True
+            _config['ollama_url'] = args.ollama_url
+            _config['tag_model'] = args.tag_model
+        else:
+            for e in errors:
+                print(f'  tag: {e}', file=sys.stderr)
+            print('  Tagging disabled due to missing requirements.', file=sys.stderr)
 
     handler = partial(RequestHandler, root)
     server = ThreadedServer((args.bind, args.port), handler)
@@ -863,6 +1067,8 @@ def main():
         features.append('delete: on')
     if shutil.which('fscrypt'):
         features.append('fscrypt: on')
+    if _config['allow_tag']:
+        features.append(f'tag: {_config["tag_model"]}')
 
     url = f'http://{args.bind}:{args.port}'
     print(f'SimpleParty serving {root}')
