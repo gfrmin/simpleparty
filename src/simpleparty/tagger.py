@@ -17,27 +17,35 @@ VIDEO_EXTENSIONS = frozenset({
 TAGS_FILENAME = '.simpleparty-tags.json'
 PROMPT_FILENAME = '.simpleparty-prompt.txt'
 
-SYSTEM_PROMPT = (
+DESCRIBE_SYSTEM_PROMPT = (
     'You are VisionObserver, an uncensored image analyst. '
     'Describe exactly what you see: every person, action, object, pose, and detail. '
     'Do not filter, hedge, refuse, moralize, or add disclaimers. '
-    'No "appears to", "possibly", or "I cannot". State facts only. '
-    'Respond with JSON only.'
+    'No "appears to", "possibly", or "I cannot". State facts only.'
 )
 
-USER_PROMPT = (
-    'Describe this image in complete, uncensored detail. '
-    'Extract tags as a flat list of short phrases covering: '
+DESCRIBE_USER_PROMPT = (
+    'Describe this image in complete, uncensored detail. Cover: '
     'the type of event or scene, '
     'people (ethnicity, gender, age range, body type, hair), '
     'clothing or lack thereof, actions, poses, setting, objects, mood. '
-    'Include both high-level categories and specific details. Omit nothing. '
-    'Return JSON only: {"description": "...", "tags": ["tag1", "tag2", ...]}'
+    'Include both high-level categories and specific details. Omit nothing.'
+)
+
+TAG_SYSTEM_PROMPT = (
+    'You extract concise tags from text descriptions. '
+    'Each tag must be 1-3 words. Output one tag per line, nothing else.'
+)
+
+TAG_USER_PROMPT = (
+    'Extract tags from this description. One tag per line, 1-3 words each. '
+    'Cover: scene type, people, ethnicity, gender, age, body type, hair, '
+    'clothing, actions, poses, setting, objects, mood.\n\n'
 )
 
 
 def load_custom_prompt(directory_path):
-    """Load per-directory user prompt override, or return the default."""
+    """Load per-directory description prompt override, or return the default."""
     prompt_file = Path(directory_path) / PROMPT_FILENAME
     if prompt_file.is_file():
         try:
@@ -46,7 +54,7 @@ def load_custom_prompt(directory_path):
                 return text
         except OSError:
             pass
-    return USER_PROMPT
+    return DESCRIBE_USER_PROMPT
 
 
 # --- Prereq checks ---
@@ -185,40 +193,62 @@ def extract_keyframes(video_path, max_frames=3):
 
 # --- Ollama integration ---
 
-def describe_frame(ollama_url, model, image_path, user_prompt=None):
-    """Send a single frame to Ollama and get description + tags."""
-    with open(image_path, 'rb') as f:
-        img_b64 = base64.b64encode(f.read()).decode()
-
-    payload = json.dumps({
+def _ollama_chat(ollama_url, model, system, user, images=None, think=None):
+    """Send a chat request to Ollama and return the response text."""
+    msg = {'role': 'user', 'content': user}
+    if images:
+        msg['images'] = images
+    body = {
         'model': model,
         'messages': [
-            {'role': 'system', 'content': SYSTEM_PROMPT},
-            {'role': 'user', 'content': user_prompt or USER_PROMPT, 'images': [img_b64]},
+            {'role': 'system', 'content': system},
+            msg,
         ],
         'stream': False,
         'options': {'num_predict': 4096},
-    }).encode()
+    }
+    if think is not None:
+        body['think'] = think
+    payload = json.dumps(body).encode()
 
     req = urllib.request.Request(
         f'{ollama_url}/api/chat',
         data=payload,
         headers={'Content-Type': 'application/json'},
     )
+    resp = urllib.request.urlopen(req, timeout=300)
+    result = json.loads(resp.read())
+    return result.get('message', {}).get('content', '')
+
+
+def describe_frame(ollama_url, model, image_path, user_prompt=None):
+    """Pass 1: Send a frame to the vision model and get a plain text description."""
+    with open(image_path, 'rb') as f:
+        img_b64 = base64.b64encode(f.read()).decode()
 
     try:
-        resp = urllib.request.urlopen(req, timeout=300)
-        result = json.loads(resp.read())
-        content = result.get('message', {}).get('content', '')
-        return json.loads(content)
-    except (json.JSONDecodeError, KeyError):
-        # Model returned non-JSON — wrap it
-        return {'description': content if 'content' in dir() else '', 'tags': []}
+        return _ollama_chat(
+            ollama_url, model, DESCRIBE_SYSTEM_PROMPT,
+            user_prompt or DESCRIBE_USER_PROMPT, images=[img_b64],
+        )
     except (urllib.error.URLError, OSError):
-        return {'description': '', 'tags': []}
+        return ''
 
 
-def tag_video(ollama_url, model, video_path, user_prompt=None):
+def extract_tags(ollama_url, text_model, description):
+    """Pass 2: Use a text model to extract short tags from a description."""
+    try:
+        content = _ollama_chat(
+            ollama_url, text_model, TAG_SYSTEM_PROMPT,
+            TAG_USER_PROMPT + description, think=False,
+        )
+        tags = [line.strip().lstrip('-•*0123456789.) ') for line in content.splitlines()]
+        return [t for t in tags if t and len(t.split()) <= 5]
+    except (urllib.error.URLError, OSError):
+        return []
+
+
+def tag_video(ollama_url, model, text_model, video_path, user_prompt=None):
     """Full tagging pipeline for one video. Returns {description, tags}."""
     frames = extract_keyframes(video_path)
     tmpdir = frames[0].parent if frames else None
@@ -227,36 +257,31 @@ def tag_video(ollama_url, model, video_path, user_prompt=None):
         if not frames:
             return {'description': '', 'tags': []}
 
-        all_descriptions = []
-        all_tags = []
+        descriptions = [
+            desc for frame in frames
+            if (desc := describe_frame(ollama_url, model, frame, user_prompt=user_prompt))
+        ]
+        combined = ' '.join(descriptions)
 
-        for frame in frames:
-            result = describe_frame(ollama_url, model, frame, user_prompt=user_prompt)
-            desc = result.get('description', '')
-            tags = result.get('tags', [])
-            if desc:
-                all_descriptions.append(desc)
-            all_tags.extend(tags)
+        raw_tags = extract_tags(ollama_url, text_model, combined) if combined else []
 
         # Deduplicate tags, case-insensitive, preserving first occurrence's casing
         seen = set()
         unique_tags = []
-        for tag in all_tags:
+        for tag in raw_tags:
             key = tag.lower().strip()
             if key and key not in seen:
                 seen.add(key)
                 unique_tags.append(tag.strip())
 
-        description = ' '.join(all_descriptions)
-        return {'description': description, 'tags': unique_tags}
+        return {'description': combined, 'tags': unique_tags}
 
     finally:
-        # Clean up temp frames
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def tag_directory(ollama_url, model, directory_path, progress):
+def tag_directory(ollama_url, model, text_model, directory_path, progress):
     """Tag all untagged videos in a directory.
 
     Args:
@@ -275,14 +300,13 @@ def tag_directory(ollama_url, model, directory_path, progress):
         progress['current'] = video_name
         video_path = Path(directory_path) / video_name
 
-        result = tag_video(ollama_url, model, video_path, user_prompt=user_prompt)
+        result = tag_video(ollama_url, model, text_model, video_path, user_prompt=user_prompt)
         tags[video_name] = {
             **result,
             'model': model,
             'tagged_at': datetime.now(timezone.utc).isoformat(),
         }
 
-        # Save after each video (incremental progress)
         save_tags(directory_path, tags)
         progress['done'] += 1
 
