@@ -197,11 +197,16 @@ def parse_query(url):
     return {k: v[0] for k, v in params.items()}
 
 
-def url_for_browse(path=''):
-    return '/' if not path else '/browse?' + urllib.parse.urlencode({'path': path})
+def url_for_browse(path='', tags=None):
+    params = {}
+    if path:
+        params['path'] = path
+    if tags:
+        params['tags'] = ','.join(tags)
+    return '/' if not params else '/browse?' + urllib.parse.urlencode(params)
 
 
-def url_for_play(dir_path, idx, shuffle=False, seed=None, pos=None):
+def url_for_play(dir_path, idx, shuffle=False, seed=None, pos=None, tags=None):
     params = {'path': dir_path, 'idx': str(idx)}
     if shuffle:
         params['shuffle'] = '1'
@@ -209,6 +214,8 @@ def url_for_play(dir_path, idx, shuffle=False, seed=None, pos=None):
             params['seed'] = str(seed)
         if pos is not None:
             params['pos'] = str(pos)
+    if tags:
+        params['tags'] = ','.join(tags)
     return '/play?' + urllib.parse.urlencode(params)
 
 
@@ -224,6 +231,24 @@ def fmt_size(b):
     if b < 1073741824:
         return f'{b / 1048576:.1f} MB'
     return f'{b / 1073741824:.1f} GB'
+
+
+def parse_tags_param(params):
+    """Parse comma-separated tags from URL params into a list."""
+    raw = params.get('tags', '')
+    return [t.strip() for t in raw.split(',') if t.strip()] if raw else []
+
+
+def filter_videos_by_tags(videos, tags_map, selected_tags):
+    """Filter video list to those having ALL selected tags (AND logic)."""
+    if not selected_tags or not tags_map:
+        return videos
+    selected_lower = {t.lower() for t in selected_tags}
+    return [
+        v for v in videos
+        if v['name'] in tags_map
+        and selected_lower <= {t.lower() for t in tags_map[v['name']].get('tags', [])}
+    ]
 
 
 def shuffle_indices(n, seed):
@@ -321,9 +346,16 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .error-page{color:#f87171;text-align:center;padding:60px 20px;font-size:16px}
 .item-tags{color:#64748b;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;padding-top:2px}
 .tag-progress{color:#94a3b8;font-size:13px;padding:8px 0}
-.tag-summary{padding:12px 16px;display:flex;flex-wrap:wrap;gap:6px;border-bottom:1px solid #2d2d44}
-.tag-pill{display:inline-block;background:#2d2d44;color:#a78bfa;padding:4px 10px;border-radius:12px;font-size:12px;white-space:nowrap}
+.tag-filter{padding:12px 16px;border-bottom:1px solid #2d2d44}
+.tag-search{background:#0f0f1a;border:1px solid #2d2d44;border-radius:6px;color:#e2e8f0;padding:6px 10px;font-size:13px;width:200px;margin-bottom:8px;margin-right:8px}
+.tag-search:focus{border-color:#7c3aed;outline:none}
+.tag-pills{display:flex;flex-wrap:wrap;gap:6px}
+.tag-pill{display:inline-block;background:#2d2d44;color:#a78bfa;padding:4px 10px;border-radius:12px;font-size:12px;white-space:nowrap;cursor:pointer;text-decoration:none;transition:all .15s}
+.tag-pill:hover{background:#3d3d5c}
+.tag-pill.active{background:#7c3aed;color:#fff}
 .tag-pill-count{color:#64748b;font-size:11px}
+.tag-pill.active .tag-pill-count{color:rgba(255,255,255,0.7)}
+.tag-clear{color:#94a3b8;font-size:12px;cursor:pointer;text-decoration:underline;padding:4px 8px}
 .video-meta{padding:8px 16px;background:#1a1a2e;border-bottom:1px solid #2d2d44;display:flex;flex-wrap:wrap;align-items:center;gap:8px}
 .video-meta .item-tags{width:100%}
 .video-meta input[type="text"]{background:#0f0f1a;border:1px solid #2d2d44;border-radius:6px;color:#e2e8f0;padding:6px 10px;font-size:13px;flex:1;min-width:200px}
@@ -372,11 +404,14 @@ def render_nav(path, encrypted_dir=None):
     return '<nav>' + ''.join(pieces) + '</nav>'
 
 
-def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None):
+def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, selected_tags=None):
     pieces = ['<div id="file-list">']
 
     if show_shuffle and data['videos']:
-        shuffle_url = '/play?' + urllib.parse.urlencode({'path': data['path'], 'shuffle': '1'})
+        shuffle_params = {'path': data['path'], 'shuffle': '1'}
+        if selected_tags:
+            shuffle_params['tags'] = ','.join(selected_tags)
+        shuffle_url = '/play?' + urllib.parse.urlencode(shuffle_params)
         tag_html = ''
         if _config['allow_ai_tag']:
             path_param = esc(data['path'])
@@ -412,7 +447,7 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None):
 
     for i, v in enumerate(data['videos']):
         cls = ' playing' if i == current_idx else ''
-        play_url = url_for_play(data['path'], i)
+        play_url = url_for_play(data['path'], i, tags=selected_tags)
         pieces.append(f'<div class="item{cls}">')
         pieces.append(
             f'<a class="item-link" href="{esc(play_url)}">'
@@ -443,8 +478,8 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None):
     return ''.join(pieces)
 
 
-def render_tag_summary(tags_map):
-    """Render a tag cloud showing all tags in the directory with counts."""
+def render_tag_filter(tags_map, selected_tags, path):
+    """Render searchable, clickable tag filter bar."""
     if not tags_map:
         return ''
     counts = {}
@@ -456,21 +491,49 @@ def render_tag_summary(tags_map):
     if not counts:
         return ''
     sorted_tags = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
-    pieces = ['<div class="tag-summary">']
+    selected_lower = {t.lower() for t in selected_tags} if selected_tags else set()
+
+    pieces = ['<div class="tag-filter">']
+    pieces.append('<input type="text" id="tag-search" class="tag-search" placeholder="Search tags...">')
+    if selected_tags:
+        pieces.append(f'<a class="tag-clear" href="{esc(url_for_browse(path))}">Clear filters</a>')
+    pieces.append('<div class="tag-pills">')
+
     for tag, count in sorted_tags:
+        is_active = tag in selected_lower
+        if is_active:
+            # Click removes this tag
+            new_tags = [t for t in selected_tags if t.lower() != tag]
+            href = url_for_browse(path, tags=new_tags if new_tags else None)
+        else:
+            # Click adds this tag
+            new_tags = list(selected_tags or []) + [tag]
+            href = url_for_browse(path, tags=new_tags)
+        active_cls = ' active' if is_active else ''
         label = esc(tag)
         if count > 1:
             label += f' <span class="tag-pill-count">({count})</span>'
-        pieces.append(f'<span class="tag-pill">{label}</span>')
+        pieces.append(f'<a class="tag-pill{active_cls}" href="{esc(href)}">{label}</a>')
+
+    pieces.append('</div>')
+    pieces.append(
+        '<script>'
+        'document.getElementById("tag-search").addEventListener("input",function(){'
+        'var q=this.value.toLowerCase();'
+        'document.querySelectorAll(".tag-pill").forEach(function(p){'
+        'p.style.display=p.textContent.toLowerCase().includes(q)?"":"none"'
+        '})});'
+        '</script>'
+    )
     pieces.append('</div>')
     return ''.join(pieces)
 
 
-def render_browse_page(data, tags_map=None):
+def render_browse_page(data, tags_map=None, selected_tags=None):
     title = f'SimpleParty \u2014 {data["path"].split("/")[-1]}' if data['path'] else 'SimpleParty'
     body = render_nav(data['path'], data.get('encryptedDir'))
-    body += render_tag_summary(tags_map)
-    body += render_file_list(data, tags_map=tags_map)
+    body += render_tag_filter(tags_map, selected_tags, data['path'])
+    body += render_file_list(data, tags_map=tags_map, selected_tags=selected_tags)
     return render_page(title, body)
 
 
@@ -503,10 +566,10 @@ def render_error_page(path, error):
     return render_page('SimpleParty \u2014 Error', body)
 
 
-def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info, tags_map=None):
+def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info, tags_map=None, selected_tags=None):
     v = data['videos'][idx]
     video_src = url_for_video(v['path'])
-    browse_url = url_for_browse(data['path'])
+    browse_url = url_for_browse(data['path'], tags=selected_tags)
 
     body = render_nav(data['path'], data.get('encryptedDir'))
     body += (
@@ -545,7 +608,7 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
             f'</div>'
         )
 
-    body += render_file_list(data, current_idx=idx, show_shuffle=False, tags_map=tags_map)
+    body += render_file_list(data, current_idx=idx, show_shuffle=False, tags_map=tags_map, selected_tags=selected_tags)
 
     body += (
         '<script>\n'
@@ -724,11 +787,13 @@ def handle_browse(handler, root):
         send_html(handler, render_error_page(rel_path, data['error']), status)
     else:
         tags_map = None
+        selected_tags = parse_tags_param(params)
         if _config['allow_tag']:
             from simpleparty.tagger import load_tags
             resolved = resolve_path(root, rel_path)
             tags_map = load_tags(resolved)
-        send_html(handler, render_browse_page(data, tags_map=tags_map))
+            data['videos'] = filter_videos_by_tags(data['videos'], tags_map, selected_tags)
+        send_html(handler, render_browse_page(data, tags_map=tags_map, selected_tags=selected_tags))
 
 
 def handle_play(handler, root):
@@ -739,8 +804,17 @@ def handle_play(handler, root):
     if data.get('locked'):
         send_html(handler, render_locked_page(dir_path, data['encryptedDir']))
         return
+
+    selected_tags = parse_tags_param(params)
+    tags_map = None
+    if _config['allow_tag']:
+        from simpleparty.tagger import load_tags
+        resolved = resolve_path(root, dir_path)
+        tags_map = load_tags(resolved)
+        data['videos'] = filter_videos_by_tags(data['videos'], tags_map, selected_tags)
+
     if 'error' in data or not data.get('videos'):
-        send_redirect(handler, url_for_browse(dir_path))
+        send_redirect(handler, url_for_browse(dir_path, tags=selected_tags))
         return
 
     n = len(data['videos'])
@@ -753,23 +827,21 @@ def handle_play(handler, root):
         idx = order[pos]
         next_pos = (pos + 1) % n
         prev_pos = (pos - 1) % n
-        next_url = url_for_play(dir_path, order[next_pos], shuffle=True, seed=seed, pos=next_pos)
-        prev_url = url_for_play(dir_path, order[prev_pos], shuffle=True, seed=seed, pos=prev_pos)
+        next_url = url_for_play(dir_path, order[next_pos], shuffle=True, seed=seed, pos=next_pos, tags=selected_tags)
+        prev_url = url_for_play(dir_path, order[prev_pos], shuffle=True, seed=seed, pos=prev_pos, tags=selected_tags)
         pos_info = f'{pos + 1}/{n}'
-        shuffle_url = url_for_play(dir_path, idx)
+        shuffle_url = url_for_play(dir_path, idx, tags=selected_tags)
     else:
         idx = max(0, min(safe_int(params.get('idx')), n - 1))
-        next_url = url_for_play(dir_path, (idx + 1) % n)
-        prev_url = url_for_play(dir_path, (idx - 1) % n)
+        next_url = url_for_play(dir_path, (idx + 1) % n, tags=selected_tags)
+        prev_url = url_for_play(dir_path, (idx - 1) % n, tags=selected_tags)
         pos_info = f'{idx + 1}/{n}'
-        shuffle_url = '/play?' + urllib.parse.urlencode({'path': dir_path, 'shuffle': '1'})
+        shuffle_params = {'path': dir_path, 'shuffle': '1'}
+        if selected_tags:
+            shuffle_params['tags'] = ','.join(selected_tags)
+        shuffle_url = '/play?' + urllib.parse.urlencode(shuffle_params)
 
-    tags_map = None
-    if _config['allow_tag']:
-        from simpleparty.tagger import load_tags
-        resolved = resolve_path(root, dir_path)
-        tags_map = load_tags(resolved)
-    send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info, tags_map=tags_map))
+    send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info, tags_map=tags_map, selected_tags=selected_tags))
 
 
 def handle_video(handler, root):
