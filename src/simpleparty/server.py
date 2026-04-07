@@ -29,10 +29,6 @@ _config = {
     'allow_delete': True,
     'allow_transcode': True,
     'allow_tag': True,
-    'allow_ai_tag': False,
-    'ollama_url': 'http://localhost:11434',
-    'tag_model': 'huihui_ai/qwen3-vl-abliterated:8b',
-    'tag_frames': 1,
     'tag_jobs': {},  # path -> progress dict
 }
 
@@ -346,6 +342,7 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .unlock-error{color:#f87171;font-size:13px;margin-top:10px;min-height:1.2em}
 .error-page{color:#f87171;text-align:center;padding:60px 20px;font-size:16px}
 .item-tags{color:#64748b;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;padding-top:2px}
+.item-tags.suggested{color:#a78bfa;opacity:0.5;font-style:italic}
 .tag-progress{color:#94a3b8;font-size:13px;padding:8px 0}
 .tag-filter{padding:8px 16px;border-bottom:1px solid #2d2d44;display:flex;flex-wrap:wrap;align-items:center;gap:8px}
 .tag-selected-pills{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
@@ -371,6 +368,11 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .video-meta input:focus{border-color:#7c3aed;outline:none}
 .video-tag-pills{display:flex;flex-wrap:wrap;gap:6px;align-items:center;width:100%}
 .video-tag-pill{display:inline-flex;align-items:center;background:#2d2d44;color:#a78bfa;padding:4px 10px;border-radius:12px;font-size:12px;white-space:nowrap;gap:4px}
+.video-tag-pill.suggested{background:transparent;border:1px dashed #a78bfa;opacity:0.7}
+.btn-confirm{color:#4ade80;border-color:#4ade80;font-size:12px;padding:2px 8px}
+.btn-confirm:hover{background:#166534}
+.btn-reject{color:#f87171;border-color:#f87171;font-size:12px;padding:2px 8px}
+.btn-reject:hover{background:#7f1d1d}
 .video-tag-remove{background:none;border:none;color:#a78bfa;cursor:pointer;font-size:10px;padding:0 0 0 2px;opacity:0.6;line-height:1}
 .video-tag-remove:hover{opacity:1;color:#f87171}
 .video-tag-add{background:#0f0f1a;border:1px solid #2d2d44;border-radius:12px;color:#e2e8f0;padding:4px 10px;font-size:12px;width:120px;outline:none}
@@ -428,13 +430,38 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
             shuffle_params['tags'] = ','.join(selected_tags)
         shuffle_url = '/play?' + urllib.parse.urlencode(shuffle_params)
         tag_html = ''
-        if _config['allow_ai_tag']:
+        if _config['allow_tag'] and _config['has_ffmpeg']:
             path_param = esc(data['path'])
+            # Check if model exists for this directory
+            from simpleparty.tagger import MODEL_FILENAME
+            resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
+            has_model = (resolved_dir / MODEL_FILENAME).exists() if resolved_dir.is_dir() else False
             tag_html = (
-                f'<form hx-post="/tag" style="display:inline">'
+                f'<form hx-post="/train" style="display:inline">'
                 f'<input type="hidden" name="path" value="{path_param}">'
-                f'<button class="btn">\U0001F3F7 Tag</button>'
+                f'<button class="btn">\U0001F9E0 Train</button>'
                 f'</form>'
+            )
+            if has_model:
+                tag_html += (
+                    f'<form hx-post="/suggest" style="display:inline">'
+                    f'<input type="hidden" name="path" value="{path_param}">'
+                    f'<button class="btn">\U0001F3F7 Suggest tags</button>'
+                    f'</form>'
+                )
+            # Show "Confirm all" if there are suggested tags
+            if tags_map:
+                has_suggested = any(
+                    e.get('status') == 'suggested' for e in tags_map.values()
+                )
+                if has_suggested:
+                    tag_html += (
+                        f'<form hx-post="/confirm-all" style="display:inline">'
+                        f'<input type="hidden" name="path" value="{path_param}">'
+                        f'<button class="btn btn-confirm">\u2714 Confirm all</button>'
+                        f'</form>'
+                    )
+            tag_html += (
                 f'<span hx-get="/tag-status?{urllib.parse.urlencode({"path": data["path"]})}" '
                 f'hx-trigger="load,every 5s" hx-swap="innerHTML" '
                 f'class="tag-progress"></span>'
@@ -480,10 +507,14 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
                 f'</form>'
             )
         if tags_map and v['name'] in tags_map:
-            video_tags = tags_map[v['name']].get('tags', [])
+            entry = tags_map[v['name']]
+            video_tags = entry.get('tags', [])
             if video_tags:
+                is_suggested = entry.get('status') == 'suggested'
                 tags_text = esc(' \u00B7 '.join(video_tags[:8]))
-                pieces.append(f'<div class="item-tags">{tags_text}</div>')
+                cls = ' suggested' if is_suggested else ''
+                prefix = '\u2753 ' if is_suggested else ''
+                pieces.append(f'<div class="item-tags{cls}">{prefix}{tags_text}</div>')
         pieces.append('</div>')
 
     if not data['dirs'] and not data['videos']:
@@ -623,13 +654,32 @@ def render_error_page(path, error):
     return render_page('SimpleParty \u2014 Error', body)
 
 
-def render_video_tags_inline(rel_path, video_name, tags_list):
+def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'):
     """Render tag pills with inline add/remove for the video play page."""
+    is_suggested = status == 'suggested'
     pieces = ['<div class="video-tag-pills">']
+
+    if is_suggested:
+        pieces.append(
+            f'<form hx-post="/confirm-tags" hx-target="#video-meta" hx-swap="innerHTML" '
+            f'style="display:inline;margin:0;padding:0">'
+            f'<input type="hidden" name="path" value="{esc(rel_path)}">'
+            f'<input type="hidden" name="video" value="{esc(video_name)}">'
+            f'<button type="submit" class="btn btn-confirm" title="Accept suggested tags">'
+            f'\u2714 Accept</button></form> '
+            f'<form hx-post="/reject-tags" hx-target="#video-meta" hx-swap="innerHTML" '
+            f'style="display:inline;margin:0;padding:0">'
+            f'<input type="hidden" name="path" value="{esc(rel_path)}">'
+            f'<input type="hidden" name="video" value="{esc(video_name)}">'
+            f'<button type="submit" class="btn btn-reject" title="Reject suggested tags">'
+            f'\u2718 Reject</button></form> '
+        )
+
+    pill_class = 'video-tag-pill suggested' if is_suggested else 'video-tag-pill'
     for i, tag in enumerate(tags_list):
         remaining = ', '.join(t for j, t in enumerate(tags_list) if j != i)
         pieces.append(
-            f'<span class="video-tag-pill">{esc(tag)}'
+            f'<span class="{pill_class}">{esc(tag)}'
             f'<form hx-post="/save-tags" hx-target="#video-meta" hx-swap="innerHTML" '
             f'style="display:inline;margin:0;padding:0">'
             f'<input type="hidden" name="path" value="{esc(rel_path)}">'
@@ -683,10 +733,12 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
     body += '</div></div>'
 
     if _config['allow_tag']:
-        video_tags = tags_map.get(v['name'], {}).get('tags', []) if tags_map else []
+        video_entry = tags_map.get(v['name'], {}) if tags_map else {}
+        video_tags = video_entry.get('tags', [])
+        video_status = video_entry.get('status', 'confirmed')
         body += (
             f'<div class="video-meta" id="video-meta">'
-            + render_video_tags_inline(data['path'], v['name'], video_tags)
+            + render_video_tags_inline(data['path'], v['name'], video_tags, status=video_status)
             + '</div>'
         )
 
@@ -1024,11 +1076,45 @@ def handle_lock(handler, root):
     send_hx_redirect(handler, redirect_url)
 
 
-def handle_tag(handler, root):
-    if not _config['allow_ai_tag']:
-        handler.send_error(403, 'AI tagging not available')
+def handle_train(handler, root):
+    if not _config['allow_tag']:
+        handler.send_error(403, 'Tagging not enabled')
         return
-    from simpleparty.tagger import tag_directory
+    from simpleparty.classifier import train
+
+    form = read_form_body(handler)
+    rel_path = form.get('path', '')
+    max_frames = int(form.get('frames', '1'))
+    resolved = resolve_path(root, rel_path)
+    if not resolved.is_dir():
+        handler.send_error(400, 'Not a directory')
+        return
+
+    resolved_str = str(resolved)
+    existing = _config['tag_jobs'].get(resolved_str)
+    if existing and existing.get('running'):
+        send_hx_redirect(handler, url_for_browse(rel_path))
+        return
+
+    progress = {'running': True, 'done': 0, 'total': 0, 'current': '', 'phase': 'starting'}
+    _config['tag_jobs'][resolved_str] = progress
+
+    t = threading.Thread(
+        target=train,
+        args=(resolved_str,),
+        kwargs={'max_frames': max_frames, 'progress': progress},
+        daemon=True,
+    )
+    t.start()
+    send_hx_redirect(handler, url_for_browse(rel_path))
+
+
+def handle_suggest(handler, root):
+    if not _config['allow_tag']:
+        handler.send_error(403, 'Tagging not enabled')
+        return
+    from simpleparty.classifier import suggest_for_directory
+    from simpleparty.tagger import MODEL_FILENAME
 
     form = read_form_body(handler)
     rel_path = form.get('path', '')
@@ -1037,23 +1123,105 @@ def handle_tag(handler, root):
         handler.send_error(400, 'Not a directory')
         return
 
+    model_path = str(resolved / MODEL_FILENAME)
+    if not Path(model_path).exists():
+        handler.send_error(400, 'No trained model found. Train first.')
+        return
+
     resolved_str = str(resolved)
-    # Don't start a new job if one is already running for this directory
     existing = _config['tag_jobs'].get(resolved_str)
     if existing and existing.get('running'):
         send_hx_redirect(handler, url_for_browse(rel_path))
         return
 
-    progress = {'running': True, 'done': 0, 'total': 0, 'current': ''}
+    progress = {'running': True, 'done': 0, 'total': 0, 'current': '', 'phase': 'suggesting'}
     _config['tag_jobs'][resolved_str] = progress
 
     t = threading.Thread(
-        target=tag_directory,
-        args=(_config['ollama_url'], _config['tag_model'], resolved_str, progress, _config['tag_frames']),
+        target=suggest_for_directory,
+        args=(resolved_str, model_path),
+        kwargs={'progress': progress},
         daemon=True,
     )
     t.start()
     send_hx_redirect(handler, url_for_browse(rel_path))
+
+
+def handle_confirm_tags(handler, root):
+    if not _config['allow_tag']:
+        handler.send_error(403, 'Tagging not enabled')
+        return
+    from simpleparty.tagger import load_tags, save_tags
+
+    form = read_form_body(handler)
+    rel_path = form.get('path', '')
+    video_name = form.get('video', '')
+    resolved = resolve_path(root, rel_path)
+
+    if not resolved.is_dir() or not video_name:
+        handler.send_error(400, 'Invalid request')
+        return
+
+    all_tags = load_tags(resolved)
+    entry = all_tags.get(video_name, {})
+    entry['status'] = 'confirmed'
+    from datetime import datetime, timezone
+    entry['confirmed_at'] = datetime.now(timezone.utc).isoformat()
+    all_tags[video_name] = entry
+    save_tags(resolved, all_tags)
+
+    tags_list = entry.get('tags', [])
+    send_html(handler, render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'))
+
+
+def handle_confirm_all(handler, root):
+    if not _config['allow_tag']:
+        handler.send_error(403, 'Tagging not enabled')
+        return
+    from simpleparty.tagger import load_tags, save_tags
+
+    form = read_form_body(handler)
+    rel_path = form.get('path', '')
+    resolved = resolve_path(root, rel_path)
+
+    if not resolved.is_dir():
+        handler.send_error(400, 'Invalid request')
+        return
+
+    all_tags = load_tags(resolved)
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    count = 0
+    for entry in all_tags.values():
+        if entry.get('status') == 'suggested':
+            entry['status'] = 'confirmed'
+            entry['confirmed_at'] = now
+            count += 1
+    save_tags(resolved, all_tags)
+    send_hx_redirect(handler, url_for_browse(rel_path))
+
+
+def handle_reject_tags(handler, root):
+    if not _config['allow_tag']:
+        handler.send_error(403, 'Tagging not enabled')
+        return
+    from simpleparty.tagger import load_tags, save_tags
+
+    form = read_form_body(handler)
+    rel_path = form.get('path', '')
+    video_name = form.get('video', '')
+    resolved = resolve_path(root, rel_path)
+
+    if not resolved.is_dir() or not video_name:
+        handler.send_error(400, 'Invalid request')
+        return
+
+    all_tags = load_tags(resolved)
+    if video_name in all_tags:
+        del all_tags[video_name]
+        save_tags(resolved, all_tags)
+
+    send_html(handler, render_video_tags_inline(rel_path, video_name, []))
 
 
 def handle_tag_status(handler, root):
@@ -1065,14 +1233,26 @@ def handle_tag_status(handler, root):
     resolved = str(resolve_path(root, rel_path))
 
     progress = _config['tag_jobs'].get(resolved)
-    if not progress or not progress.get('running'):
+    if not progress:
         send_html(handler, '')
         return
 
+    if progress.get('error'):
+        send_html(handler, f'Error: {esc(progress["error"])}')
+        return
+
+    if not progress.get('running'):
+        if progress.get('phase') == 'done':
+            send_html(handler, esc(progress.get('current', 'Done')))
+        else:
+            send_html(handler, '')
+        return
+
+    phase = progress.get('phase', '')
     done = progress.get('done', 0)
     total = progress.get('total', 0)
     current = progress.get('current', '')
-    text = f'Tagging {done}/{total} (runs in background)'
+    text = f'{phase}: {done}/{total}' if total else phase
     if current:
         text += f' \u2014 {esc(current)}'
     text += '\u2026'
@@ -1100,8 +1280,7 @@ def handle_save_tags(handler, root):
     all_tags = load_tags(resolved)
     entry = all_tags.get(video_name, {})
     entry['tags'] = tags_list
-    entry.setdefault('description', '')
-    entry.setdefault('model', 'manual')
+    entry['status'] = 'confirmed'
     from datetime import datetime, timezone
     entry['tagged_at'] = datetime.now(timezone.utc).isoformat()
     all_tags[video_name] = entry
@@ -1141,8 +1320,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             handle_unlock(self, self.root)
         elif path == '/lock':
             handle_lock(self, self.root)
-        elif path == '/tag':
-            handle_tag(self, self.root)
+        elif path == '/train':
+            handle_train(self, self.root)
+        elif path == '/suggest':
+            handle_suggest(self, self.root)
+        elif path == '/confirm-tags':
+            handle_confirm_tags(self, self.root)
+        elif path == '/confirm-all':
+            handle_confirm_all(self, self.root)
+        elif path == '/reject-tags':
+            handle_reject_tags(self, self.root)
         elif path == '/save-tags':
             handle_save_tags(self, self.root)
         else:
@@ -1170,11 +1357,6 @@ def main():
     parser.add_argument('--no-delete', action='store_true', help='Disable video deletion')
     parser.add_argument('--no-transcode', action='store_true', help='Disable ffmpeg/VLC transcoding')
     parser.add_argument('--no-tag', action='store_true', help='Disable all tagging features')
-    parser.add_argument('--tag-model', default='huihui_ai/qwen3-vl-abliterated:8b',
-                        help='Ollama vision model for describing frames (default: huihui_ai/qwen3-vl-abliterated:8b)')
-    parser.add_argument('--tag-frames', type=int, default=1,
-                        help='Number of keyframes per video (default: 1, extracts extra to skip dark frames)')
-    parser.add_argument('--ollama-url', default='http://localhost:11434', help='Ollama API URL (default: http://localhost:11434)')
     args = parser.parse_args()
 
     root = str(Path(args.root).resolve())
@@ -1187,21 +1369,9 @@ def main():
     _config['allow_delete'] = not args.no_delete
     _config['allow_transcode'] = not args.no_transcode
 
+    _config['root'] = root
     if args.no_tag:
         _config['allow_tag'] = False
-        _config['allow_ai_tag'] = False
-    else:
-        from simpleparty.tagger import check_prereqs
-        ok, errors = check_prereqs(args.ollama_url, args.tag_model)
-        if ok:
-            _config['allow_ai_tag'] = True
-            _config['ollama_url'] = args.ollama_url
-            _config['tag_model'] = args.tag_model
-            _config['tag_frames'] = args.tag_frames
-        else:
-            for e in errors:
-                print(f'  tag: {e}', file=sys.stderr)
-            print('  AI tagging unavailable (manual tagging still works).', file=sys.stderr)
 
     handler = partial(RequestHandler, root)
     server = ThreadedServer((args.bind, args.port), handler)
@@ -1216,10 +1386,8 @@ def main():
         features.append('delete: on')
     if shutil.which('fscrypt'):
         features.append('fscrypt: on')
-    if _config['allow_ai_tag']:
-        features.append(f'tag: {_config["tag_model"]}')
-    elif _config['allow_tag']:
-        features.append('tag: manual only')
+    if _config['allow_tag']:
+        features.append('tag: on')
 
     from simpleparty import __version__
     url = f'http://{args.bind}:{args.port}'
