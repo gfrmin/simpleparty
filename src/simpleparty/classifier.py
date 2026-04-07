@@ -257,7 +257,14 @@ def train(directory, max_frames=1, min_tag_count=5, progress=None):
     """
     if progress is None:
         progress = {}
+    try:
+        _train_inner(directory, max_frames, min_tag_count, progress)
+    except Exception as e:
+        progress['error'] = str(e)
+        progress['running'] = False
 
+
+def _train_inner(directory, max_frames, min_tag_count, progress):
     progress['phase'] = 'loading PyTorch'
     torch, _ = _require_torch()
 
@@ -470,10 +477,17 @@ def suggest_for_directory(directory, model_path, progress=None, max_frames=1):
 
     Saves suggestions with status='suggested' to the tags file.
     """
-    from simpleparty.tagger import untagged_videos
-
     if progress is None:
         progress = {}
+    try:
+        _suggest_inner(directory, model_path, progress, max_frames)
+    except Exception as e:
+        progress['error'] = str(e)
+        progress['running'] = False
+
+
+def _suggest_inner(directory, model_path, progress, max_frames):
+    from simpleparty.tagger import untagged_videos
 
     tags_data = load_tags(directory)
     videos = untagged_videos(directory, tags_data)
