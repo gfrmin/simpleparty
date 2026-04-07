@@ -32,7 +32,7 @@ _config = {
     'allow_ai_tag': False,
     'ollama_url': 'http://localhost:11434',
     'tag_model': 'huihui_ai/qwen3-vl-abliterated:8b',
-    'tag_text_model': 'qwen3.5:9b',
+    'tag_frames': 1,
     'tag_jobs': {},  # path -> progress dict
 }
 
@@ -369,7 +369,6 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .video-meta .item-tags{width:100%}
 .video-meta input[type="text"]{background:#0f0f1a;border:1px solid #2d2d44;border-radius:6px;color:#e2e8f0;padding:6px 10px;font-size:13px;flex:1;min-width:200px}
 .video-meta input:focus{border-color:#7c3aed;outline:none}
-.video-desc{color:#94a3b8;font-size:12px;line-height:1.5;width:100%;padding-bottom:4px}
 .video-tag-pills{display:flex;flex-wrap:wrap;gap:6px;align-items:center;width:100%}
 .video-tag-pill{display:inline-flex;align-items:center;background:#2d2d44;color:#a78bfa;padding:4px 10px;border-radius:12px;font-size:12px;white-space:nowrap;gap:4px}
 .video-tag-remove{background:none;border:none;color:#a78bfa;cursor:pointer;font-size:10px;padding:0 0 0 2px;opacity:0.6;line-height:1}
@@ -684,14 +683,12 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
     body += '</div></div>'
 
     if _config['allow_tag']:
-        video_entry = tags_map.get(v['name'], {}) if tags_map else {}
-        video_tags = video_entry.get('tags', [])
-        video_desc = video_entry.get('description', '')
-        body += f'<div class="video-meta" id="video-meta">'
-        if video_desc:
-            body += f'<div class="video-desc">{esc(video_desc)}</div>'
-        body += render_video_tags_inline(data['path'], v['name'], video_tags)
-        body += '</div>'
+        video_tags = tags_map.get(v['name'], {}).get('tags', []) if tags_map else []
+        body += (
+            f'<div class="video-meta" id="video-meta">'
+            + render_video_tags_inline(data['path'], v['name'], video_tags)
+            + '</div>'
+        )
 
     body += render_file_list(data, current_idx=idx, show_shuffle=False, tags_map=tags_map, selected_tags=selected_tags)
 
@@ -1052,7 +1049,7 @@ def handle_tag(handler, root):
 
     t = threading.Thread(
         target=tag_directory,
-        args=(_config['ollama_url'], _config['tag_model'], _config['tag_text_model'], resolved_str, progress),
+        args=(_config['ollama_url'], _config['tag_model'], resolved_str, progress, _config['tag_frames']),
         daemon=True,
     )
     t.start()
@@ -1175,8 +1172,8 @@ def main():
     parser.add_argument('--no-tag', action='store_true', help='Disable all tagging features')
     parser.add_argument('--tag-model', default='huihui_ai/qwen3-vl-abliterated:8b',
                         help='Ollama vision model for describing frames (default: huihui_ai/qwen3-vl-abliterated:8b)')
-    parser.add_argument('--tag-text-model', default='qwen3.5:9b',
-                        help='Ollama text model for extracting tags from descriptions (default: qwen3.5:9b)')
+    parser.add_argument('--tag-frames', type=int, default=1,
+                        help='Number of keyframes per video (default: 1, extracts extra to skip dark frames)')
     parser.add_argument('--ollama-url', default='http://localhost:11434', help='Ollama API URL (default: http://localhost:11434)')
     args = parser.parse_args()
 
@@ -1200,7 +1197,7 @@ def main():
             _config['allow_ai_tag'] = True
             _config['ollama_url'] = args.ollama_url
             _config['tag_model'] = args.tag_model
-            _config['tag_text_model'] = args.tag_text_model
+            _config['tag_frames'] = args.tag_frames
         else:
             for e in errors:
                 print(f'  tag: {e}', file=sys.stderr)
@@ -1220,8 +1217,7 @@ def main():
     if shutil.which('fscrypt'):
         features.append('fscrypt: on')
     if _config['allow_ai_tag']:
-        features.append(f'vision: {_config["tag_model"]}')
-        features.append(f'tags: {_config["tag_text_model"]}')
+        features.append(f'tag: {_config["tag_model"]}')
     elif _config['allow_tag']:
         features.append('tag: manual only')
 
