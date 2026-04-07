@@ -12,12 +12,12 @@ import tempfile
 from pathlib import Path
 
 from simpleparty.tagger import (
-    TAGS_FILENAME, MODEL_FILENAME, VIDEO_EXTENSIONS,
+    SIMPLEPARTY_DIR, MODEL_FILENAME, VIDEO_EXTENSIONS,
     _get_duration, _is_dark_frame,
-    confirmed_entries, load_tags, save_tags,
+    confirmed_entries, load_tags, model_path, save_tags,
 )
 
-FRAMES_DIR = '.simpleparty-frames'
+FRAMES_DIR = SIMPLEPARTY_DIR + '/frames'
 
 
 def _require_torch():
@@ -255,10 +255,11 @@ def train(directory, max_frames=1, min_tag_count=5, progress=None):
     Saves model to {directory}/.simpleparty-model.pt.
     Progress dict is mutated with phase/done/total/current updates.
     """
-    torch, _ = _require_torch()
-
     if progress is None:
         progress = {}
+
+    progress['phase'] = 'loading PyTorch'
+    torch, _ = _require_torch()
 
     tags_data = load_tags(directory)
     vocab = build_vocabulary(tags_data, min_count=min_tag_count)
@@ -365,17 +366,19 @@ def train(directory, max_frames=1, min_tag_count=5, progress=None):
     thresholds = _find_thresholds(model, val_loader, vocab, device)
 
     # Save model
-    model_path = Path(directory) / MODEL_FILENAME
+    sp_dir = Path(directory) / SIMPLEPARTY_DIR
+    sp_dir.mkdir(exist_ok=True)
+    save_path = sp_dir / MODEL_FILENAME
     torch.save({
         'model_state_dict': model.cpu().state_dict(),
         'vocab': vocab,
         'thresholds': thresholds,
         'num_classes': len(vocab),
-    }, str(model_path))
+    }, str(save_path))
 
     progress['phase'] = 'done'
     progress['running'] = False
-    progress['model_path'] = str(model_path)
+    progress['model_path'] = str(save_path)
     progress['current'] = f'Saved model with {len(vocab)} tags'
 
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "simpleparty"
-version = "0.4.2"
+version = "0.5.0"
 description = "Easily enjoy your private video collection"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -33,6 +33,7 @@ simpleparty = "simpleparty.server:main"
 
 [dependency-groups]
 dev = [
+    "pytest>=8.3.5",
     "scrapling[all]>=0.2.8",
     "torch>=2.5.1",
     "torchvision>=0.20.1",
