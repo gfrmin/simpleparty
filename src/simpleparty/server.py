@@ -343,7 +343,23 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .error-page{color:#f87171;text-align:center;padding:60px 20px;font-size:16px}
 .item-tags{color:#64748b;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;padding-top:2px}
 .item-tags.suggested{color:#a78bfa;opacity:0.5;font-style:italic}
-.tag-progress{color:#94a3b8;font-size:13px;padding:8px 0}
+.btn-train.htmx-request{opacity:0.6;pointer-events:none}
+.btn-train.htmx-request .btn-label{display:none}
+.btn-train.htmx-request .btn-spinner{display:inline-block}
+.btn-train:disabled,.btn-train.busy{opacity:0.5;cursor:not-allowed;pointer-events:none;border-color:#4a4a6a}
+.btn-spinner{display:none;width:14px;height:14px;border:2px solid #64748b;border-top-color:#a78bfa;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+.tag-progress-panel{display:flex;align-items:center;gap:10px;min-height:0;transition:all .3s ease}
+.tag-progress-panel:empty{display:none}
+.tag-progress-bar-wrap{flex:0 1 200px;min-width:80px;height:6px;background:#2d2d44;border-radius:3px;overflow:hidden}
+.tag-progress-bar{height:100%;background:#7c3aed;border-radius:3px;transition:width .4s ease}
+.tag-progress-text{color:#94a3b8;font-size:13px;white-space:nowrap}
+.tag-progress-phase{color:#a78bfa;font-size:13px;font-weight:500}
+.tag-progress-panel.active .tag-progress-phase{animation:pulse 1.5s ease infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.6}}
+.tag-done{color:#4ade80;font-size:13px;font-weight:500;display:flex;align-items:center;gap:8px;animation:fadeIn .3s ease}
+.tag-error{color:#f87171;font-size:13px;font-weight:500;animation:fadeIn .3s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
 .tag-filter{padding:8px 16px;border-bottom:1px solid #2d2d44;display:flex;flex-wrap:wrap;align-items:center;gap:8px}
 .tag-selected-pills{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 .tag-pill{display:inline-flex;align-items:center;background:#2d2d44;color:#a78bfa;padding:4px 10px;border-radius:12px;font-size:12px;white-space:nowrap;cursor:pointer;text-decoration:none;transition:all .15s;gap:4px}
@@ -421,6 +437,21 @@ def render_nav(path, encrypted_dir=None):
     return '<nav>' + ''.join(pieces) + '</nav>'
 
 
+def _render_train_btn(path_param, is_busy):
+    cls = 'btn btn-train busy' if is_busy else 'btn btn-train'
+    disabled = ' disabled' if is_busy else ''
+    label = '\U0001F9E0 Training\u2026' if is_busy else '\U0001F9E0 Train'
+    return (
+        f'<form hx-post="/train" style="display:inline" id="train-form">'
+        f'<input type="hidden" name="path" value="{path_param}">'
+        f'<button class="{cls}"{disabled} hx-disabled-elt="this">'
+        f'<span class="btn-spinner"></span>'
+        f'<span class="btn-label">{label}</span>'
+        f'</button>'
+        f'</form>'
+    )
+
+
 def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, selected_tags=None):
     pieces = ['<div id="file-list">']
 
@@ -436,12 +467,10 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
             from simpleparty.tagger import MODEL_FILENAME
             resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
             has_model = (resolved_dir / MODEL_FILENAME).exists() if resolved_dir.is_dir() else False
-            tag_html = (
-                f'<form hx-post="/train" style="display:inline">'
-                f'<input type="hidden" name="path" value="{path_param}">'
-                f'<button class="btn">\U0001F9E0 Train</button>'
-                f'</form>'
-            )
+            resolved_str = str(resolved_dir)
+            job = _config['tag_jobs'].get(resolved_str)
+            is_busy = bool(job and job.get('running'))
+            tag_html = _render_train_btn(path_param, is_busy)
             if has_model:
                 tag_html += (
                     f'<form hx-post="/suggest" style="display:inline">'
@@ -461,10 +490,13 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
                         f'<button class="btn btn-confirm">\u2714 Confirm all</button>'
                         f'</form>'
                     )
+            status_url = f'/tag-status?{urllib.parse.urlencode({"path": data["path"]})}'
+            poll = 'every 2s' if is_busy else 'every 10s'
             tag_html += (
-                f'<span hx-get="/tag-status?{urllib.parse.urlencode({"path": data["path"]})}" '
-                f'hx-trigger="load,every 5s" hx-swap="innerHTML" '
-                f'class="tag-progress"></span>'
+                f'<div hx-get="{status_url}" '
+                f'hx-trigger="load,{poll}" hx-swap="outerHTML" '
+                f'class="tag-progress-panel{" active" if is_busy else ""}" '
+                f'id="tag-progress"></div>'
             )
         pieces.append(
             f'<div class="action-bar">'
@@ -1231,32 +1263,78 @@ def handle_tag_status(handler, root):
     params = parse_query(handler.path)
     rel_path = params.get('path', '')
     resolved = str(resolve_path(root, rel_path))
+    status_url = f'/tag-status?{urllib.parse.urlencode({"path": rel_path})}'
+    path_param = esc(rel_path)
 
     progress = _config['tag_jobs'].get(resolved)
+
+    # OOB swap to keep train button in sync
+    def train_btn_oob(busy):
+        btn = _render_train_btn(path_param, busy)
+        return btn.replace('id="train-form"', 'id="train-form" hx-swap-oob="true"', 1)
+
+    def wrap(inner, poll=None, active=False):
+        if poll:
+            return (
+                f'<div hx-get="{status_url}" hx-trigger="{poll}" '
+                f'hx-swap="outerHTML" class="tag-progress-panel'
+                f'{" active" if active else ""}" id="tag-progress">'
+                f'{inner}</div>'
+            )
+        return f'<div class="tag-progress-panel" id="tag-progress">{inner}</div>'
+
     if not progress:
-        send_html(handler, '')
+        send_html(handler, wrap('', poll='every 10s'))
         return
 
     if progress.get('error'):
-        send_html(handler, f'Error: {esc(progress["error"])}')
+        send_html(handler,
+            wrap(f'<span class="tag-error">\u274C {esc(progress["error"])}</span>')
+            + train_btn_oob(False))
         return
 
     if not progress.get('running'):
         if progress.get('phase') == 'done':
-            send_html(handler, esc(progress.get('current', 'Done')))
+            msg = esc(progress.get('current', 'Done'))
+            suggest = (
+                f'<form hx-post="/suggest" style="display:inline">'
+                f'<input type="hidden" name="path" value="{path_param}">'
+                f'<button class="btn">\U0001F3F7 Suggest tags</button>'
+                f'</form>'
+            )
+            send_html(handler,
+                wrap(f'<span class="tag-done">\u2705 {msg} {suggest}</span>')
+                + train_btn_oob(False))
         else:
-            send_html(handler, '')
+            send_html(handler, wrap('', poll='every 10s'))
         return
 
     phase = progress.get('phase', '')
     done = progress.get('done', 0)
     total = progress.get('total', 0)
     current = progress.get('current', '')
-    text = f'{phase}: {done}/{total}' if total else phase
+
+    pct = int(done * 100 / total) if total > 0 else 0
+    bar = (
+        f'<div class="tag-progress-bar-wrap">'
+        f'<div class="tag-progress-bar" style="width:{pct}%"></div>'
+        f'</div>'
+    ) if total > 0 else ''
+
+    phase_label = phase.replace('_', ' ').replace('(', '(').title()
+    text = f'{done}/{total}' if total else ''
     if current:
-        text += f' \u2014 {esc(current)}'
+        text += f' \u2014 {esc(current)}' if text else esc(current)
     text += '\u2026'
-    send_html(handler, text)
+
+    inner = (
+        f'<span class="tag-progress-phase">{esc(phase_label)}</span>'
+        f'{bar}'
+        f'<span class="tag-progress-text">{text}</span>'
+    )
+    send_html(handler,
+        wrap(inner, poll='every 2s', active=True)
+        + train_btn_oob(True))
 
 
 def handle_save_tags(handler, root):
