@@ -142,32 +142,51 @@ def _is_dark_frame(jpeg_path, threshold=20):
         return True
 
 
-def extract_keyframes(video_path, max_frames=3):
-    """Extract I-frames from video using ffmpeg. Returns list of JPEG paths.
+def _get_duration(video_path):
+    """Get video duration in seconds via ffprobe."""
+    cmd = [
+        'ffprobe', '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'csv=p=0',
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=10, text=True)
+        return float(result.stdout.strip())
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        return 0.0
 
-    Caller is responsible for cleaning up the returned temp directory
-    (parent of the returned paths).
+
+def extract_keyframes(video_path, max_frames=3):
+    """Extract frames at evenly spaced positions through the video.
+
+    For max_frames=3, extracts at 25%, 50%, 75% of duration.
+    For max_frames=1, extracts at 50%.
+    Returns list of JPEG paths. Caller must clean up the temp directory.
     """
     tmpdir = tempfile.mkdtemp(prefix='simpleparty-frames-')
-    pattern = os.path.join(tmpdir, 'frame_%02d.jpg')
+    duration = _get_duration(video_path)
+    if duration <= 0:
+        return []
 
-    # Extract extra frames to compensate for dark/black ones that get filtered
-    cmd = [
-        'ffmpeg', '-i', str(video_path),
-        '-vf', 'select=eq(pict_type\\,I)',
-        '-fps_mode', 'vfr',
-        '-frames:v', str(max_frames + 2),
-        '-q:v', '4',
-        pattern,
-    ]
+    positions = [duration * (i + 1) / (max_frames + 1) for i in range(max_frames)]
 
-    try:
-        subprocess.run(
-            cmd, capture_output=True, timeout=60,
-            check=False,  # Some videos may have warnings but still produce frames
-        )
-    except subprocess.TimeoutExpired:
-        pass
+    for idx, pos in enumerate(positions):
+        out_path = os.path.join(tmpdir, f'frame_{idx:02d}.jpg')
+        cmd = [
+            'ffmpeg', '-ss', f'{pos:.2f}',
+            '-i', str(video_path),
+            '-frames:v', '1',
+            '-q:v', '4',
+            out_path,
+        ]
+        try:
+            subprocess.run(
+                cmd, capture_output=True, timeout=30,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            pass
 
     frames = sorted(Path(tmpdir).glob('frame_*.jpg'))
     usable = [f for f in frames if not _is_dark_frame(f)]
@@ -179,7 +198,7 @@ def extract_keyframes(video_path, max_frames=3):
 def _ollama_chat(ollama_url, model, system, user, images=None):
     """Send a chat request to Ollama and return the response text."""
     import re
-    msg = {'role': 'user', 'content': user}
+    msg = {'role': 'user', 'content': f'/no_think\n{user}'}
     if images:
         msg['images'] = images
     payload = json.dumps({
@@ -189,7 +208,8 @@ def _ollama_chat(ollama_url, model, system, user, images=None):
             msg,
         ],
         'stream': False,
-        'options': {'num_predict': 512},
+        'think': False,
+        'options': {'num_predict': 4096},
     }).encode()
 
     req = urllib.request.Request(
