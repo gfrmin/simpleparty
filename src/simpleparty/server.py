@@ -30,6 +30,7 @@ _config = {
     'allow_transcode': True,
     'allow_tag': True,
     'tag_jobs': {},  # path -> progress dict
+    'thumb_jobs': set(),  # directories currently generating thumbs
 }
 
 MIME_TYPES = {
@@ -307,7 +308,8 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 }
 #file-list{
   padding:16px;
-  display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(min(220px,100%),1fr));gap:8px;
+  overflow:hidden;max-width:100%;
 }
 .item{
   display:flex;align-items:center;gap:10px;padding:12px 14px;
@@ -315,7 +317,15 @@ video{width:100%;max-height:70vh;display:block;background:#000}
   transition:background .15s;border:2px solid transparent;min-width:0;overflow:hidden;
   flex-wrap:wrap;
 }
+.item-video{
+  flex-direction:column;align-items:stretch;padding:0;gap:0;
+}
+.item-video .item-link{flex-direction:column;align-items:stretch;gap:0}
+.item-video .item-info{display:flex;align-items:center;gap:8px;padding:8px 10px;min-width:0}
+.item-thumb{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:6px 6px 0 0;display:block;background:#0f0f1a}
+.item-thumb-placeholder{display:flex;align-items:center;justify-content:center;font-size:32px;color:#4a4a6a}
 .item:hover{background:#1e3054}
+.item-video:hover{background:#1e3054}
 .item.playing{border-color:#7c3aed}
 .item-link{display:flex;align-items:center;gap:10px;flex:1;min-width:0}
 .item-icon{font-size:18px;flex-shrink:0;line-height:1}
@@ -326,8 +336,11 @@ video{width:100%;max-height:70vh;display:block;background:#000}
   padding:4px;border-radius:4px;flex-shrink:0;line-height:1;
 }
 .btn-del:hover{color:#f87171;background:rgba(248,113,113,0.1)}
+.item-video .btn-del{position:absolute;top:4px;right:4px;z-index:2;background:rgba(0,0,0,0.5);border-radius:50%;padding:4px 6px}
+.item-video{position:relative}
+.item-video .item-tags{padding:0 10px 8px;width:100%}
 .empty{grid-column:1/-1;color:#64748b;text-align:center;padding:40px 20px;font-size:15px}
-.action-bar{grid-column:1/-1;display:flex;gap:8px;padding-bottom:4px}
+.action-bar{grid-column:1/-1;display:flex;gap:8px;padding-bottom:4px;flex-wrap:wrap;overflow:hidden}
 .unlock-box{
   max-width:380px;margin:40px auto;background:#1a1a2e;border:1px solid #2d2d44;
   border-radius:12px;padding:24px;
@@ -464,9 +477,9 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
         if _config['allow_tag'] and _config['has_ffmpeg']:
             path_param = esc(data['path'])
             # Check if model exists for this directory
-            from simpleparty.tagger import MODEL_FILENAME
+            from simpleparty.tagger import model_path as _model_path
             resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
-            has_model = (resolved_dir / MODEL_FILENAME).exists() if resolved_dir.is_dir() else False
+            has_model = _model_path(resolved_dir).exists() if resolved_dir.is_dir() else False
             resolved_str = str(resolved_dir)
             job = _config['tag_jobs'].get(resolved_str)
             is_busy = bool(job and job.get('running'))
@@ -519,15 +532,26 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
             f'</a>'
         )
 
+    from simpleparty.tagger import thumb_path
+    root_dir = _config.get('root', '.')
     for i, v in enumerate(data['videos']):
         cls = ' playing' if i == current_idx else ''
         play_url = url_for_play(data['path'], i, tags=selected_tags)
-        pieces.append(f'<div class="item{cls}">')
+        resolved_dir = resolve_path(root_dir, data['path'])
+        has_thumb = thumb_path(str(resolved_dir), v['name']).exists()
+        pieces.append(f'<div class="item item-video{cls}">')
+        thumb_url = f'/thumb/{urllib.parse.quote(v["path"])}'
+        if has_thumb:
+            thumb_html = f'<img src="{thumb_url}" loading="lazy" class="item-thumb" alt="">'
+        else:
+            thumb_html = '<div class="item-thumb item-thumb-placeholder">\U0001F3AC</div>'
         pieces.append(
             f'<a class="item-link" href="{esc(play_url)}">'
-            f'<span class="item-icon">\U0001F3AC</span>'
+            f'{thumb_html}'
+            f'<span class="item-info">'
             f'<span class="item-name">{esc(v["name"])}</span>'
             f'<span class="item-size">{fmt_size(v["size"])}</span>'
+            f'</span>'
             f'</a>'
         )
         if _config['allow_delete']:
@@ -940,6 +964,43 @@ def read_form_body(handler):
     return {k: v[0] for k, v in params.items()}
 
 
+# --- Thumbnail generation ---
+
+def _generate_thumbnails(directory, videos):
+    """Background worker: extract thumbnails for videos missing them."""
+    from simpleparty.tagger import thumb_path, extract_thumbnail
+    try:
+        for v in videos:
+            tp = thumb_path(directory, v['name'])
+            if tp.exists():
+                continue
+            video_file = Path(directory) / v['name']
+            if video_file.exists():
+                extract_thumbnail(str(video_file), str(tp))
+    finally:
+        _config['thumb_jobs'].discard(str(directory))
+
+
+def _maybe_start_thumbs(directory, videos):
+    """Spawn background thumbnail generation if needed and not already running."""
+    if not _config['has_ffmpeg'] or not videos:
+        return
+    dir_str = str(directory)
+    if dir_str in _config['thumb_jobs']:
+        return
+    from simpleparty.tagger import thumb_path
+    missing = any(not thumb_path(directory, v['name']).exists() for v in videos)
+    if not missing:
+        return
+    _config['thumb_jobs'].add(dir_str)
+    t = threading.Thread(
+        target=_generate_thumbnails,
+        args=(directory, videos),
+        daemon=True,
+    )
+    t.start()
+
+
 # --- Route handlers ---
 
 def handle_browse(handler, root):
@@ -954,11 +1015,12 @@ def handle_browse(handler, root):
     else:
         tags_map = None
         selected_tags = parse_tags_param(params)
+        resolved = resolve_path(root, rel_path)
         if _config['allow_tag']:
             from simpleparty.tagger import load_tags
-            resolved = resolve_path(root, rel_path)
             tags_map = load_tags(resolved)
             data['videos'] = filter_videos_by_tags(data['videos'], tags_map, selected_tags)
+        _maybe_start_thumbs(resolved, data['videos'])
         send_html(handler, render_browse_page(data, tags_map=tags_map, selected_tags=selected_tags))
 
 
@@ -1128,7 +1190,7 @@ def handle_train(handler, root):
         send_hx_redirect(handler, url_for_browse(rel_path))
         return
 
-    progress = {'running': True, 'done': 0, 'total': 0, 'current': '', 'phase': 'starting'}
+    progress = {'running': True, 'done': 0, 'total': 0, 'current': '', 'phase': 'preparing'}
     _config['tag_jobs'][resolved_str] = progress
 
     t = threading.Thread(
@@ -1146,7 +1208,7 @@ def handle_suggest(handler, root):
         handler.send_error(403, 'Tagging not enabled')
         return
     from simpleparty.classifier import suggest_for_directory
-    from simpleparty.tagger import MODEL_FILENAME
+    from simpleparty.tagger import model_path as _model_path
 
     form = read_form_body(handler)
     rel_path = form.get('path', '')
@@ -1155,8 +1217,9 @@ def handle_suggest(handler, root):
         handler.send_error(400, 'Not a directory')
         return
 
-    model_path = str(resolved / MODEL_FILENAME)
-    if not Path(model_path).exists():
+    mp = _model_path(resolved)
+    model_path = str(mp)
+    if not mp.exists():
         handler.send_error(400, 'No trained model found. Train first.')
         return
 
@@ -1368,6 +1431,31 @@ def handle_save_tags(handler, root):
     send_html(handler, render_video_tags_inline(rel_path, video_name, tags_list))
 
 
+def handle_thumb(handler, root):
+    """Serve a thumbnail JPEG from .simpleparty/thumbs/."""
+    raw = urllib.parse.urlparse(handler.path).path
+    rel = raw[len('/thumb/'):]  # strip prefix
+    rel = urllib.parse.unquote(rel)
+    if not rel:
+        handler.send_error(404)
+        return
+    # rel is "dir/subdir/video.mp4" — thumb is at dir/subdir/.simpleparty/thumbs/video.mp4.jpg
+    from simpleparty.tagger import thumb_path
+    video_dir = Path(root) / Path(rel).parent
+    video_name = Path(rel).name
+    tp = thumb_path(str(video_dir), video_name)
+    if not tp.exists():
+        handler.send_error(404)
+        return
+    data = tp.read_bytes()
+    handler.send_response(200)
+    handler.send_header('Content-Type', 'image/jpeg')
+    handler.send_header('Content-Length', str(len(data)))
+    handler.send_header('Cache-Control', 'public, max-age=3600')
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
 # --- Server ---
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -1387,6 +1475,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             handle_video(self, self.root)
         elif path == '/tag-status':
             handle_tag_status(self, self.root)
+        elif path.startswith('/thumb/'):
+            handle_thumb(self, self.root)
         else:
             self.send_error(404)
 
