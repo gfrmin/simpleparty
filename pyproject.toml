@@ -25,5 +25,15 @@ classifiers = [
 Homepage = "https://github.com/gfrmin/simpleparty"
 Repository = "https://github.com/gfrmin/simpleparty"
 
+[project.optional-dependencies]
+classifier = ["torch", "torchvision"]
+
 [project.scripts]
 simpleparty = "simpleparty.server:main"
+
+[dependency-groups]
+dev = [
+    "scrapling[all]>=0.2.8",
+    "torch>=2.5.1",
+    "torchvision>=0.20.1",
+]
