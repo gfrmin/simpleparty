@@ -15,6 +15,7 @@ SIMPLEPARTY_DIR = '.simpleparty'
 TAGS_FILENAME = 'tags.json'
 MODEL_FILENAME = 'model.pt'
 THUMB_DIR = 'thumbs'
+FRAMES_DIR = SIMPLEPARTY_DIR + '/frames'
 
 # Legacy paths for backward compat
 _LEGACY_TAGS = '.simpleparty-tags.json'
@@ -174,18 +175,27 @@ def thumb_path(directory_path, video_name):
     return Path(directory_path) / SIMPLEPARTY_DIR / THUMB_DIR / f'{video_name}.jpg'
 
 
-def extract_thumbnail(video_path, output_path):
-    """Extract a median frame as a scaled-down thumbnail. Returns True on success."""
-    duration = _get_duration(video_path)
-    if duration <= 0:
-        return False
-
-    pos = duration / 2
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+def extract_frame(video_path, position, out_path):
+    """Extract a single full-res frame at *position* seconds. Returns True on success."""
     cmd = [
-        'ffmpeg', '-ss', f'{pos:.2f}',
+        'ffmpeg', '-ss', f'{position:.2f}',
         '-i', str(video_path),
         '-frames:v', '1',
+        '-q:v', '4',
+        str(out_path),
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=30, check=False)
+        return Path(out_path).exists() and not _is_dark_frame(out_path)
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def _downscale_frame(frame_path, output_path):
+    """Downscale a JPEG to 320px width for use as a thumbnail. Returns True on success."""
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        'ffmpeg', '-i', str(frame_path),
         '-vf', 'scale=320:-1',
         '-q:v', '6',
         '-y', str(output_path),
@@ -194,7 +204,6 @@ def extract_thumbnail(video_path, output_path):
         subprocess.run(cmd, capture_output=True, timeout=30, check=False)
     except subprocess.TimeoutExpired:
         return False
-
     out = Path(output_path)
     if not out.exists():
         return False
@@ -202,3 +211,31 @@ def extract_thumbnail(video_path, output_path):
         out.unlink()
         return False
     return True
+
+
+def extract_thumbnail(video_path, output_path):
+    """Extract a thumbnail by downscaling a full-res frame.
+
+    Reuses an existing full-res frame from the frames dir if available,
+    otherwise extracts one first. Returns True on success.
+    """
+    video_path = Path(video_path)
+    video_name = video_path.name
+    frames_dir = video_path.parent / FRAMES_DIR
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    # Look for an existing full-res frame
+    existing = sorted(frames_dir.glob(f'{video_name}.f*.jpg'))
+    if existing:
+        return _downscale_frame(existing[0], output_path)
+
+    # Extract a new full-res frame at 50% duration
+    duration = _get_duration(video_path)
+    if duration <= 0:
+        return False
+
+    frame_path = frames_dir / f'{video_name}.f0.jpg'
+    if not extract_frame(str(video_path), duration / 2, str(frame_path)):
+        return False
+
+    return _downscale_frame(str(frame_path), output_path)
