@@ -27,9 +27,10 @@ def _require_torch():
         import torchvision
         return torch, torchvision
     except ImportError:
+        from simpleparty import __version__
         raise RuntimeError(
-            'torch and torchvision are required for classifier features. '
-            'Install with: uv add torch torchvision'
+            'torch and torchvision are required for tagger features. '
+            f'Install with: uvx simpleparty[classifier]=={__version__}'
         )
 
 
