@@ -5,10 +5,14 @@ untagged videos. Generic — works with any tag vocabulary.
 """
 
 import json
+import logging
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
+
+logger = logging.getLogger('simpleparty.classifier')
 
 from simpleparty.tagger import (
     SIMPLEPARTY_DIR, FRAMES_DIR, MODEL_FILENAME,
@@ -74,6 +78,7 @@ def extract_training_frames(directory, tags_data, max_frames=1, progress=None):
     Frames saved to {directory}/.simpleparty/frames/.
     Also creates thumbnails as a side effect for videos that lack them.
     """
+    t0 = time.monotonic()
     frames_dir = Path(directory) / FRAMES_DIR
     frames_dir.mkdir(parents=True, exist_ok=True)
 
@@ -81,6 +86,27 @@ def extract_training_frames(directory, tags_data, max_frames=1, progress=None):
     manifest = []
     total = len(confirmed)
     mid_idx = (max_frames - 1) // 2
+
+    # Pre-scan: classify videos into need-extraction vs already-have-frames
+    need_extract = []
+    have_frames = []
+    for video_name, entry in confirmed.items():
+        video_path = Path(directory) / video_name
+        if not video_path.exists() or not entry.get('tags'):
+            continue
+        frame_paths = [frames_dir / f'{video_name}.f{j}.jpg' for j in range(max_frames)]
+        if all(fp.exists() for fp in frame_paths):
+            have_frames.append(video_name)
+        else:
+            missing = [str(fp) for fp in frame_paths if not fp.exists()]
+            need_extract.append((video_name, missing))
+
+    logger.debug('training frames: %d confirmed, %d already have frames, %d need extraction',
+                 total, len(have_frames), len(need_extract))
+    for name in have_frames:
+        logger.debug('  skip (frames exist): %s', name)
+    for name, missing in need_extract:
+        logger.debug('  need extraction: %s (missing: %s)', name, missing)
 
     for i, (video_name, entry) in enumerate(confirmed.items()):
         if progress:
@@ -123,6 +149,9 @@ def extract_training_frames(directory, tags_data, max_frames=1, progress=None):
 
     if progress:
         progress['done'] = total
+
+    logger.debug('training frame extraction done: %d manifest entries (%.1fs)',
+                 len(manifest), time.monotonic() - t0)
 
     return manifest
 
