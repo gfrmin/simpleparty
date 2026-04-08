@@ -18,6 +18,7 @@ from simpleparty.tagger import (
     SIMPLEPARTY_DIR, FRAMES_DIR, MODEL_FILENAME,
     _get_duration, _downscale_frame,
     confirmed_entries, extract_frame, load_tags, model_path, save_tags,
+    training_entries,
     thumb_path,
 )
 
@@ -57,24 +58,35 @@ def build_vocabulary(tags_data, min_count=5):
     return vocab
 
 
-def _encode_tags(tags, vocab, tag_to_idx):
-    """Encode a tag list as a binary vector."""
+def _encode_tags(tags, vocab, tag_to_idx, rejected_tags=()):
+    """Encode tags as (target, mask) tensors.
+
+    target[i] = 1.0 for confirmed tags, 0.0 otherwise.
+    mask[i] = 1.0 for confirmed AND rejected tags (known positions), 0.0 for unknown.
+    Only masked positions contribute to loss during training.
+    """
     import torch
-    vec = torch.zeros(len(vocab))
+    target = torch.zeros(len(vocab))
+    mask = torch.zeros(len(vocab))
     for tag in tags:
         key = tag.lower().strip()
         if key in tag_to_idx:
-            vec[tag_to_idx[key]] = 1.0
-    return vec
+            target[tag_to_idx[key]] = 1.0
+            mask[tag_to_idx[key]] = 1.0
+    for tag in rejected_tags:
+        key = tag.lower().strip()
+        if key in tag_to_idx:
+            mask[tag_to_idx[key]] = 1.0
+    return target, mask
 
 
 # --- Frame extraction ---
 
 
 def extract_training_frames(directory, tags_data, max_frames=1, progress=None):
-    """Extract frames for all confirmed videos. Returns manifest list.
+    """Extract frames for all training videos. Returns manifest list.
 
-    Each manifest entry: (frame_path, tags_list).
+    Each manifest entry: (frame_path, tags_list, rejected_tags_list).
     Frames saved to {directory}/.simpleparty/frames/.
     Also creates thumbnails as a side effect for videos that lack them.
     """
@@ -82,17 +94,18 @@ def extract_training_frames(directory, tags_data, max_frames=1, progress=None):
     frames_dir = Path(directory) / FRAMES_DIR
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    confirmed = confirmed_entries(tags_data)
+    entries = training_entries(tags_data)
     manifest = []
-    total = len(confirmed)
     mid_idx = (max_frames - 1) // 2
 
     # Pre-scan: classify videos into need-extraction vs already-have-frames
     need_extract = []
     have_frames = []
-    for video_name, entry in confirmed.items():
+    for video_name, entry in entries.items():
         video_path = Path(directory) / video_name
-        if not video_path.exists() or not entry.get('tags'):
+        if not video_path.exists():
+            continue
+        if not entry.get('tags') and not entry.get('rejected_tags'):
             continue
         frame_paths = [frames_dir / f'{video_name}.f{j}.jpg' for j in range(max_frames)]
         if all(fp.exists() for fp in frame_paths):
@@ -101,54 +114,62 @@ def extract_training_frames(directory, tags_data, max_frames=1, progress=None):
             missing = [str(fp) for fp in frame_paths if not fp.exists()]
             need_extract.append((video_name, missing))
 
-    logger.debug('training frames: %d confirmed, %d already have frames, %d need extraction',
-                 total, len(have_frames), len(need_extract))
+    logger.debug('training frames: %d entries, %d already have frames, %d need extraction',
+                 len(entries), len(have_frames), len(need_extract))
     for name in have_frames:
         logger.debug('  skip (frames exist): %s', name)
     for name, missing in need_extract:
         logger.debug('  need extraction: %s (missing: %s)', name, missing)
 
-    for i, (video_name, entry) in enumerate(confirmed.items()):
-        if progress:
-            progress['phase'] = 'extracting frames'
-            progress['done'] = i
-            progress['total'] = total
-            progress['current'] = video_name
-
-        video_path = Path(directory) / video_name
-        if not video_path.exists():
-            continue
-
+    def _add_to_manifest(video_name, entry):
         tags = entry.get('tags', [])
-        if not tags:
-            continue
-
-        duration = _get_duration(video_path)
-        if duration <= 0:
-            continue
-
-        positions = [duration * (j + 1) / (max_frames + 1) for j in range(max_frames)]
-
-        for frame_idx, pos in enumerate(positions):
-            frame_name = f'{video_name}.f{frame_idx}.jpg'
-            frame_path = frames_dir / frame_name
-
-            if not frame_path.exists():
-                ok = extract_frame(str(video_path), pos, str(frame_path))
-                if not ok:
-                    continue
-
+        rejected = entry.get('rejected_tags', [])
+        for frame_idx in range(max_frames):
+            frame_path = frames_dir / f'{video_name}.f{frame_idx}.jpg'
             if frame_path.exists():
-                manifest.append((str(frame_path), tags))
+                manifest.append((str(frame_path), tags, rejected))
 
-        # Create thumbnail as side effect from the frame nearest 50%
+    def _make_thumbnail(video_name):
         tp = thumb_path(directory, video_name)
         mid_frame = frames_dir / f'{video_name}.f{mid_idx}.jpg'
         if not tp.exists() and mid_frame.exists():
             _downscale_frame(str(mid_frame), str(tp))
 
-    if progress:
-        progress['done'] = total
+    # Build manifest from cached frames (instant, no progress needed)
+    for video_name in have_frames:
+        entry = entries[video_name]
+        _add_to_manifest(video_name, entry)
+        _make_thumbnail(video_name)
+
+    # Extract only what's missing
+    if need_extract and progress:
+        progress['phase'] = 'extracting frames'
+        progress['total'] = len(need_extract)
+        progress['done'] = 0
+
+    for i, (video_name, _missing) in enumerate(need_extract):
+        if progress:
+            progress['done'] = i
+            progress['current'] = video_name
+
+        entry = entries[video_name]
+        video_path = Path(directory) / video_name
+        duration = _get_duration(video_path)
+        if duration <= 0:
+            continue
+
+        positions = [duration * (j + 1) / (max_frames + 1) for j in range(max_frames)]
+        for frame_idx, pos in enumerate(positions):
+            frame_name = f'{video_name}.f{frame_idx}.jpg'
+            frame_path = frames_dir / frame_name
+            if not frame_path.exists():
+                extract_frame(str(video_path), pos, str(frame_path))
+
+        _add_to_manifest(video_name, entry)
+        _make_thumbnail(video_name)
+
+    if need_extract and progress:
+        progress['done'] = len(need_extract)
 
     logger.debug('training frame extraction done: %d manifest entries (%.1fs)',
                  len(manifest), time.monotonic() - t0)
@@ -189,11 +210,11 @@ def _build_dataset(manifest, vocab, tag_to_idx, train=True):
 
         def __getitem__(self, idx):
             from PIL import Image
-            path, tags = self.items[idx]
+            path, tags, rejected = self.items[idx]
             img = Image.open(path).convert('RGB')
             img = self.tf(img)
-            label = _encode_tags(tags, vocab, tag_to_idx)
-            return img, label
+            target, mask = _encode_tags(tags, vocab, tag_to_idx, rejected_tags=rejected)
+            return img, target, mask
 
     return FrameDataset(manifest, transform)
 
@@ -219,17 +240,22 @@ def _build_model(num_classes, freeze_backbone=True):
 
 
 def _compute_pos_weights(manifest, vocab, tag_to_idx, cap=10.0):
-    """Compute positive class weights for BCEWithLogitsLoss."""
+    """Compute positive class weights from known (masked) positions only."""
     torch, _ = _require_torch()
     pos_counts = torch.zeros(len(vocab))
-    total = len(manifest)
-    for _, tags in manifest:
+    known_counts = torch.zeros(len(vocab))
+    for _, tags, rejected in manifest:
         for tag in tags:
             key = tag.lower().strip()
             if key in tag_to_idx:
                 pos_counts[tag_to_idx[key]] += 1
-    neg_counts = total - pos_counts
-    weights = neg_counts / pos_counts.clamp(min=1)
+                known_counts[tag_to_idx[key]] += 1
+        for tag in rejected:
+            key = tag.lower().strip()
+            if key in tag_to_idx:
+                known_counts[tag_to_idx[key]] += 1
+    neg_counts = known_counts - pos_counts
+    weights = neg_counts.clamp(min=1) / pos_counts.clamp(min=1)
     return weights.clamp(max=cap)
 
 
@@ -238,26 +264,35 @@ def _find_thresholds(model, val_loader, vocab, device):
     torch, _ = _require_torch()
     model.eval()
     all_probs = []
-    all_labels = []
+    all_targets = []
+    all_masks = []
     with torch.no_grad():
-        for imgs, labels in val_loader:
+        for imgs, targets, masks in val_loader:
             imgs = imgs.to(device)
             logits = model(imgs)
             probs = torch.sigmoid(logits).cpu()
             all_probs.append(probs)
-            all_labels.append(labels)
+            all_targets.append(targets)
+            all_masks.append(masks)
 
     all_probs = torch.cat(all_probs)
-    all_labels = torch.cat(all_labels)
+    all_targets = torch.cat(all_targets)
+    all_masks = torch.cat(all_masks)
 
     thresholds = []
     for i in range(len(vocab)):
+        m = all_masks[:, i].bool()
         best_f1, best_t = 0.0, 0.5
+        if not m.any():
+            thresholds.append(best_t)
+            continue
+        probs_i = all_probs[:, i][m]
+        labels_i = all_targets[:, i][m]
         for t in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
-            pred = (all_probs[:, i] >= t).float()
-            tp = (pred * all_labels[:, i]).sum()
-            fp = (pred * (1 - all_labels[:, i])).sum()
-            fn = ((1 - pred) * all_labels[:, i]).sum()
+            pred = (probs_i >= t).float()
+            tp = (pred * labels_i).sum()
+            fp = (pred * (1 - labels_i)).sum()
+            fn = ((1 - pred) * labels_i).sum()
             precision = tp / (tp + fp + 1e-8)
             recall = tp / (tp + fn + 1e-8)
             f1 = 2 * precision * recall / (precision + recall + 1e-8)
@@ -322,7 +357,11 @@ def _train_inner(directory, max_frames, min_tag_count, progress):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     pos_weights = _compute_pos_weights(train_items, vocab, tag_to_idx).to(device)
-    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weights)
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weights, reduction='none')
+
+    def masked_loss(logits, targets, masks):
+        raw = criterion(logits, targets)
+        return (raw * masks).sum() / masks.sum().clamp(min=1)
 
     # Phase 1: frozen backbone
     model = _build_model(len(vocab), freeze_backbone=True).to(device)
@@ -334,10 +373,10 @@ def _train_inner(directory, max_frames, min_tag_count, progress):
     for epoch in range(10):
         model.train()
         total_loss = 0
-        for imgs, labels in train_loader:
-            imgs, labels = imgs.to(device), labels.to(device)
+        for imgs, targets, masks in train_loader:
+            imgs, targets, masks = imgs.to(device), targets.to(device), masks.to(device)
             optimizer.zero_grad()
-            loss = criterion(model(imgs), labels)
+            loss = masked_loss(model(imgs), targets, masks)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -360,10 +399,10 @@ def _train_inner(directory, max_frames, min_tag_count, progress):
     for epoch in range(10):
         model.train()
         total_loss = 0
-        for imgs, labels in train_loader:
-            imgs, labels = imgs.to(device), labels.to(device)
+        for imgs, targets, masks in train_loader:
+            imgs, targets, masks = imgs.to(device), targets.to(device), masks.to(device)
             optimizer.zero_grad()
-            loss = criterion(model(imgs), labels)
+            loss = masked_loss(model(imgs), targets, masks)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -372,9 +411,9 @@ def _train_inner(directory, max_frames, min_tag_count, progress):
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for imgs, labels in val_loader:
-                imgs, labels = imgs.to(device), labels.to(device)
-                val_loss += criterion(model(imgs), labels).item()
+            for imgs, targets, masks in val_loader:
+                imgs, targets, masks = imgs.to(device), targets.to(device), masks.to(device)
+                val_loss += masked_loss(model(imgs), targets, masks).item()
         val_loss /= max(len(val_loader), 1)
         scheduler.step(val_loss)
 
@@ -526,11 +565,11 @@ def _suggest_inner(directory, model_path, progress, max_frames):
 
         if results:
             avg_conf = sum(c for _, c in results) / len(results)
-            tags_data[video_name] = {
-                'tags': [tag for tag, _ in results],
-                'status': 'suggested',
-                'confidence': round(avg_conf, 3),
-            }
+            entry = tags_data.get(video_name, {})
+            entry['tags'] = [tag for tag, _ in results]
+            entry['status'] = 'suggested'
+            entry['confidence'] = round(avg_conf, 3)
+            tags_data[video_name] = entry
             save_tags(directory, tags_data)
 
         progress['done'] += 1

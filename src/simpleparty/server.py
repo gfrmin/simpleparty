@@ -737,17 +737,29 @@ def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'
 
     pill_class = 'video-tag-pill suggested' if is_suggested else 'video-tag-pill'
     for i, tag in enumerate(tags_list):
-        remaining = ', '.join(t for j, t in enumerate(tags_list) if j != i)
-        pieces.append(
-            f'<span class="{pill_class}">{esc(tag)}'
-            f'<form hx-post="/save-tags" hx-target="#video-meta" hx-swap="innerHTML" '
-            f'style="display:inline;margin:0;padding:0">'
-            f'<input type="hidden" name="path" value="{esc(rel_path)}">'
-            f'<input type="hidden" name="video" value="{esc(video_name)}">'
-            f'<input type="hidden" name="tags" value="{esc(remaining)}">'
-            f'<button type="submit" class="video-tag-remove" title="Remove tag">\u00d7</button>'
-            f'</form></span>'
-        )
+        if is_suggested:
+            pieces.append(
+                f'<span class="{pill_class}">{esc(tag)}'
+                f'<form hx-post="/reject-tag" hx-target="#video-meta" hx-swap="innerHTML" '
+                f'style="display:inline;margin:0;padding:0">'
+                f'<input type="hidden" name="path" value="{esc(rel_path)}">'
+                f'<input type="hidden" name="video" value="{esc(video_name)}">'
+                f'<input type="hidden" name="tag" value="{esc(tag)}">'
+                f'<button type="submit" class="video-tag-remove" title="Reject tag">\u00d7</button>'
+                f'</form></span>'
+            )
+        else:
+            remaining = ', '.join(t for j, t in enumerate(tags_list) if j != i)
+            pieces.append(
+                f'<span class="{pill_class}">{esc(tag)}'
+                f'<form hx-post="/save-tags" hx-target="#video-meta" hx-swap="innerHTML" '
+                f'style="display:inline;margin:0;padding:0">'
+                f'<input type="hidden" name="path" value="{esc(rel_path)}">'
+                f'<input type="hidden" name="video" value="{esc(video_name)}">'
+                f'<input type="hidden" name="tags" value="{esc(remaining)}">'
+                f'<button type="submit" class="video-tag-remove" title="Remove tag">\u00d7</button>'
+                f'</form></span>'
+            )
     # Inline add input
     all_csv = ', '.join(tags_list)
     prefix = (all_csv + ', ') if all_csv else ''
@@ -797,7 +809,7 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         video_tags = video_entry.get('tags', [])
         video_status = video_entry.get('status', 'confirmed')
         meta_html = render_video_tags_inline(data['path'], v['name'], video_tags, status=video_status)
-        if not video_tags:
+        if not video_tags or video_status in ('suggested', 'rejected'):
             from simpleparty.tagger import model_path as _model_path
             resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
             if _model_path(resolved_dir).exists():
@@ -1337,11 +1349,11 @@ def handle_suggest_one(handler, root):
     if results:
         all_tags = load_tags(resolved)
         avg_conf = sum(c for _, c in results) / len(results)
-        all_tags[video_name] = {
-            'tags': [tag for tag, _ in results],
-            'status': 'suggested',
-            'confidence': round(avg_conf, 3),
-        }
+        entry = all_tags.get(video_name, {})
+        entry['tags'] = [tag for tag, _ in results]
+        entry['status'] = 'suggested'
+        entry['confidence'] = round(avg_conf, 3)
+        all_tags[video_name] = entry
         save_tags(resolved, all_tags)
         send_html(handler, render_video_tags_inline(
             rel_path, video_name,
@@ -1423,10 +1435,53 @@ def handle_reject_tags(handler, root):
 
     all_tags = load_tags(resolved)
     if video_name in all_tags:
-        del all_tags[video_name]
+        entry = all_tags[video_name]
+        entry['rejected_tags'] = entry.get('rejected_tags', []) + entry.get('tags', [])
+        entry['tags'] = []
+        entry['status'] = 'rejected'
         save_tags(resolved, all_tags)
 
     send_html(handler, render_video_tags_inline(rel_path, video_name, []))
+
+
+def handle_reject_tag(handler, root):
+    """Reject a single suggested tag, keeping remaining suggestions."""
+    if not _config['allow_tag']:
+        handler.send_error(403, 'Tagging not enabled')
+        return
+    from simpleparty.tagger import load_tags, save_tags
+
+    form = read_form_body(handler)
+    rel_path = form.get('path', '')
+    video_name = form.get('video', '')
+    tag = form.get('tag', '')
+    resolved = resolve_path(root, rel_path)
+
+    if not resolved.is_dir() or not video_name or not tag:
+        handler.send_error(400, 'Invalid request')
+        return
+
+    all_tags = load_tags(resolved)
+    entry = all_tags.get(video_name, {})
+    tags_list = entry.get('tags', [])
+
+    if tag in tags_list:
+        tags_list.remove(tag)
+        entry['tags'] = tags_list
+        rejected = entry.get('rejected_tags', [])
+        rejected.append(tag)
+        entry['rejected_tags'] = rejected
+
+    if not tags_list:
+        entry['status'] = 'rejected'
+        status = 'rejected'
+    else:
+        status = entry.get('status', 'confirmed')
+
+    all_tags[video_name] = entry
+    save_tags(resolved, all_tags)
+
+    send_html(handler, render_video_tags_inline(rel_path, video_name, tags_list, status=status))
 
 
 def handle_tag_status(handler, root):
@@ -1610,6 +1665,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             handle_confirm_all(self, self.root)
         elif path == '/reject-tags':
             handle_reject_tags(self, self.root)
+        elif path == '/reject-tag':
+            handle_reject_tag(self, self.root)
         elif path == '/save-tags':
             handle_save_tags(self, self.root)
         else:
