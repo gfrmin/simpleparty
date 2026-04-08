@@ -1554,8 +1554,14 @@ def main():
         features.append('delete: on')
     if shutil.which('fscrypt'):
         features.append('fscrypt: on')
+    has_torch = False
     if _config['allow_tag']:
-        features.append('tag: on')
+        try:
+            import torch
+            has_torch = True
+            features.append('tag: on')
+        except ImportError:
+            features.append('tag: on (tagger unavailable)')
 
     from simpleparty import __version__
     url = f'http://{args.bind}:{args.port}'
@@ -1563,6 +1569,8 @@ def main():
     print(f'  {url}')
     if features:
         print(f'  [{", ".join(features)}]')
+    if _config['allow_tag'] and not has_torch:
+        print(f'  To train a tagger: uvx simpleparty[classifier]=={__version__}')
 
     try:
         server.serve_forever()
