@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "simpleparty"
-version = "0.6.1"
+version = "0.7.0"
 description = "Easily enjoy your private video collection"
 readme = "README.md"
 license = "AGPL-3.0-only"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = []
 authors = [
     { name = "Guy Freeman" },

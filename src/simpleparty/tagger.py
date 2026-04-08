@@ -79,7 +79,8 @@ def untagged_videos(directory_path, existing_tags):
             if name.startswith('.'):
                 continue
             if Path(name).suffix.lower() in VIDEO_EXTENSIONS:
-                if name not in existing_tags:
+                entry = existing_tags.get(name)
+                if not entry or entry.get('status') == 'rejected':
                     result.append(name)
     except OSError:
         pass
@@ -92,6 +93,19 @@ def confirmed_entries(tags):
         name: entry for name, entry in tags.items()
         if entry.get('status', 'confirmed') != 'suggested'
         and entry.get('tags')
+    }
+
+
+def training_entries(tags):
+    """Return dict of entries useful for training (confirmed or rejected).
+
+    Includes entries with confirmed tags and/or rejected_tags.
+    Excludes entries with status='suggested' (not yet reviewed).
+    """
+    return {
+        name: entry for name, entry in tags.items()
+        if entry.get('status', 'confirmed') not in ('suggested',)
+        and (entry.get('tags') or entry.get('rejected_tags'))
     }
 
 
