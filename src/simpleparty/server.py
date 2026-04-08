@@ -792,11 +792,20 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         video_entry = tags_map.get(v['name'], {}) if tags_map else {}
         video_tags = video_entry.get('tags', [])
         video_status = video_entry.get('status', 'confirmed')
-        body += (
-            f'<div class="video-meta" id="video-meta">'
-            + render_video_tags_inline(data['path'], v['name'], video_tags, status=video_status)
-            + '</div>'
-        )
+        meta_html = render_video_tags_inline(data['path'], v['name'], video_tags, status=video_status)
+        if not video_tags:
+            from simpleparty.tagger import model_path as _model_path
+            resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
+            if _model_path(resolved_dir).exists():
+                meta_html += (
+                    f'<form hx-post="/suggest-one" hx-target="#video-meta" '
+                    f'hx-swap="innerHTML" style="display:inline">'
+                    f'<input type="hidden" name="path" value="{esc(data["path"])}">'
+                    f'<input type="hidden" name="video" value="{esc(v["name"])}">'
+                    f'<button class="btn">\U0001F3F7 Suggest tags</button>'
+                    f'</form>'
+                )
+        body += f'<div class="video-meta" id="video-meta">{meta_html}</div>'
 
     body += render_file_list(data, current_idx=idx, show_shuffle=False, tags_map=tags_map, selected_tags=selected_tags)
 
@@ -967,16 +976,38 @@ def read_form_body(handler):
 # --- Thumbnail generation ---
 
 def _generate_thumbnails(directory, videos):
-    """Background worker: extract thumbnails for videos missing them."""
-    from simpleparty.tagger import thumb_path, extract_thumbnail
+    """Background worker: extract thumbnails and backing full-res frames.
+
+    For each video, ensures both a full-res frame in frames/ and a
+    thumbnail in thumbs/ exist. Migrates legacy thumbnails that lack
+    a backing frame by extracting the full-res frame.
+    """
+    from simpleparty.tagger import (
+        FRAMES_DIR, thumb_path, extract_thumbnail,
+        extract_frame, _downscale_frame, _get_duration,
+    )
     try:
+        frames_dir = Path(directory) / FRAMES_DIR
+        frames_dir.mkdir(parents=True, exist_ok=True)
         for v in videos:
             tp = thumb_path(directory, v['name'])
-            if tp.exists():
-                continue
+            has_frame = bool(sorted(frames_dir.glob(f"{v['name']}.f*.jpg")))
             video_file = Path(directory) / v['name']
-            if video_file.exists():
+
+            if has_frame and tp.exists():
+                continue
+
+            if not video_file.exists():
+                continue
+
+            if not has_frame:
+                # No full-res frame yet — extract_thumbnail handles both
                 extract_thumbnail(str(video_file), str(tp))
+            elif not tp.exists():
+                # Frame exists but no thumbnail (e.g. after training)
+                existing = sorted(frames_dir.glob(f"{v['name']}.f*.jpg"))
+                if existing:
+                    _downscale_frame(str(existing[0]), str(tp))
     finally:
         _config['thumb_jobs'].discard(str(directory))
 
@@ -988,8 +1019,13 @@ def _maybe_start_thumbs(directory, videos):
     dir_str = str(directory)
     if dir_str in _config['thumb_jobs']:
         return
-    from simpleparty.tagger import thumb_path
-    missing = any(not thumb_path(directory, v['name']).exists() for v in videos)
+    from simpleparty.tagger import FRAMES_DIR, thumb_path
+    frames_dir = Path(directory) / FRAMES_DIR
+    def _needs_work(name):
+        has_thumb = thumb_path(directory, name).exists()
+        has_frame = bool(sorted(frames_dir.glob(f'{name}.f*.jpg'))) if frames_dir.exists() else False
+        return not has_thumb or not has_frame
+    missing = any(_needs_work(v['name']) for v in videos)
     if not missing:
         return
     _config['thumb_jobs'].add(dir_str)
@@ -1242,6 +1278,52 @@ def handle_suggest(handler, root):
     send_hx_redirect(handler, url_for_browse(rel_path))
 
 
+def handle_suggest_one(handler, root):
+    """Suggest tags for a single video and return updated tag HTML."""
+    if not _config['allow_tag']:
+        handler.send_error(403, 'Tagging not enabled')
+        return
+    from simpleparty.classifier import suggest_for_video
+    from simpleparty.tagger import load_tags, save_tags, model_path as _model_path
+
+    form = read_form_body(handler)
+    rel_path = form.get('path', '')
+    video_name = form.get('video', '')
+    resolved = resolve_path(root, rel_path)
+
+    if not resolved.is_dir() or not video_name:
+        handler.send_error(400, 'Invalid request')
+        return
+
+    mp = _model_path(resolved)
+    if not mp.exists():
+        handler.send_error(400, 'No trained model found. Train first.')
+        return
+
+    video_path = resolved / video_name
+    if not video_path.exists():
+        handler.send_error(404, 'Video not found')
+        return
+
+    results = suggest_for_video(str(video_path), str(mp))
+    if results:
+        all_tags = load_tags(resolved)
+        avg_conf = sum(c for _, c in results) / len(results)
+        all_tags[video_name] = {
+            'tags': [tag for tag, _ in results],
+            'status': 'suggested',
+            'confidence': round(avg_conf, 3),
+        }
+        save_tags(resolved, all_tags)
+        send_html(handler, render_video_tags_inline(
+            rel_path, video_name,
+            [tag for tag, _ in results],
+            status='suggested',
+        ))
+    else:
+        send_html(handler, render_video_tags_inline(rel_path, video_name, []))
+
+
 def handle_confirm_tags(handler, root):
     if not _config['allow_tag']:
         handler.send_error(403, 'Tagging not enabled')
@@ -1492,6 +1574,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             handle_train(self, self.root)
         elif path == '/suggest':
             handle_suggest(self, self.root)
+        elif path == '/suggest-one':
+            handle_suggest_one(self, self.root)
         elif path == '/confirm-tags':
             handle_confirm_tags(self, self.root)
         elif path == '/confirm-all':

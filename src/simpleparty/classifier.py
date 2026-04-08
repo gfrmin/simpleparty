@@ -7,17 +7,15 @@ untagged videos. Generic — works with any tag vocabulary.
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 
 from simpleparty.tagger import (
-    SIMPLEPARTY_DIR, MODEL_FILENAME, VIDEO_EXTENSIONS,
-    _get_duration, _is_dark_frame,
-    confirmed_entries, load_tags, model_path, save_tags,
+    SIMPLEPARTY_DIR, FRAMES_DIR, MODEL_FILENAME,
+    _get_duration, _downscale_frame,
+    confirmed_entries, extract_frame, load_tags, model_path, save_tags,
+    thumb_path,
 )
-
-FRAMES_DIR = SIMPLEPARTY_DIR + '/frames'
 
 
 def _require_torch():
@@ -68,34 +66,21 @@ def _encode_tags(tags, vocab, tag_to_idx):
 
 # --- Frame extraction ---
 
-def _extract_single_frame(video_path, position, out_path):
-    """Extract a single frame at a given position (seconds)."""
-    cmd = [
-        'ffmpeg', '-ss', f'{position:.2f}',
-        '-i', str(video_path),
-        '-frames:v', '1',
-        '-q:v', '4',
-        str(out_path),
-    ]
-    try:
-        subprocess.run(cmd, capture_output=True, timeout=30, check=False)
-        return Path(out_path).exists() and not _is_dark_frame(out_path)
-    except subprocess.TimeoutExpired:
-        return False
-
 
 def extract_training_frames(directory, tags_data, max_frames=1, progress=None):
     """Extract frames for all confirmed videos. Returns manifest list.
 
     Each manifest entry: (frame_path, tags_list).
-    Frames saved to {directory}/.simpleparty-frames/.
+    Frames saved to {directory}/.simpleparty/frames/.
+    Also creates thumbnails as a side effect for videos that lack them.
     """
     frames_dir = Path(directory) / FRAMES_DIR
-    frames_dir.mkdir(exist_ok=True)
+    frames_dir.mkdir(parents=True, exist_ok=True)
 
     confirmed = confirmed_entries(tags_data)
     manifest = []
     total = len(confirmed)
+    mid_idx = (max_frames - 1) // 2
 
     for i, (video_name, entry) in enumerate(confirmed.items()):
         if progress:
@@ -123,12 +108,18 @@ def extract_training_frames(directory, tags_data, max_frames=1, progress=None):
             frame_path = frames_dir / frame_name
 
             if not frame_path.exists():
-                ok = _extract_single_frame(video_path, pos, frame_path)
+                ok = extract_frame(str(video_path), pos, str(frame_path))
                 if not ok:
                     continue
 
             if frame_path.exists():
                 manifest.append((str(frame_path), tags))
+
+        # Create thumbnail as side effect from the frame nearest 50%
+        tp = thumb_path(directory, video_name)
+        mid_frame = frames_dir / f'{video_name}.f{mid_idx}.jpg'
+        if not tp.exists() and mid_frame.exists():
+            _downscale_frame(str(mid_frame), str(tp))
 
     if progress:
         progress['done'] = total
