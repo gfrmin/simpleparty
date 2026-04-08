@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import logging
 import os
 import random
 import re
@@ -10,12 +11,15 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 from functools import partial
 from html import escape as esc
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
+
+logger = logging.getLogger('simpleparty.server')
 
 VIDEO_EXTENSIONS = frozenset({
     '.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4v', '.ogv',
@@ -987,27 +991,49 @@ def _generate_thumbnails(directory, videos):
         extract_frame, _downscale_frame, _get_duration,
     )
     try:
+        t0 = time.monotonic()
         frames_dir = Path(directory) / FRAMES_DIR
         frames_dir.mkdir(parents=True, exist_ok=True)
+
+        # Pre-scan: classify each video
+        skip = []
+        need_frame = []       # no full-res frame (extract frame + maybe thumb)
+        need_thumb_only = []   # frame exists but no thumbnail
         for v in videos:
-            tp = thumb_path(directory, v['name'])
-            has_frame = bool(sorted(frames_dir.glob(f"{v['name']}.f*.jpg")))
-            video_file = Path(directory) / v['name']
-
-            if has_frame and tp.exists():
-                continue
-
+            name = v['name']
+            tp = thumb_path(directory, name)
+            has_frame = bool(sorted(frames_dir.glob(f'{name}.f*.jpg')))
+            video_file = Path(directory) / name
             if not video_file.exists():
                 continue
+            if has_frame and tp.exists():
+                skip.append(name)
+            elif not has_frame:
+                need_frame.append(name)
+            else:
+                need_thumb_only.append(name)
 
-            if not has_frame:
-                # No full-res frame yet — extract_thumbnail handles both
-                extract_thumbnail(str(video_file), str(tp))
-            elif not tp.exists():
-                # Frame exists but no thumbnail (e.g. after training)
-                existing = sorted(frames_dir.glob(f"{v['name']}.f*.jpg"))
-                if existing:
-                    _downscale_frame(str(existing[0]), str(tp))
+        logger.debug('thumbnails for %s: %d skip, %d need frame, %d need thumb only',
+                     directory, len(skip), len(need_frame), len(need_thumb_only))
+        for name in skip:
+            logger.debug('  skip (frame+thumb exist): %s', name)
+        for name in need_frame:
+            logger.debug('  need frame extraction: %s', name)
+        for name in need_thumb_only:
+            logger.debug('  need thumb only: %s', name)
+
+        for name in need_frame:
+            video_file = Path(directory) / name
+            tp = thumb_path(directory, name)
+            extract_thumbnail(str(video_file), str(tp))
+
+        for name in need_thumb_only:
+            tp = thumb_path(directory, name)
+            existing = sorted(frames_dir.glob(f'{name}.f*.jpg'))
+            if existing:
+                _downscale_frame(str(existing[0]), str(tp))
+
+        logger.debug('thumbnail generation done for %s (%.1fs)', directory, time.monotonic() - t0)
     finally:
         _config['thumb_jobs'].discard(str(directory))
 
@@ -1029,6 +1055,8 @@ def _maybe_start_thumbs(directory, videos):
     if not missing:
         return
     _config['thumb_jobs'].add(dir_str)
+    logger.debug('starting background thumbnail thread for %s (%d videos to check)',
+                 directory, len(videos))
     t = threading.Thread(
         target=_generate_thumbnails,
         args=(directory, videos),
@@ -1609,7 +1637,14 @@ def main():
     parser.add_argument('--no-delete', action='store_true', help='Disable video deletion')
     parser.add_argument('--no-transcode', action='store_true', help='Disable ffmpeg/VLC transcoding')
     parser.add_argument('--no-tag', action='store_true', help='Disable all tagging features')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.WARNING,
+        format='%(asctime)s %(name)s %(message)s',
+        datefmt='%H:%M:%S',
+    )
 
     root = str(Path(args.root).resolve())
     if not Path(root).is_dir():

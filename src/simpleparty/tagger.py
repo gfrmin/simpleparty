@@ -1,11 +1,15 @@
 """Video tagging: keyframe extraction and tag file I/O."""
 
 import json
+import logging
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
+
+logger = logging.getLogger('simpleparty.tagger')
 
 VIDEO_EXTENSIONS = frozenset({
     '.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4v', '.ogv',
@@ -98,6 +102,7 @@ def _is_dark_frame(jpeg_path, threshold=20):
     try:
         data = Path(jpeg_path).read_bytes()
         if len(data) < 1000:
+            logger.debug('dark frame (too small %d bytes): %s', len(data), jpeg_path)
             return True
         start = len(data) // 3
         end = 2 * len(data) // 3
@@ -105,8 +110,12 @@ def _is_dark_frame(jpeg_path, threshold=20):
         if not sample:
             return True
         avg = sum(sample) / len(sample)
-        return avg < threshold
+        if avg < threshold:
+            logger.debug('dark frame (avg %.1f < %d): %s', avg, threshold, jpeg_path)
+            return True
+        return False
     except OSError:
+        logger.debug('dark frame (read error): %s', jpeg_path)
         return True
 
 
@@ -119,9 +128,13 @@ def _get_duration(video_path):
         str(video_path),
     ]
     try:
+        t0 = time.monotonic()
         result = subprocess.run(cmd, capture_output=True, timeout=10, text=True)
-        return float(result.stdout.strip())
+        dur = float(result.stdout.strip())
+        logger.debug('duration %.1fs for %s (%.2fs)', dur, video_path, time.monotonic() - t0)
+        return dur
     except (subprocess.TimeoutExpired, ValueError, OSError):
+        logger.debug('duration failed for %s', video_path)
         return 0.0
 
 
@@ -132,12 +145,15 @@ def extract_keyframes(video_path, max_frames=3):
     For max_frames=1, extracts at 50%.
     Returns list of JPEG paths. Caller must clean up the temp directory.
     """
+    t0 = time.monotonic()
     tmpdir = tempfile.mkdtemp(prefix='simpleparty-frames-')
     duration = _get_duration(video_path)
     if duration <= 0:
         return []
 
     positions = [duration * (i + 1) / (max_frames + 1) for i in range(max_frames)]
+    logger.debug('extracting %d keyframes from %s at positions %s',
+                 max_frames, video_path, ['%.1fs' % p for p in positions])
 
     for idx, pos in enumerate(positions):
         out_path = os.path.join(tmpdir, f'frame_{idx:02d}.jpg')
@@ -158,6 +174,8 @@ def extract_keyframes(video_path, max_frames=3):
 
     frames = sorted(Path(tmpdir).glob('frame_*.jpg'))
     usable = [f for f in frames if not _is_dark_frame(f)]
+    logger.debug('keyframes done for %s: %d usable of %d extracted (%.2fs)',
+                 video_path, len(usable), len(frames), time.monotonic() - t0)
     return usable[:max_frames]
 
 
@@ -185,9 +203,15 @@ def extract_frame(video_path, position, out_path):
         str(out_path),
     ]
     try:
+        t0 = time.monotonic()
         subprocess.run(cmd, capture_output=True, timeout=30, check=False)
-        return Path(out_path).exists() and not _is_dark_frame(out_path)
+        ok = Path(out_path).exists() and not _is_dark_frame(out_path)
+        logger.debug('extract_frame %s @%.1fs -> %s (%s, %.2fs)',
+                     video_path, position, out_path,
+                     'ok' if ok else 'failed', time.monotonic() - t0)
+        return ok
     except subprocess.TimeoutExpired:
+        logger.debug('extract_frame timeout for %s @%.1fs', video_path, position)
         return False
 
 
@@ -201,15 +225,19 @@ def _downscale_frame(frame_path, output_path):
         '-y', str(output_path),
     ]
     try:
+        t0 = time.monotonic()
         subprocess.run(cmd, capture_output=True, timeout=30, check=False)
     except subprocess.TimeoutExpired:
+        logger.debug('downscale timeout: %s', frame_path)
         return False
     out = Path(output_path)
     if not out.exists():
+        logger.debug('downscale failed (no output): %s', frame_path)
         return False
     if _is_dark_frame(out):
         out.unlink()
         return False
+    logger.debug('downscaled %s -> %s (%.2fs)', frame_path, output_path, time.monotonic() - t0)
     return True
 
 
@@ -227,9 +255,11 @@ def extract_thumbnail(video_path, output_path):
     # Look for an existing full-res frame
     existing = sorted(frames_dir.glob(f'{video_name}.f*.jpg'))
     if existing:
+        logger.debug('thumbnail reusing existing frame %s', existing[0])
         return _downscale_frame(existing[0], output_path)
 
     # Extract a new full-res frame at 50% duration
+    logger.debug('thumbnail extracting new frame for %s', video_name)
     duration = _get_duration(video_path)
     if duration <= 0:
         return False
