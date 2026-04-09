@@ -253,6 +253,26 @@ def filter_videos_by_tags(videos, tags_map, selected_tags):
     ]
 
 
+def _compute_related_videos(data, idx, tags_map, max_results=8):
+    """Return list of (video_index, shared_tag_count) for videos sharing tags with current."""
+    if not tags_map:
+        return []
+    current = data['videos'][idx]
+    current_tags = {t.lower() for t in tags_map.get(current['name'], {}).get('tags', [])}
+    if not current_tags:
+        return []
+    scored = []
+    for i, v in enumerate(data['videos']):
+        if i == idx:
+            continue
+        vtags = {t.lower() for t in tags_map.get(v['name'], {}).get('tags', [])}
+        overlap = len(current_tags & vtags)
+        if overlap > 0:
+            scored.append((i, overlap))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:max_results]
+
+
 def shuffle_indices(n, seed):
     rng = random.Random(seed)
     indices = list(range(n))
@@ -306,23 +326,43 @@ video{width:100%;max-height:70vh;display:block;background:#000}
   display:flex;align-items:center;padding:8px 16px;gap:8px;
   background:#1a1a2e;border-bottom:1px solid #2d2d44;flex-wrap:wrap;
 }
+.skip-group{display:flex;gap:4px}
+.btn-skip{padding:6px 10px;font-size:12px;min-height:32px}
+.speed-select{
+  background:#16213e;color:#e2e8f0;border:1px solid #2d2d44;
+  padding:6px 8px;border-radius:6px;font-size:13px;cursor:pointer;
+  min-height:32px;
+}
+.speed-select:hover{border-color:#a78bfa}
+#video-overlay{
+  position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+  background:rgba(0,0,0,0.7);color:#fff;padding:10px 20px;border-radius:8px;
+  font-size:20px;font-weight:bold;pointer-events:none;opacity:0;transition:opacity .15s;
+  z-index:6;
+}
+#video-title{
+  padding:8px 16px 0;background:#1a1a2e;
+  font-size:16px;font-weight:600;color:#e2e8f0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
 #now-playing{
   flex:1;text-align:center;overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap;color:#94a3b8;font-size:13px;padding:0 8px;
+  white-space:nowrap;color:#94a3b8;font-size:12px;padding:0 8px;
 }
 #file-list{
   padding:16px;
-  display:grid;grid-template-columns:repeat(auto-fill,minmax(min(220px,100%),1fr));gap:8px;
+  display:flex;flex-wrap:wrap;gap:8px;
   overflow:hidden;max-width:100%;
 }
 .item{
   display:flex;align-items:center;gap:10px;padding:12px 14px;
   background:#16213e;border-radius:8px;min-height:48px;
   transition:background .15s;border:2px solid transparent;min-width:0;overflow:hidden;
-  flex-wrap:wrap;
+  flex-wrap:wrap;width:100%;
 }
 .item-video{
-  flex-direction:column;align-items:stretch;padding:0;gap:0;
+  flex:0 1 calc(12.5% - 7px);min-width:120px;max-width:180px;
+  flex-direction:column;align-items:stretch;padding:0;gap:0;width:auto;
 }
 .item-video .item-link{flex-direction:column;align-items:stretch;gap:0}
 .item-video .item-info{display:flex;align-items:center;gap:8px;padding:8px 10px;min-width:0}
@@ -343,8 +383,8 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .item-video .btn-del{position:absolute;top:4px;right:4px;z-index:2;background:rgba(0,0,0,0.5);border-radius:50%;padding:4px 6px}
 .item-video{position:relative}
 .item-video .item-tags{padding:0 10px 8px;width:100%}
-.empty{grid-column:1/-1;color:#64748b;text-align:center;padding:40px 20px;font-size:15px}
-.action-bar{grid-column:1/-1;display:flex;gap:8px;padding-bottom:4px;flex-wrap:wrap;overflow:hidden}
+.empty{width:100%;color:#64748b;text-align:center;padding:40px 20px;font-size:15px}
+.action-bar{width:100%;display:flex;gap:8px;padding-bottom:4px;flex-wrap:wrap;overflow:hidden}
 .unlock-box{
   max-width:380px;margin:40px auto;background:#1a1a2e;border:1px solid #2d2d44;
   border-radius:12px;padding:24px;
@@ -410,8 +450,26 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .video-tag-remove:hover{opacity:1;color:#f87171}
 .video-tag-add{background:#0f0f1a;border:1px solid #2d2d44;border-radius:12px;color:#e2e8f0;padding:4px 10px;font-size:12px;width:120px;outline:none}
 .video-tag-add:focus{border-color:#7c3aed}
+#related-videos{padding:16px;border-bottom:1px solid #2d2d44}
+.related-heading{color:#94a3b8;font-size:14px;font-weight:500;margin-bottom:10px}
+.related-list{display:flex;flex-wrap:wrap;gap:8px}
+.related-list .item-video{flex:0 1 calc(12.5% - 7px);min-width:120px;max-width:160px}
+.playlist{padding:16px}
+.playlist-heading{color:#94a3b8;font-size:14px;font-weight:500;margin-bottom:10px}
+.playlist-items{display:flex;flex-direction:column;gap:4px}
+.playlist-item{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:6px;text-decoration:none;color:#e2e8f0;transition:background .15s}
+.playlist-item:hover{background:#1e3054}
+.playlist-item.playing{background:#1a1a2e;border-left:3px solid #7c3aed}
+.playlist-thumb{width:80px;aspect-ratio:16/9;object-fit:cover;border-radius:4px;flex-shrink:0;background:#0f0f1a}
+.playlist-thumb-placeholder{width:80px;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;font-size:20px;color:#4a4a6a;background:#0f0f1a;border-radius:4px;flex-shrink:0}
+.playlist-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;flex:1;min-width:0}
+.playlist-pos{color:#64748b;font-size:12px;flex-shrink:0;min-width:20px;text-align:right}
 @media(max-width:640px){
-  #file-list{grid-template-columns:1fr;padding:8px;gap:6px}
+  #file-list{padding:8px;gap:6px}
+  .item-video{flex:0 1 calc(50% - 4px);min-width:0;max-width:none}
+  .related-list .item-video{flex:0 1 calc(50% - 4px);min-width:0;max-width:none}
+  #video-title{font-size:14px;padding:6px 12px 0}
+  .playlist-thumb,.playlist-thumb-placeholder{width:60px}
   nav{padding:8px 12px}
   #controls{padding:6px 12px;justify-content:center}
 }"""
@@ -581,6 +639,97 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
         pieces.append('<div class="empty">Empty directory</div>')
 
     pieces.append('</div>')
+    return ''.join(pieces)
+
+
+def render_related_videos(data, idx, tags_map, selected_tags=None):
+    """Render a 'Related Videos' section based on tag overlap."""
+    related = _compute_related_videos(data, idx, tags_map)
+    if not related:
+        return ''
+    from simpleparty.tagger import thumb_path
+    root_dir = _config.get('root', '.')
+    pieces = [
+        '<div id="related-videos">'
+        '<h3 class="related-heading">Related Videos</h3>'
+        '<div class="related-list">'
+    ]
+    for video_idx, _overlap in related:
+        v = data['videos'][video_idx]
+        play_url = url_for_play(data['path'], video_idx, tags=selected_tags)
+        resolved_dir = resolve_path(root_dir, data['path'])
+        has_thumb = thumb_path(str(resolved_dir), v['name']).exists()
+        thumb_url = f'/thumb/{urllib.parse.quote(v["path"])}'
+        if has_thumb:
+            thumb_html = f'<img src="{thumb_url}" loading="lazy" class="item-thumb" alt="">'
+        else:
+            thumb_html = '<div class="item-thumb item-thumb-placeholder">\U0001F3AC</div>'
+        pieces.append(
+            f'<div class="item item-video">'
+            f'<a class="item-link" href="{esc(play_url)}">'
+            f'{thumb_html}'
+            f'<span class="item-info">'
+            f'<span class="item-name">{esc(v["name"])}</span>'
+            f'</span>'
+            f'</a>'
+            f'</div>'
+        )
+    pieces.append('</div></div>')
+    return ''.join(pieces)
+
+
+def render_playlist(data, current_idx, play_order, shuffle_seed, selected_tags=None):
+    """Render playlist showing videos in playback order with current highlighted."""
+    from simpleparty.tagger import thumb_path
+    root_dir = _config.get('root', '.')
+    n = len(data['videos'])
+    is_shuffled = play_order is not None
+
+    # Build ordered list: (video_index, playlist_position)
+    # Starting from current position, wrapping around
+    if is_shuffled:
+        # Find current position in shuffle order
+        current_pos = play_order.index(current_idx)
+        ordered = [(play_order[(current_pos + i) % n], i) for i in range(n)]
+    else:
+        ordered = [((current_idx + i) % n, i) for i in range(n)]
+
+    pieces = [
+        '<div class="playlist">'
+        '<h3 class="playlist-heading">Playlist</h3>'
+        '<div class="playlist-items">'
+    ]
+
+    for video_idx, offset in ordered:
+        v = data['videos'][video_idx]
+        is_current = (offset == 0)
+
+        if is_shuffled:
+            pos_in_order = (current_pos + offset) % n
+            play_url = url_for_play(data['path'], video_idx, shuffle=True, seed=shuffle_seed, pos=pos_in_order, tags=selected_tags)
+        else:
+            play_url = url_for_play(data['path'], video_idx, tags=selected_tags)
+
+        resolved_dir = resolve_path(root_dir, data['path'])
+        has_thumb = thumb_path(str(resolved_dir), v['name']).exists()
+        thumb_url = f'/thumb/{urllib.parse.quote(v["path"])}'
+
+        cls = ' playing' if is_current else ''
+        if has_thumb:
+            thumb_html = f'<img src="{thumb_url}" loading="lazy" class="playlist-thumb" alt="">'
+        else:
+            thumb_html = '<div class="playlist-thumb-placeholder">\U0001F3AC</div>'
+
+        label = '\u25B6 Now' if is_current else str(offset)
+        pieces.append(
+            f'<a class="playlist-item{cls}" href="{esc(play_url)}">'
+            f'{thumb_html}'
+            f'<span class="playlist-name">{esc(v["name"])}</span>'
+            f'<span class="playlist-pos">{label}</span>'
+            f'</a>'
+        )
+
+    pieces.append('</div></div>')
     return ''.join(pieces)
 
 
@@ -778,7 +927,7 @@ def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'
     return ''.join(pieces)
 
 
-def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info, tags_map=None, selected_tags=None):
+def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info, tags_map=None, selected_tags=None, play_order=None, shuffle_seed=None):
     v = data['videos'][idx]
     video_src = url_for_video(v['path'])
     browse_url = url_for_browse(data['path'], tags=selected_tags)
@@ -787,10 +936,27 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
     body += (
         f'<div id="player-area">'
         f'<video id="video" src="{esc(video_src)}" controls playsinline autoplay></video>'
+        f'<div id="video-overlay"></div>'
+        f'<div id="video-title">{esc(v["name"])}</div>'
         f'<div id="controls">'
         f'<a class="btn" href="{esc(prev_url)}" title="Previous (p)">\u25C0 Prev</a>'
-        f'<span id="now-playing">{esc(v["name"])} ({pos_info})</span>'
+        f'<div class="skip-group">'
+        f'<button class="btn btn-skip" onclick="skip(-30)" title="Back 30s (J)">-30s</button>'
+        f'<button class="btn btn-skip" onclick="skip(-10)" title="Back 10s (j)">-10s</button>'
+        f'<button class="btn btn-skip" onclick="skip(10)" title="Forward 10s (l)">+10s</button>'
+        f'<button class="btn btn-skip" onclick="skip(30)" title="Forward 30s (L)">+30s</button>'
+        f'</div>'
+        f'<span id="now-playing">{pos_info}</span>'
         f'<a class="btn" href="{esc(next_url)}" title="Next (n)">Next \u25B6</a>'
+        f'<select id="speed-select" class="speed-select" onchange="setSpeed(this.value)" title="Speed (&lt; &gt;)">'
+        f'<option value="0.5">0.5x</option>'
+        f'<option value="0.75">0.75x</option>'
+        f'<option value="1" selected>1x</option>'
+        f'<option value="1.25">1.25x</option>'
+        f'<option value="1.5">1.5x</option>'
+        f'<option value="2">2x</option>'
+        f'<option value="3">3x</option>'
+        f'</select>'
         f'<a class="btn{" active" if is_shuffled else ""}" '
         f'href="{esc(shuffle_url)}" title="Shuffle (s)">\u21C5 Shuffle</a>'
     )
@@ -823,7 +989,10 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
                 )
         body += f'<div class="video-meta" id="video-meta">{meta_html}</div>'
 
-    body += render_file_list(data, current_idx=idx, show_shuffle=False, tags_map=tags_map, selected_tags=selected_tags)
+    if tags_map:
+        body += render_related_videos(data, idx, tags_map, selected_tags=selected_tags)
+
+    body += render_playlist(data, idx, play_order, shuffle_seed, selected_tags=selected_tags)
 
     body += (
         '<script>\n'
@@ -831,16 +1000,30 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         f'const nextUrl={json.dumps(next_url)};\n'
         f'const prevUrl={json.dumps(prev_url)};\n'
         f'const browseUrl={json.dumps(browse_url)};\n'
+        'const overlay=document.getElementById("video-overlay");\n'
+        'const speedSel=document.getElementById("speed-select");\n'
+        'const speeds=[0.5,0.75,1,1.25,1.5,2,3];\n'
+        'let overlayTimer;\n'
+        'function flash(txt){overlay.textContent=txt;overlay.style.opacity="1";clearTimeout(overlayTimer);overlayTimer=setTimeout(()=>{overlay.style.opacity="0"},600)}\n'
+        'function skip(s){video.currentTime=Math.max(0,Math.min(video.duration||0,video.currentTime+s));flash((s>0?"+":"")+s+"s")}\n'
+        'function setSpeed(v){v=parseFloat(v);video.playbackRate=v;speedSel.value=v;flash(v+"x")}\n'
+        'function cycleSpeed(dir){const i=speeds.indexOf(video.playbackRate);const ni=Math.max(0,Math.min(speeds.length-1,i+dir));setSpeed(speeds[ni])}\n'
         'video.addEventListener("ended",()=>{window.location.href=nextUrl});\n'
         'video.play().catch(()=>{});\n'
         'document.addEventListener("keydown",e=>{\n'
-        '  if(e.target.tagName==="INPUT")return;\n'
+        '  if(e.target.tagName==="INPUT"||e.target.tagName==="SELECT")return;\n'
         '  switch(e.key){\n'
         '    case"n":case"ArrowRight":window.location.href=nextUrl;break;\n'
         '    case"p":case"ArrowLeft":window.location.href=prevUrl;break;\n'
         '    case" ":e.preventDefault();video.paused?video.play():video.pause();break;\n'
         '    case"f":e.preventDefault();document.fullscreenElement?document.exitFullscreen():video.requestFullscreen();break;\n'
         '    case"m":video.muted=!video.muted;break;\n'
+        '    case"j":e.preventDefault();skip(-10);break;\n'
+        '    case"l":e.preventDefault();skip(10);break;\n'
+        '    case"J":e.preventDefault();skip(-30);break;\n'
+        '    case"L":e.preventDefault();skip(30);break;\n'
+        '    case"<":e.preventDefault();cycleSpeed(-1);break;\n'
+        '    case">":e.preventDefault();cycleSpeed(1);break;\n'
         '    case"Escape":window.location.href=browseUrl;break;\n'
         '    case"d":document.querySelector("#delete-form button")?.click();break;\n'
         '  }\n'
@@ -1124,6 +1307,8 @@ def handle_play(handler, root):
     n = len(data['videos'])
     shuffled = params.get('shuffle') == '1'
 
+    play_order = None
+    shuffle_seed = None
     if shuffled:
         seed = safe_int(params.get('seed'), random.randint(0, 2**31))
         pos = safe_int(params.get('pos')) % n
@@ -1135,6 +1320,8 @@ def handle_play(handler, root):
         prev_url = url_for_play(dir_path, order[prev_pos], shuffle=True, seed=seed, pos=prev_pos, tags=selected_tags)
         pos_info = f'{pos + 1}/{n}'
         shuffle_url = url_for_play(dir_path, idx, tags=selected_tags)
+        play_order = order
+        shuffle_seed = seed
     else:
         idx = max(0, min(safe_int(params.get('idx')), n - 1))
         next_url = url_for_play(dir_path, (idx + 1) % n, tags=selected_tags)
@@ -1145,7 +1332,7 @@ def handle_play(handler, root):
             shuffle_params['tags'] = ','.join(selected_tags)
         shuffle_url = '/play?' + urllib.parse.urlencode(shuffle_params)
 
-    send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info, tags_map=tags_map, selected_tags=selected_tags))
+    send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info, tags_map=tags_map, selected_tags=selected_tags, play_order=play_order, shuffle_seed=shuffle_seed))
 
 
 def handle_video(handler, root):
