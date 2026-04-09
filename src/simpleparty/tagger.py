@@ -174,6 +174,7 @@ def extract_keyframes(video_path, max_frames=3):
         out_path = os.path.join(tmpdir, f'frame_{idx:02d}.jpg')
         cmd = [
             'ffmpeg', '-ss', f'{pos:.2f}',
+            '-t', '30',
             '-skip_frame', 'nokey',
             '-i', str(video_path),
             '-frames:v', '1',
@@ -213,6 +214,7 @@ def extract_frame(video_path, position, out_path, timeout=30):
     """Extract a single full-res frame at *position* seconds. Returns True on success."""
     cmd = [
         'ffmpeg', '-ss', f'{position:.2f}',
+        '-t', '10',
         '-skip_frame', 'nokey',
         '-i', str(video_path),
         '-frames:v', '1',
@@ -275,15 +277,20 @@ def extract_thumbnail(video_path, output_path):
         logger.debug('thumbnail reusing existing frame %s', existing[0])
         return _downscale_frame(existing[0], output_path)
 
-    # Extract a new full-res frame at 50% duration
+    # Extract a new full-res frame, trying progressively earlier positions
+    # (earlier positions are faster to seek to on slow storage)
     logger.debug('thumbnail extracting new frame for %s', video_name)
     duration = _get_duration(video_path)
     if duration <= 0:
         return False
 
-    timeout = max(30, int(duration / 10))
+    positions = [duration / 2, duration / 4, min(10, duration / 4), 1]
+    timeout_per = min(45, max(20, int(duration / 15)))
     frame_path = frames_dir / f'{video_name}.f0.jpg'
-    if not extract_frame(str(video_path), duration / 2, str(frame_path), timeout=timeout):
+    for pos in positions:
+        if extract_frame(str(video_path), pos, str(frame_path), timeout=timeout_per):
+            break
+    else:
         return False
 
     return _downscale_frame(str(frame_path), output_path)
