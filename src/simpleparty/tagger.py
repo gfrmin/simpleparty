@@ -166,6 +166,7 @@ def extract_keyframes(video_path, max_frames=3):
         return []
 
     positions = [duration * (i + 1) / (max_frames + 1) for i in range(max_frames)]
+    timeout = max(30, int(duration / 10))
     logger.debug('extracting %d keyframes from %s at positions %s',
                  max_frames, video_path, ['%.1fs' % p for p in positions])
 
@@ -173,6 +174,7 @@ def extract_keyframes(video_path, max_frames=3):
         out_path = os.path.join(tmpdir, f'frame_{idx:02d}.jpg')
         cmd = [
             'ffmpeg', '-ss', f'{pos:.2f}',
+            '-skip_frame', 'nokey',
             '-i', str(video_path),
             '-frames:v', '1',
             '-q:v', '4',
@@ -180,7 +182,7 @@ def extract_keyframes(video_path, max_frames=3):
         ]
         try:
             subprocess.run(
-                cmd, capture_output=True, timeout=30,
+                cmd, capture_output=True, timeout=timeout,
                 check=False,
             )
         except subprocess.TimeoutExpired:
@@ -207,10 +209,11 @@ def thumb_path(directory_path, video_name):
     return Path(directory_path) / SIMPLEPARTY_DIR / THUMB_DIR / f'{video_name}.jpg'
 
 
-def extract_frame(video_path, position, out_path):
+def extract_frame(video_path, position, out_path, timeout=30):
     """Extract a single full-res frame at *position* seconds. Returns True on success."""
     cmd = [
         'ffmpeg', '-ss', f'{position:.2f}',
+        '-skip_frame', 'nokey',
         '-i', str(video_path),
         '-frames:v', '1',
         '-q:v', '4',
@@ -218,7 +221,7 @@ def extract_frame(video_path, position, out_path):
     ]
     try:
         t0 = time.monotonic()
-        subprocess.run(cmd, capture_output=True, timeout=30, check=False)
+        subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
         ok = Path(out_path).exists() and not _is_dark_frame(out_path)
         logger.debug('extract_frame %s @%.1fs -> %s (%s, %.2fs)',
                      video_path, position, out_path,
@@ -278,8 +281,9 @@ def extract_thumbnail(video_path, output_path):
     if duration <= 0:
         return False
 
+    timeout = max(30, int(duration / 10))
     frame_path = frames_dir / f'{video_name}.f0.jpg'
-    if not extract_frame(str(video_path), duration / 2, str(frame_path)):
+    if not extract_frame(str(video_path), duration / 2, str(frame_path), timeout=timeout):
         return False
 
     return _downscale_frame(str(frame_path), output_path)

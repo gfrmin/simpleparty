@@ -158,12 +158,13 @@ def extract_training_frames(directory, tags_data, max_frames=1, progress=None):
         if duration <= 0:
             continue
 
+        timeout = max(30, int(duration / 10))
         positions = [duration * (j + 1) / (max_frames + 1) for j in range(max_frames)]
         for frame_idx, pos in enumerate(positions):
             frame_name = f'{video_name}.f{frame_idx}.jpg'
             frame_path = frames_dir / frame_name
             if not frame_path.exists():
-                extract_frame(str(video_path), pos, str(frame_path))
+                extract_frame(str(video_path), pos, str(frame_path), timeout=timeout)
 
         _add_to_manifest(video_name, entry)
         _make_thumbnail(video_name)
