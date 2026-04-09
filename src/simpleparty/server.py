@@ -1311,7 +1311,7 @@ def handle_suggest(handler, root):
     t = threading.Thread(
         target=suggest_for_directory,
         args=(resolved_str, model_path),
-        kwargs={'progress': progress},
+        kwargs={'progress': progress, 'max_tags': _config['max_tags']},
         daemon=True,
     )
     t.start()
@@ -1345,7 +1345,7 @@ def handle_suggest_one(handler, root):
         handler.send_error(404, 'Video not found')
         return
 
-    results = suggest_for_video(str(video_path), str(mp))
+    results = suggest_for_video(str(video_path), str(mp), max_tags=_config['max_tags'])
     if results:
         all_tags = load_tags(resolved)
         avg_conf = sum(c for _, c in results) / len(results)
@@ -1694,6 +1694,7 @@ def main():
     parser.add_argument('--no-delete', action='store_true', help='Disable video deletion')
     parser.add_argument('--no-transcode', action='store_true', help='Disable ffmpeg/VLC transcoding')
     parser.add_argument('--no-tag', action='store_true', help='Disable all tagging features')
+    parser.add_argument('--max-tags', type=int, default=10, help='Max tags per video when suggesting (default: 10)')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     args = parser.parse_args()
 
@@ -1714,6 +1715,7 @@ def main():
     _config['allow_transcode'] = not args.no_transcode
 
     _config['root'] = root
+    _config['max_tags'] = args.max_tags
     if args.no_tag:
         _config['allow_tag'] = False
 

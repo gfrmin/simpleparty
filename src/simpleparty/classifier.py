@@ -511,7 +511,7 @@ def classify_frame(image_path, model_info):
     return sorted(results, key=lambda x: -x[1])
 
 
-def suggest_for_video(video_path, model_path, max_frames=1):
+def suggest_for_video(video_path, model_path, max_frames=1, max_tags=10):
     """Suggest tags for a single video. Returns list of (tag, confidence)."""
     from simpleparty.tagger import extract_keyframes
 
@@ -528,12 +528,12 @@ def suggest_for_video(video_path, model_path, max_frames=1):
             for tag, conf in classify_frame(str(frame), model_info):
                 if tag not in all_results or conf > all_results[tag]:
                     all_results[tag] = conf
-        return sorted(all_results.items(), key=lambda x: -x[1])
+        return sorted(all_results.items(), key=lambda x: -x[1])[:max_tags]
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def suggest_for_directory(directory, model_path, progress=None, max_frames=1):
+def suggest_for_directory(directory, model_path, progress=None, max_frames=1, max_tags=10):
     """Suggest tags for all untagged videos in a directory.
 
     Saves suggestions with status='suggested' to the tags file.
@@ -541,13 +541,13 @@ def suggest_for_directory(directory, model_path, progress=None, max_frames=1):
     if progress is None:
         progress = {}
     try:
-        _suggest_inner(directory, model_path, progress, max_frames)
+        _suggest_inner(directory, model_path, progress, max_frames, max_tags)
     except Exception as e:
         progress['error'] = str(e)
         progress['running'] = False
 
 
-def _suggest_inner(directory, model_path, progress, max_frames):
+def _suggest_inner(directory, model_path, progress, max_frames, max_tags):
     from simpleparty.tagger import untagged_videos
 
     tags_data = load_tags(directory)
@@ -562,7 +562,7 @@ def _suggest_inner(directory, model_path, progress, max_frames):
         progress['current'] = video_name
         video_path = Path(directory) / video_name
 
-        results = suggest_for_video(str(video_path), model_path, max_frames=max_frames)
+        results = suggest_for_video(str(video_path), model_path, max_frames=max_frames, max_tags=max_tags)
 
         if results:
             avg_conf = sum(c for _, c in results) / len(results)
