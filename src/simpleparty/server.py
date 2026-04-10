@@ -208,8 +208,10 @@ def url_for_browse(path='', tags=None):
     return '/' if not params else '/browse?' + urllib.parse.urlencode(params)
 
 
-def url_for_play(dir_path, idx, shuffle=False, seed=None, pos=None, tags=None):
+def url_for_play(dir_path, idx, shuffle=False, seed=None, pos=None, tags=None, video=None):
     params = {'path': dir_path, 'idx': str(idx)}
+    if video:
+        params['video'] = video
     if shuffle:
         params['shuffle'] = '1'
         if seed is not None:
@@ -287,6 +289,14 @@ def safe_int(s, default=0):
         return default
 
 
+def find_video_idx(videos, name):
+    """Find a video's index by name. Returns None if not found."""
+    for i, v in enumerate(videos):
+        if v['name'] == name:
+            return i
+    return None
+
+
 # --- HTML rendering ---
 
 CSS = """\
@@ -361,7 +371,7 @@ video{width:100%;max-height:70vh;display:block;background:#000}
   flex-wrap:wrap;width:100%;
 }
 .item-video{
-  flex:0 1 calc(12.5% - 7px);min-width:120px;max-width:180px;
+  flex:0 1 calc(12.5% - 7px);min-width:90px;max-width:220px;
   flex-direction:column;align-items:stretch;padding:0;gap:0;width:auto;
 }
 .item-video .item-link{flex-direction:column;align-items:stretch;gap:0}
@@ -453,7 +463,7 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 #related-videos{padding:16px;border-bottom:1px solid #2d2d44}
 .related-heading{color:#94a3b8;font-size:14px;font-weight:500;margin-bottom:10px}
 .related-list{display:flex;flex-wrap:wrap;gap:8px}
-.related-list .item-video{flex:0 1 calc(12.5% - 7px);min-width:120px;max-width:160px}
+.related-list .item-video{flex:0 1 calc(12.5% - 7px);min-width:90px;max-width:180px}
 .playlist{padding:16px}
 .playlist-heading{color:#94a3b8;font-size:14px;font-weight:500;margin-bottom:10px}
 .playlist-items{display:flex;flex-direction:column;gap:4px}
@@ -464,10 +474,14 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .playlist-thumb-placeholder{width:80px;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;font-size:20px;color:#4a4a6a;background:#0f0f1a;border-radius:4px;flex-shrink:0}
 .playlist-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;flex:1;min-width:0}
 .playlist-pos{color:#64748b;font-size:12px;flex-shrink:0;min-width:20px;text-align:right}
+@media(max-width:1024px){
+  .item-video{flex:0 1 calc(20% - 7px);max-width:none}
+  .related-list .item-video{flex:0 1 calc(20% - 7px);max-width:none}
+}
 @media(max-width:640px){
   #file-list{padding:8px;gap:6px}
-  .item-video{flex:0 1 calc(50% - 4px);min-width:0;max-width:none}
-  .related-list .item-video{flex:0 1 calc(50% - 4px);min-width:0;max-width:none}
+  .item-video{flex:0 1 calc(33.33% - 6px);min-width:0;max-width:none}
+  .related-list .item-video{flex:0 1 calc(33.33% - 6px);min-width:0;max-width:none}
   #video-title{font-size:14px;padding:6px 12px 0}
   .playlist-thumb,.playlist-thumb-placeholder{width:60px}
   nav{padding:8px 12px}
@@ -598,7 +612,7 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
     root_dir = _config.get('root', '.')
     for i, v in enumerate(data['videos']):
         cls = ' playing' if i == current_idx else ''
-        play_url = url_for_play(data['path'], i, tags=selected_tags)
+        play_url = url_for_play(data['path'], i, tags=selected_tags, video=v['name'])
         resolved_dir = resolve_path(root_dir, data['path'])
         has_thumb = thumb_path(str(resolved_dir), v['name']).exists()
         pieces.append(f'<div class="item item-video{cls}">')
@@ -656,7 +670,7 @@ def render_related_videos(data, idx, tags_map, selected_tags=None):
     ]
     for video_idx, _overlap in related:
         v = data['videos'][video_idx]
-        play_url = url_for_play(data['path'], video_idx, tags=selected_tags)
+        play_url = url_for_play(data['path'], video_idx, tags=selected_tags, video=v['name'])
         resolved_dir = resolve_path(root_dir, data['path'])
         has_thumb = thumb_path(str(resolved_dir), v['name']).exists()
         thumb_url = f'/thumb/{urllib.parse.quote(v["path"])}'
@@ -706,9 +720,9 @@ def render_playlist(data, current_idx, play_order, shuffle_seed, selected_tags=N
 
         if is_shuffled:
             pos_in_order = (current_pos + offset) % n
-            play_url = url_for_play(data['path'], video_idx, shuffle=True, seed=shuffle_seed, pos=pos_in_order, tags=selected_tags)
+            play_url = url_for_play(data['path'], video_idx, shuffle=True, seed=shuffle_seed, pos=pos_in_order, tags=selected_tags, video=v['name'])
         else:
-            play_url = url_for_play(data['path'], video_idx, tags=selected_tags)
+            play_url = url_for_play(data['path'], video_idx, tags=selected_tags, video=v['name'])
 
         resolved_dir = resolve_path(root_dir, data['path'])
         has_thumb = thumb_path(str(resolved_dir), v['name']).exists()
@@ -1306,6 +1320,7 @@ def handle_play(handler, root):
 
     n = len(data['videos'])
     shuffled = params.get('shuffle') == '1'
+    video_name = params.get('video')
 
     play_order = None
     shuffle_seed = None
@@ -1314,18 +1329,30 @@ def handle_play(handler, root):
         pos = safe_int(params.get('pos')) % n
         order = shuffle_indices(n, seed)
         idx = order[pos]
+        # If a video name was provided and doesn't match, find it by name
+        # (handles stale URLs after deletion)
+        if video_name and data['videos'][idx]['name'] != video_name:
+            found = find_video_idx(data['videos'], video_name)
+            if found is not None:
+                idx = found
+                pos = order.index(idx) if idx in order else pos
         next_pos = (pos + 1) % n
         prev_pos = (pos - 1) % n
-        next_url = url_for_play(dir_path, order[next_pos], shuffle=True, seed=seed, pos=next_pos, tags=selected_tags)
-        prev_url = url_for_play(dir_path, order[prev_pos], shuffle=True, seed=seed, pos=prev_pos, tags=selected_tags)
+        next_url = url_for_play(dir_path, order[next_pos], shuffle=True, seed=seed, pos=next_pos, tags=selected_tags, video=data['videos'][order[next_pos]]['name'])
+        prev_url = url_for_play(dir_path, order[prev_pos], shuffle=True, seed=seed, pos=prev_pos, tags=selected_tags, video=data['videos'][order[prev_pos]]['name'])
         pos_info = f'{pos + 1}/{n}'
-        shuffle_url = url_for_play(dir_path, idx, tags=selected_tags)
+        shuffle_url = url_for_play(dir_path, idx, tags=selected_tags, video=data['videos'][idx]['name'])
         play_order = order
         shuffle_seed = seed
     else:
-        idx = max(0, min(safe_int(params.get('idx')), n - 1))
-        next_url = url_for_play(dir_path, (idx + 1) % n, tags=selected_tags)
-        prev_url = url_for_play(dir_path, (idx - 1) % n, tags=selected_tags)
+        idx_param = safe_int(params.get('idx'))
+        # Prefer video name lookup (stable across deletions)
+        found = find_video_idx(data['videos'], video_name) if video_name else None
+        idx = found if found is not None else max(0, min(idx_param, n - 1))
+        next_idx = (idx + 1) % n
+        prev_idx = (idx - 1) % n
+        next_url = url_for_play(dir_path, next_idx, tags=selected_tags, video=data['videos'][next_idx]['name'])
+        prev_url = url_for_play(dir_path, prev_idx, tags=selected_tags, video=data['videos'][prev_idx]['name'])
         pos_info = f'{idx + 1}/{n}'
         shuffle_params = {'path': dir_path, 'shuffle': '1'}
         if selected_tags:
@@ -1402,6 +1429,17 @@ def handle_delete(handler, root):
     except OSError as e:
         handler.send_error(500, str(e))
         return
+    # Clean up tags entry for deleted video
+    if _config['allow_tag']:
+        try:
+            from simpleparty.tagger import load_tags, save_tags
+            dir_path = resolved.parent
+            all_tags = load_tags(dir_path)
+            if resolved.name in all_tags:
+                del all_tags[resolved.name]
+                save_tags(dir_path, all_tags)
+        except Exception:
+            pass  # best-effort cleanup
     if redirect_url:
         send_hx_redirect(handler, redirect_url)
     else:
