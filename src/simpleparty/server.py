@@ -331,6 +331,10 @@ nav{
 .btn-lock{border-color:#991b1b}
 .btn-lock:hover{background:#7f1d1d;border-color:#dc2626}
 #player-area{position:sticky;top:0;z-index:5;background:#000}
+#transcode-notice{
+  background:#3a2e0a;color:#fde68a;border-bottom:1px solid #78350f;
+  padding:8px 16px;font-size:13px;line-height:1.4;
+}
 video{width:100%;max-height:70vh;display:block;background:#000}
 #controls{
   display:flex;align-items:center;padding:8px 16px;gap:8px;
@@ -941,12 +945,19 @@ def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'
     return ''.join(pieces)
 
 
-def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info, tags_map=None, selected_tags=None, play_order=None, shuffle_seed=None):
+def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info, tags_map=None, selected_tags=None, play_order=None, shuffle_seed=None, transcode_plan=None):
     v = data['videos'][idx]
     video_src = url_for_video(v['path'])
     browse_url = url_for_browse(data['path'], tags=selected_tags)
 
     body = render_nav(data['path'], data.get('encryptedDir'))
+    if transcode_plan == 'reencode':
+        body += (
+            '<div id="transcode-notice" role="status">'
+            '\u2699 Re-encoding this video in real time (source codec not supported by your browser). '
+            'Start-up and seeking may be slower than usual.'
+            '</div>'
+        )
     body += (
         f'<div id="player-area">'
         f'<video id="video" src="{esc(video_src)}" controls playsinline autoplay></video>'
@@ -1059,10 +1070,70 @@ def _is_mpegts(path):
         return False
 
 
+BROWSER_VIDEO_CODECS = frozenset({'h264', 'vp8', 'vp9', 'av1'})
+BROWSER_AUDIO_CODECS = frozenset({'aac', 'mp3', 'opus', 'vorbis'})
+
+_probe_cache = {}
+
+
+def _probe_streams(path):
+    """Return (video_codec, audio_codec) for a file, or (None, None) on failure. Cached by (path, mtime, size)."""
+    try:
+        st = path.stat()
+    except OSError:
+        return (None, None)
+    key = (str(path), st.st_mtime, st.st_size)
+    cached = _probe_cache.get(key)
+    if cached is not None:
+        return cached
+
+    def _probe(stream_selector):
+        try:
+            result = subprocess.run(
+                ['ffprobe', '-v', 'error', '-select_streams', stream_selector,
+                 '-show_entries', 'stream=codec_name', '-of', 'csv=p=0', str(path)],
+                capture_output=True, timeout=10, text=True,
+            )
+            codec = result.stdout.strip().splitlines()[0].strip() if result.stdout.strip() else None
+            return codec or None
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+
+    vcodec = _probe('v:0')
+    acodec = _probe('a:0')
+    _probe_cache[key] = (vcodec, acodec)
+    return (vcodec, acodec)
+
+
+def _transcode_plan(path):
+    """Return None | 'remux' | 'reencode' for a video file.
+
+    None       -> serve as-is (container and codecs are browser-compatible).
+    'remux'    -> repackage into fMP4 without re-encoding streams.
+    'reencode' -> full libx264/aac re-encode (video codec not browser-compatible).
+    """
+    suffix = path.suffix.lower()
+    # MPEG-TS masquerading as .mp4 is handled separately by _remux_mpegts.
+    if suffix == '.mp4' and _is_mpegts(path):
+        return 'remux'
+
+    if not _config.get('has_ffmpeg'):
+        # Without ffprobe/ffmpeg we can't inspect codecs; fall back to container-only.
+        return None if suffix in BROWSER_NATIVE else 'reencode'
+
+    vcodec, acodec = _probe_streams(path)
+    video_ok = vcodec in BROWSER_VIDEO_CODECS
+    audio_ok = acodec is None or acodec in BROWSER_AUDIO_CODECS  # missing audio is fine
+
+    if suffix in BROWSER_NATIVE and video_ok and audio_ok:
+        return None
+    if video_ok and audio_ok:
+        return 'remux'
+    return 'reencode'
+
+
 def _needs_transcode(path):
-    if path.suffix.lower() not in BROWSER_NATIVE:
-        return True
-    return path.suffix.lower() == '.mp4' and _is_mpegts(path)
+    return _transcode_plan(path) is not None
 
 
 def _remux_mpegts(path):
@@ -1087,13 +1158,24 @@ def _remux_mpegts(path):
             pass
 
 
-def _serve_transcoded(handler, path):
+def _serve_transcoded(handler, path, plan='reencode'):
     if _config['has_ffmpeg']:
-        cmd = [
-            'ffmpeg', '-i', str(path), '-c:v', 'copy', '-c:a', 'aac',
-            '-movflags', 'frag_keyframe+empty_moov',
-            '-f', 'mp4', '-loglevel', 'error', 'pipe:1',
-        ]
+        if plan == 'remux':
+            cmd = [
+                'ffmpeg', '-i', str(path),
+                '-c:v', 'copy', '-c:a', 'copy',
+                '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+                '-f', 'mp4', '-loglevel', 'error', 'pipe:1',
+            ]
+        else:  # 'reencode'
+            cmd = [
+                'ffmpeg', '-i', str(path),
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p', '-crf', '23',
+                '-c:a', 'aac', '-b:a', '160k',
+                '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+                '-f', 'mp4', '-loglevel', 'error', 'pipe:1',
+            ]
     else:
         cmd = [
             'cvlc', str(path),
@@ -1359,7 +1441,18 @@ def handle_play(handler, root):
             shuffle_params['tags'] = ','.join(selected_tags)
         shuffle_url = '/play?' + urllib.parse.urlencode(shuffle_params)
 
-    send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info, tags_map=tags_map, selected_tags=selected_tags, play_order=play_order, shuffle_seed=shuffle_seed))
+    transcode_plan = None
+    if _config['allow_transcode'] and (_config['has_ffmpeg'] or _config['has_vlc']):
+        try:
+            video_fs_path = resolve_path(root, data['videos'][idx]['path'])
+            if video_fs_path.is_file():
+                transcode_plan = _transcode_plan(video_fs_path) if _config['has_ffmpeg'] else (
+                    None if video_fs_path.suffix.lower() in BROWSER_NATIVE else 'reencode'
+                )
+        except OSError:
+            pass
+
+    send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info, tags_map=tags_map, selected_tags=selected_tags, play_order=play_order, shuffle_seed=shuffle_seed, transcode_plan=transcode_plan))
 
 
 def handle_video(handler, root):
@@ -1371,12 +1464,18 @@ def handle_video(handler, root):
         handler.send_error(404)
         return
 
-    if _config['allow_transcode'] and _needs_transcode(resolved) and (_config['has_ffmpeg'] or _config['has_vlc']):
-        if _is_mpegts(resolved) and _config['has_ffmpeg'] and _remux_mpegts(resolved):
-            pass  # file is now a proper MP4, fall through to normal serving
-        else:
-            _serve_transcoded(handler, resolved)
-            return
+    if _config['allow_transcode'] and (_config['has_ffmpeg'] or _config['has_vlc']):
+        plan = _transcode_plan(resolved) if _config['has_ffmpeg'] else (
+            None if resolved.suffix.lower() in BROWSER_NATIVE else 'reencode'
+        )
+        if plan is not None:
+            if _is_mpegts(resolved) and _config['has_ffmpeg'] and _remux_mpegts(resolved):
+                pass  # file is now a proper MP4, fall through to normal serving
+            else:
+                vcodec, acodec = _probe_streams(resolved) if _config['has_ffmpeg'] else (None, None)
+                logger.info('transcode plan=%s v=%s a=%s file=%s', plan, vcodec, acodec, resolved)
+                _serve_transcoded(handler, resolved, plan)
+                return
 
     file_size = resolved.stat().st_size
     content_type = MIME_TYPES.get(resolved.suffix.lower(), 'application/octet-stream')
