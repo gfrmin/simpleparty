@@ -113,7 +113,42 @@ def list_directory(root, rel_path):
 
 # --- fscrypt ---
 
+_FSCRYPT_TTL_SEC = 60.0
+_fscrypt_cache = {}
+_fscrypt_cache_lock = threading.Lock()
+_fscrypt_missing = False
+
+
+def _fscrypt_cache_key(dir_path):
+    try:
+        return str(Path(dir_path).resolve())
+    except OSError:
+        return str(dir_path)
+
+
+def _invalidate_fscrypt_cache(dir_path):
+    key = _fscrypt_cache_key(dir_path)
+    with _fscrypt_cache_lock:
+        _fscrypt_cache.pop(key, None)
+
+
 def get_fscrypt_status(dir_path):
+    if _fscrypt_missing:
+        return {'encrypted': False, 'unlocked': True}
+    key = _fscrypt_cache_key(dir_path)
+    now = time.monotonic()
+    with _fscrypt_cache_lock:
+        cached = _fscrypt_cache.get(key)
+        if cached and now - cached[1] < _FSCRYPT_TTL_SEC:
+            return cached[0]
+    status = _probe_fscrypt_status(dir_path)
+    with _fscrypt_cache_lock:
+        _fscrypt_cache[key] = (status, now)
+    return status
+
+
+def _probe_fscrypt_status(dir_path):
+    global _fscrypt_missing
     try:
         result = subprocess.run(
             ['fscrypt', 'status', str(dir_path)],
@@ -124,7 +159,10 @@ def get_fscrypt_status(dir_path):
             return {'encrypted': False, 'unlocked': True}
         unlocked = bool(re.search(r'Unlocked:\s*Yes', output))
         return {'encrypted': True, 'unlocked': unlocked}
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except FileNotFoundError:
+        _fscrypt_missing = True
+        return {'encrypted': False, 'unlocked': True}
+    except subprocess.TimeoutExpired:
         return {'encrypted': False, 'unlocked': True}
 
 
@@ -141,7 +179,10 @@ def fscrypt_unlock(dir_path, passphrase):
             input=(passphrase + '\n').encode('utf-8'),
             timeout=10,
         )
-        return proc.returncode == 0, (stdout.decode() + stderr.decode()).strip()
+        success = proc.returncode == 0
+        if success:
+            _invalidate_fscrypt_cache(dir_path)
+        return success, (stdout.decode() + stderr.decode()).strip()
     except subprocess.TimeoutExpired:
         proc.kill()
         return False, 'Timed out'
@@ -155,7 +196,10 @@ def fscrypt_lock(dir_path):
             ['fscrypt', 'lock', str(dir_path)],
             capture_output=True, text=True, timeout=5,
         )
-        return result.returncode == 0, (result.stdout + result.stderr).strip()
+        success = result.returncode == 0
+        if success:
+            _invalidate_fscrypt_cache(dir_path)
+        return success, (result.stdout + result.stderr).strip()
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         return False, str(e)
 
