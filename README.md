@@ -11,6 +11,7 @@ Easily enjoy your private video collection. Browse and play local video files fr
 - **Dark theme** - comfortable for extended viewing
 - **Mobile friendly** - responsive layout with large tap targets
 - **Auto-transcoding** - MKV/AVI/MOV files are automatically transcoded via ffmpeg or VLC (if installed)
+- **URL download** - paste a URL from the browse page or `/download` and yt-dlp fetches it into that directory (opt-in extra)
 - **AI video tagging** - automatically tag videos using a local Ollama vision model (opt-in, requires `--tag` flag)
 - **Manual tagging** - add or edit tags on any video from the player page
 - **Tag summary** - see all tags in a directory at a glance, with counts
@@ -51,6 +52,8 @@ simpleparty [/path/to/videos] [options]
   --no-delete           Disable the delete button
   --no-transcode        Disable ffmpeg/VLC transcoding
   --no-tag              Disable all tagging features
+  --no-download         Disable URL download feature
+  --yt-dlp-format FMT   yt-dlp format selector
   --tag-model MODEL     Ollama vision model (default: huihui_ai/qwen3-vl-abliterated:8b)
   --ollama-url URL      Ollama API URL (default: http://localhost:11434)
 ```
@@ -75,6 +78,25 @@ These are auto-detected at startup and require no configuration:
 
 - **ffmpeg** or **VLC** - Enables playback of MKV, AVI, and MOV files by transcoding to browser-compatible MP4 on the fly. Install either one: `sudo apt install ffmpeg` / `sudo pacman -S ffmpeg`
 - **fscrypt** - If your video directories use Linux filesystem encryption (fscrypt), SimpleParty will detect locked directories and prompt for the passphrase in the browser
+
+## URL download
+
+Paste a URL on any directory page (or on `/download`) to fetch a video via [yt-dlp](https://github.com/yt-dlp/yt-dlp). Downloads land in the chosen directory, run serially in a single background worker, and keep going even after you navigate away or close the browser — as long as the server stays up.
+
+### Setup
+
+```sh
+uvx simpleparty[download] /path/to/videos
+```
+
+Any install of yt-dlp visible to Python will do; the feature is auto-detected at startup.
+
+### Notes
+
+- One download at a time (queue is in-memory and does not persist across restarts).
+- Partial `.part` files may be left behind after an unclean shutdown — remove them manually if you don't want them.
+- Running downloads cannot be cancelled mid-flight yet; only queued jobs.
+- Installing `ffmpeg` lets yt-dlp merge separate video+audio streams into a single MP4.
 
 ## AI tagging
 
