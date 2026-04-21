@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "simpleparty"
-version = "0.8.3"
+version = "0.9.0"
 description = "Easily enjoy your private video collection"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -27,6 +27,7 @@ Repository = "https://github.com/gfrmin/simpleparty"
 
 [project.optional-dependencies]
 classifier = ["torch", "torchvision"]
+download = ["yt-dlp"]
 
 [project.scripts]
 simpleparty = "simpleparty.server:main"
@@ -37,4 +38,5 @@ dev = [
     "scrapling[all]>=0.2.8",
     "torch>=2.5.1",
     "torchvision>=0.20.1",
+    "yt-dlp>=2024.1.0",
 ]

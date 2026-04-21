@@ -5,6 +5,7 @@ import argparse
 import json
 import logging
 import os
+import queue
 import random
 import re
 import shutil
@@ -13,6 +14,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import uuid
 from functools import partial
 from html import escape as esc
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -30,12 +32,22 @@ BROWSER_NATIVE = frozenset({'.mp4', '.webm', '.ogv', '.m4v'})
 _config = {
     'has_ffmpeg': False,
     'has_vlc': False,
+    'has_ytdlp': False,
     'allow_delete': True,
     'allow_transcode': True,
     'allow_tag': True,
+    'allow_download': False,
     'tag_jobs': {},  # path -> progress dict
     'thumb_jobs': set(),  # directories currently generating thumbs
+    'download_queue': None,          # queue.Queue[str], lazy
+    'download_jobs': {},             # job_id -> job dict (see _new_download_job)
+    'download_order': [],            # job_ids in enqueue order, capped
+    'download_lock': threading.Lock(),
+    'download_worker': None,         # threading.Thread, lazy
+    'yt_dlp_format': None,
 }
+
+DOWNLOAD_HISTORY_LIMIT = 20
 
 MIME_TYPES = {
     '.mp4': 'video/mp4',
@@ -474,6 +486,21 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.6}}
 .tag-done{color:#4ade80;font-size:13px;font-weight:500;display:flex;align-items:center;gap:8px;animation:fadeIn .3s ease}
 .tag-error{color:#f87171;font-size:13px;font-weight:500;animation:fadeIn .3s ease}
+.download-details{display:inline-block}
+.download-details[open] summary{color:#a78bfa}
+.download-form{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:8px;width:100%}
+.download-form input[type="url"],.download-form input[type="text"]{background:#0f0f1a;border:1px solid #2d2d44;border-radius:6px;color:#e2e8f0;padding:8px 10px;font-size:14px;flex:1;min-width:200px;outline:none}
+.download-form input:focus{border-color:#7c3aed}
+.download-progress-panel{display:flex;align-items:center;gap:10px;min-height:0;flex-wrap:wrap;transition:all .3s ease}
+.download-progress-panel:empty{display:none}
+.download-card{background:#1a1a2e;border:1px solid #2d2d44;border-radius:8px;padding:12px 14px;margin:8px 16px;display:flex;flex-direction:column;gap:8px}
+.download-card.err{border-color:#7f1d1d}
+.download-card .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.download-card .title{font-size:14px;color:#e2e8f0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+.download-card .url{font-size:12px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+.download-card .meta{color:#94a3b8;font-size:12px}
+.download-board{padding:0 16px 24px}
+.download-section-title{color:#94a3b8;font-size:13px;font-weight:500;margin:16px 16px 6px;text-transform:uppercase;letter-spacing:.5px}
 @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
 .tag-filter{padding:8px 16px;border-bottom:1px solid #2d2d44;display:flex;flex-wrap:wrap;align-items:center;gap:8px}
 .tag-selected-pills{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
@@ -560,6 +587,8 @@ def render_nav(path, encrypted_dir=None):
         pieces.append(f'<span class="crumb-sep">/</span>')
         pieces.append(f'<a class="crumb" href="{esc(url_for_browse(acc))}">{esc(part)}</a>')
     pieces.append('<span class="nav-spacer"></span>')
+    if _config.get('allow_download'):
+        pieces.append('<a class="btn" href="/download">\u2B07 Downloads</a>')
     if encrypted_dir is not None:
         parent = str(Path(encrypted_dir).parent)
         if parent == '.':
@@ -592,13 +621,17 @@ def _render_train_btn(path_param, is_busy):
 def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, selected_tags=None):
     pieces = ['<div id="file-list">']
 
+    shuffle_btn = ''
     if show_shuffle and data['videos']:
         shuffle_params = {'path': data['path'], 'shuffle': '1'}
         if selected_tags:
             shuffle_params['tags'] = ','.join(selected_tags)
         shuffle_url = '/play?' + urllib.parse.urlencode(shuffle_params)
+        shuffle_btn = f'<a class="btn" href="{esc(shuffle_url)}">\u21C5 Shuffle Play</a>'
+    want_action_bar = bool(shuffle_btn) or _config.get('allow_download')
+    if want_action_bar:
         tag_html = ''
-        if _config['allow_tag'] and _config['has_ffmpeg']:
+        if data['videos'] and _config['allow_tag'] and _config['has_ffmpeg']:
             path_param = esc(data['path'])
             # Check if model exists for this directory
             from simpleparty.tagger import model_path as _model_path
@@ -635,10 +668,24 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
                 f'class="tag-progress-panel{" active" if is_busy else ""}" '
                 f'id="tag-progress"></div>'
             )
+        download_html = ''
+        if _config['allow_download']:
+            path_q = urllib.parse.urlencode({'path': data['path']})
+            download_html = (
+                f'<details class="download-details">'
+                f'<summary class="btn">\u2B07\uFE0F Download URL</summary>'
+                f'<div style="flex-basis:100%">{render_download_form(data["path"], autofocus=False)}</div>'
+                f'</details>'
+                f'<a class="btn" href="/download">Manage</a>'
+                f'<div hx-get="/download-status?{path_q}" hx-trigger="load" '
+                f'hx-swap="outerHTML" class="download-progress-panel" '
+                f'id="download-progress"></div>'
+            )
         pieces.append(
             f'<div class="action-bar">'
-            f'<a class="btn" href="{esc(shuffle_url)}">\u21C5 Shuffle Play</a>'
+            f'{shuffle_btn}'
             f'{tag_html}'
+            f'{download_html}'
             f'</div>'
         )
 
@@ -1400,6 +1447,340 @@ def _maybe_start_thumbs(directory, videos):
     t.start()
 
 
+# --- Download queue ---
+
+def _new_download_job(job_id, url, target_dir, target_rel):
+    return {
+        'id': job_id,
+        'url': url,
+        'target_dir': target_dir,
+        'target_rel': target_rel,
+        'state': 'queued',
+        'running': False,
+        'status': '',
+        'phase': 'queued',
+        'enqueued_at': time.time(),
+        'started_at': None,
+        'finished_at': None,
+        'title': '',
+        'filename': '',
+        'downloaded_bytes': 0,
+        'total_bytes': 0,
+        'percent': 0,
+        'speed': None,
+        'eta': None,
+        'final_path': None,
+        'final_name': None,
+        'play_dir': None,
+        'play_name': None,
+        'error': None,
+    }
+
+
+def _evict_download_history():
+    """Trim non-running jobs beyond the history limit (oldest first)."""
+    order = _config['download_order']
+    jobs = _config['download_jobs']
+    non_running = [jid for jid in order if not jobs.get(jid, {}).get('running')]
+    excess = len(non_running) - DOWNLOAD_HISTORY_LIMIT
+    if excess <= 0:
+        return
+    to_drop = set(non_running[:excess])
+    _config['download_order'] = [jid for jid in order if jid not in to_drop]
+    for jid in to_drop:
+        jobs.pop(jid, None)
+
+
+def _finalize_download_job(job, root):
+    """After a download ends, compute play/browse links if final file is in root."""
+    final = job.get('final_path')
+    if not final:
+        return
+    try:
+        rel = Path(final).resolve().relative_to(Path(root).resolve())
+    except (ValueError, OSError):
+        return
+    if not Path(final).exists() or not is_video(Path(final).name):
+        return
+    rel_str = str(rel)
+    if '/' in rel_str:
+        parent, name = rel_str.rsplit('/', 1)
+    else:
+        parent, name = '', rel_str
+    job['play_dir'] = parent
+    job['play_name'] = name
+
+
+def _download_worker_loop(root):
+    from simpleparty.downloader import download_video
+    q = _config['download_queue']
+    while True:
+        job_id = q.get()
+        with _config['download_lock']:
+            job = _config['download_jobs'].get(job_id)
+        if not job:
+            continue
+        if job.get('state') == 'cancelled':
+            continue
+        job['state'] = 'running'
+        job['started_at'] = time.time()
+        try:
+            download_video(
+                job['url'], job['target_dir'], job,
+                format_str=_config.get('yt_dlp_format'),
+            )
+            job['state'] = 'error' if job.get('error') else 'done'
+        except Exception as e:
+            logger.exception('download worker: unexpected failure')
+            job['error'] = str(e) or e.__class__.__name__
+            job['state'] = 'error'
+        finally:
+            job['running'] = False
+            job['finished_at'] = time.time()
+            _finalize_download_job(job, root)
+
+
+def _ensure_download_worker(root):
+    """Create queue + daemon worker on first use."""
+    with _config['download_lock']:
+        if _config['download_queue'] is None:
+            _config['download_queue'] = queue.Queue()
+        if _config['download_worker'] is None or not _config['download_worker'].is_alive():
+            t = threading.Thread(
+                target=_download_worker_loop,
+                args=(root,),
+                daemon=True,
+            )
+            _config['download_worker'] = t
+            t.start()
+
+
+def _snapshot_download_jobs():
+    with _config['download_lock']:
+        order = list(_config['download_order'])
+        jobs = {jid: dict(_config['download_jobs'][jid])
+                for jid in order if jid in _config['download_jobs']}
+    return order, jobs
+
+
+def _any_download_running(jobs):
+    return any(j.get('running') for j in jobs.values())
+
+
+def render_download_form(target_rel='', *, autofocus=False):
+    rel = esc(target_rel)
+    af = ' autofocus' if autofocus else ''
+    return (
+        f'<form hx-post="/download" class="download-form">'
+        f'<input type="hidden" name="path" value="{rel}">'
+        f'<input type="url" name="url" placeholder="https://… (paste a URL)" required{af}>'
+        f'<button type="submit" class="btn active">\u2B07 Queue</button>'
+        f'</form>'
+    )
+
+
+def _render_bytes(n):
+    if not n:
+        return ''
+    return fmt_size(n)
+
+
+def _render_speed(s):
+    if not s:
+        return ''
+    return fmt_size(int(s)) + '/s'
+
+
+def _render_eta(eta):
+    if eta is None or eta < 0:
+        return ''
+    if eta < 60:
+        return f'{int(eta)}s'
+    m, s = divmod(int(eta), 60)
+    if m < 60:
+        return f'{m}m {s:02d}s'
+    h, m = divmod(m, 60)
+    return f'{h}h {m:02d}m'
+
+
+def _render_download_job_card(job, *, full=True):
+    state = job.get('state', 'queued')
+    title = job.get('title') or Path(job.get('filename') or '').name or job['url']
+    err = ''
+    if job.get('error'):
+        err = f'<div class="tag-error">\u274C {esc(job["error"])}</div>'
+    card_cls = 'download-card err' if state == 'error' else 'download-card'
+
+    bar = ''
+    meta = ''
+    if state == 'running':
+        pct = job.get('percent', 0)
+        bar = (
+            f'<div class="tag-progress-bar-wrap">'
+            f'<div class="tag-progress-bar" style="width:{pct}%"></div>'
+            f'</div>'
+        )
+        parts = [job.get('phase', 'downloading')]
+        total = job.get('total_bytes', 0)
+        done = job.get('downloaded_bytes', 0)
+        if total:
+            parts.append(f'{_render_bytes(done)} / {_render_bytes(total)} ({pct}%)')
+        elif done:
+            parts.append(_render_bytes(done))
+        sp = _render_speed(job.get('speed'))
+        if sp:
+            parts.append(sp)
+        eta = _render_eta(job.get('eta'))
+        if eta:
+            parts.append('ETA ' + eta)
+        meta = f'<div class="meta">{esc(" · ".join(parts))}</div>'
+    elif state == 'done':
+        meta_bits = ['Done']
+        final_name = job.get('final_name')
+        if final_name:
+            meta_bits.append(final_name)
+        links = ''
+        if job.get('play_dir') is not None and job.get('play_name'):
+            play_url = url_for_play(job['play_dir'], 0, video=job['play_name'])
+            links += f' <a class="btn" href="{esc(play_url)}">\u25B6 Play</a>'
+            browse_url = url_for_browse(job['play_dir'])
+            links += f' <a class="btn" href="{esc(browse_url)}">\U0001F4C1 Folder</a>'
+        meta = (
+            f'<div class="meta"><span class="tag-done">\u2705 '
+            f'{esc(" · ".join(meta_bits))}</span>{links}</div>'
+        )
+    elif state == 'cancelled':
+        meta = '<div class="meta">Cancelled</div>'
+    elif state == 'queued':
+        meta = '<div class="meta">Queued</div>'
+
+    cancel = ''
+    if full and state == 'queued':
+        cancel = (
+            f'<form hx-post="/download-cancel" style="display:inline">'
+            f'<input type="hidden" name="id" value="{esc(job["id"])}">'
+            f'<button class="btn">Cancel</button>'
+            f'</form>'
+        )
+
+    target_link = ''
+    if full:
+        browse_url = url_for_browse(job.get('target_rel', ''))
+        tlabel = job.get('target_rel') or '/'
+        target_link = (
+            f'<span class="meta">→ '
+            f'<a class="crumb" href="{esc(browse_url)}">{esc(tlabel)}</a></span>'
+        )
+
+    return (
+        f'<div class="{card_cls}">'
+        f'<div class="row">'
+        f'<span class="title">{esc(title)}</span>'
+        f'{target_link}'
+        f'{cancel}'
+        f'</div>'
+        f'<div class="row">'
+        f'<span class="url">{esc(job["url"])}</span>'
+        f'</div>'
+        f'{bar}'
+        f'{meta}'
+        f'{err}'
+        f'</div>'
+    )
+
+
+def render_download_status(path_filter=None):
+    """Returns the status fragment — self-polling element.
+
+    `path_filter` (rel path) scopes to jobs targeting that directory, for the
+    inline panel on the browse page. Without it, returns the full board for
+    the dedicated page.
+    """
+    order, jobs = _snapshot_download_jobs()
+    running = _any_download_running(jobs)
+    poll = 'every 1s' if running else 'every 10s'
+
+    if path_filter is not None:
+        scoped = [jobs[jid] for jid in order
+                  if jobs[jid].get('target_rel') == path_filter]
+        active = [j for j in scoped if j.get('state') in ('queued', 'running')]
+        inner = ''
+        if active:
+            parts = []
+            for j in active:
+                if j.get('state') == 'running':
+                    pct = j.get('percent', 0)
+                    title = j.get('title') or Path(j.get('filename') or '').name or j['url']
+                    parts.append(
+                        f'<span class="tag-progress-phase">\u2B07 {esc(title[:60])}</span>'
+                        f'<div class="tag-progress-bar-wrap">'
+                        f'<div class="tag-progress-bar" style="width:{pct}%"></div>'
+                        f'</div>'
+                        f'<span class="tag-progress-text">{pct}%</span>'
+                    )
+                else:
+                    parts.append(f'<span class="tag-progress-text">\u2B07 queued</span>')
+            inner = ''.join(parts) + ' <a class="btn" href="/download">Manage</a>'
+        return (
+            f'<div hx-get="/download-status?{urllib.parse.urlencode({"path": path_filter})}" '
+            f'hx-trigger="{poll}" hx-swap="outerHTML" '
+            f'class="download-progress-panel" id="download-progress">{inner}</div>'
+        )
+
+    # Full board
+    active = [jobs[jid] for jid in order if jobs[jid].get('state') == 'running']
+    queued = [jobs[jid] for jid in order if jobs[jid].get('state') == 'queued']
+    finished = [jobs[jid] for jid in order
+                if jobs[jid].get('state') in ('done', 'error', 'cancelled')]
+    finished.reverse()  # most recent first
+
+    pieces = []
+    if active:
+        pieces.append('<div class="download-section-title">Now downloading</div>')
+        for j in active:
+            pieces.append(_render_download_job_card(j))
+    if queued:
+        pieces.append('<div class="download-section-title">Queued</div>')
+        for j in queued:
+            pieces.append(_render_download_job_card(j))
+    if finished:
+        pieces.append(
+            '<div class="download-section-title">Recent '
+            '<form hx-post="/download-clear" style="display:inline;margin-left:8px">'
+            '<button class="btn">Clear completed</button></form></div>'
+        )
+        for j in finished:
+            pieces.append(_render_download_job_card(j))
+    if not pieces:
+        pieces.append('<div class="empty">No downloads yet.</div>')
+
+    return (
+        f'<div hx-get="/download-status" hx-trigger="{poll}" '
+        f'hx-swap="outerHTML" class="download-board" id="download-board">'
+        f'{"".join(pieces)}</div>'
+    )
+
+
+def render_download_page(target_rel=''):
+    nav = render_nav('')
+    hint = (
+        '<div style="padding:16px 16px 0;color:#94a3b8;font-size:13px">'
+        'Paste a URL. Downloads land in the chosen directory '
+        '(default: server root). One at a time.'
+        '</div>'
+    )
+    full_form = (
+        f'<form hx-post="/download" class="download-form" style="margin:8px 16px 0">'
+        f'<input type="url" name="url" placeholder="https://…" required autofocus style="flex:2">'
+        f'<input type="text" name="path" placeholder="subdir/ (blank = root)" value="{esc(target_rel)}" style="flex:1">'
+        f'<button type="submit" class="btn active">\u2B07 Queue</button>'
+        f'</form>'
+    )
+    board = render_download_status(path_filter=None)
+    body = nav + hint + full_form + board
+    return render_page('Downloads — SimpleParty', body)
+
+
 # --- Route handlers ---
 
 def handle_browse(handler, root):
@@ -1989,6 +2370,86 @@ def handle_thumb(handler, root):
     handler.wfile.write(data)
 
 
+def handle_download_page(handler, root):
+    if not _config['allow_download']:
+        handler.send_error(404)
+        return
+    params = parse_query(handler.path)
+    rel = params.get('path', '')
+    send_html(handler, render_download_page(rel))
+
+
+def handle_download_submit(handler, root):
+    if not _config['allow_download']:
+        handler.send_error(403, 'Download disabled')
+        return
+    from simpleparty.downloader import validate_url, is_path_within
+
+    form = read_form_body(handler)
+    rel_path = form.get('path', '') or ''
+    redirect_url = form.get('redirect') or ''
+    try:
+        url = validate_url(form.get('url', ''))
+    except ValueError as e:
+        handler.send_error(400, str(e))
+        return
+
+    resolved = resolve_path(root, rel_path)
+    if not is_path_within(root, resolved) or not resolved.is_dir():
+        handler.send_error(400, 'Invalid target directory')
+        return
+
+    job_id = uuid.uuid4().hex
+    job = _new_download_job(job_id, url, str(resolved), rel_path)
+    with _config['download_lock']:
+        _config['download_jobs'][job_id] = job
+        _config['download_order'].append(job_id)
+        _evict_download_history()
+    _ensure_download_worker(root)
+    _config['download_queue'].put(job_id)
+
+    send_hx_redirect(handler, redirect_url or '/download')
+
+
+def handle_download_status(handler, root):
+    if not _config['allow_download']:
+        send_html(handler, '')
+        return
+    params = parse_query(handler.path)
+    path_filter = params.get('path') if 'path' in params else None
+    send_html(handler, render_download_status(path_filter=path_filter))
+
+
+def handle_download_cancel(handler, root):
+    if not _config['allow_download']:
+        handler.send_error(403, 'Download disabled')
+        return
+    form = read_form_body(handler)
+    job_id = form.get('id', '')
+    with _config['download_lock']:
+        job = _config['download_jobs'].get(job_id)
+        if job and job.get('state') == 'queued':
+            job['state'] = 'cancelled'
+            job['finished_at'] = time.time()
+    send_hx_redirect(handler, '/download')
+
+
+def handle_download_clear(handler, root):
+    if not _config['allow_download']:
+        handler.send_error(403, 'Download disabled')
+        return
+    with _config['download_lock']:
+        jobs = _config['download_jobs']
+        order = _config['download_order']
+        keep = [jid for jid in order
+                if jobs.get(jid, {}).get('state') in ('queued', 'running')]
+        dropped = [jid for jid in order if jid not in keep]
+        for jid in dropped:
+            jobs.pop(jid, None)
+        _config['download_order'] = keep
+    send_hx_redirect(handler, '/download')
+
+
 # --- Server ---
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -2010,6 +2471,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             handle_tag_status(self, self.root)
         elif path.startswith('/thumb/'):
             handle_thumb(self, self.root)
+        elif path == '/download':
+            handle_download_page(self, self.root)
+        elif path == '/download-status':
+            handle_download_status(self, self.root)
         else:
             self.send_error(404)
 
@@ -2037,6 +2502,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             handle_reject_tag(self, self.root)
         elif path == '/save-tags':
             handle_save_tags(self, self.root)
+        elif path == '/download':
+            handle_download_submit(self, self.root)
+        elif path == '/download-cancel':
+            handle_download_cancel(self, self.root)
+        elif path == '/download-clear':
+            handle_download_clear(self, self.root)
         else:
             self.send_error(404)
 
@@ -2063,6 +2534,9 @@ def main():
     parser.add_argument('--no-transcode', action='store_true', help='Disable ffmpeg/VLC transcoding')
     parser.add_argument('--no-tag', action='store_true', help='Disable all tagging features')
     parser.add_argument('--max-tags', type=int, default=10, help='Max tags per video when suggesting (default: 10)')
+    parser.add_argument('--no-download', action='store_true', help='Disable URL download feature')
+    parser.add_argument('--yt-dlp-format', default=None,
+                        help='yt-dlp format selector (default: bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b)')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     args = parser.parse_args()
 
@@ -2087,6 +2561,11 @@ def main():
     if args.no_tag:
         _config['allow_tag'] = False
 
+    from simpleparty.downloader import is_available as _ytdlp_available
+    _config['has_ytdlp'] = _ytdlp_available()
+    _config['allow_download'] = (not args.no_download) and _config['has_ytdlp']
+    _config['yt_dlp_format'] = args.yt_dlp_format
+
     handler = partial(RequestHandler, root)
     server = ThreadedServer((args.bind, args.port), handler)
 
@@ -2108,6 +2587,10 @@ def main():
             features.append('tag: on')
         except ImportError:
             features.append('tag: on (tagger unavailable)')
+    if _config['allow_download']:
+        features.append('download: on')
+    elif not args.no_download and not _config['has_ytdlp']:
+        features.append('download: on (yt-dlp unavailable)')
 
     from simpleparty import __version__
     url = f'http://{args.bind}:{args.port}'
@@ -2117,6 +2600,8 @@ def main():
         print(f'  [{", ".join(features)}]')
     if _config['allow_tag'] and not has_torch:
         print(f'  To train a tagger: uvx simpleparty[classifier]=={__version__}')
+    if (not args.no_download) and (not _config['has_ytdlp']):
+        print(f'  To enable downloads: uvx simpleparty[download]=={__version__}')
 
     try:
         server.serve_forever()
