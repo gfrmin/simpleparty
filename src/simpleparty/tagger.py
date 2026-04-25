@@ -213,7 +213,7 @@ def thumb_path(directory_path, video_name):
 def extract_frame(video_path, position, out_path, timeout=30):
     """Extract a single full-res frame at *position* seconds. Returns True on success."""
     cmd = [
-        'ffmpeg', '-ss', f'{position:.2f}',
+        'ffmpeg', '-y', '-ss', f'{position:.2f}',
         '-t', '10',
         '-skip_frame', 'nokey',
         '-i', str(video_path),
