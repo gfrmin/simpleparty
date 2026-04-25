@@ -313,13 +313,13 @@ _SORT_DIRS = {'asc', 'desc'}
 
 
 def parse_sort_params(params):
-    """Return (sort_field, direction) with defaults name/asc."""
-    sort = params.get('sort', 'name')
+    """Return (sort_field, direction) with defaults date/desc."""
+    sort = params.get('sort', 'date')
     if sort not in _SORT_FIELDS:
-        sort = 'name'
-    direction = params.get('dir', 'asc')
+        sort = 'date'
+    direction = params.get('dir', 'desc')
     if direction not in _SORT_DIRS:
-        direction = 'asc'
+        direction = 'desc'
     return sort, direction
 
 
@@ -466,7 +466,7 @@ video{width:100%;max-height:70vh;display:block;background:#000}
   flex-wrap:wrap;width:100%;
 }
 .item-video{
-  flex:0 1 calc(12.5% - 7px);min-width:90px;max-width:220px;
+  flex:0 1 calc(20% - 7px);min-width:90px;
   flex-direction:column;align-items:stretch;padding:0;gap:0;width:auto;
 }
 .item-video .item-link{flex-direction:column;align-items:stretch;gap:0}
@@ -590,13 +590,13 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .playlist-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;flex:1;min-width:0}
 .playlist-pos{color:#64748b;font-size:12px;flex-shrink:0;min-width:20px;text-align:right}
 @media(max-width:1024px){
-  .item-video{flex:0 1 calc(20% - 7px);max-width:none}
-  .related-list .item-video{flex:0 1 calc(20% - 7px);max-width:none}
+  .item-video{flex:0 1 calc(33.33% - 6px);max-width:none}
+  .related-list .item-video{flex:0 1 calc(33.33% - 6px);max-width:none}
 }
 @media(max-width:640px){
   #file-list{padding:8px;gap:6px}
-  .item-video{flex:0 1 calc(33.33% - 6px);min-width:0;max-width:none}
-  .related-list .item-video{flex:0 1 calc(33.33% - 6px);min-width:0;max-width:none}
+  .item-video{flex:0 1 calc(50% - 4px);min-width:0;max-width:none}
+  .related-list .item-video{flex:0 1 calc(50% - 4px);min-width:0;max-width:none}
   #video-title{font-size:14px;padding:6px 12px 0}
   .playlist-thumb,.playlist-thumb-placeholder{width:60px}
   nav{padding:8px 12px}
@@ -1149,6 +1149,8 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         f'</select>'
         f'<a class="btn{" active" if is_shuffled else ""}" '
         f'href="{esc(shuffle_url)}" title="Shuffle (s)">\u21C5 Shuffle</a>'
+        f'<button id="btn-autoplay" class="btn" title="Autoplay (a)">Autoplay</button>'
+        f'<button id="btn-repeat" class="btn" title="Repeat (r)">Repeat</button>'
     )
     if _config['allow_delete']:
         body += (
@@ -1198,7 +1200,16 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         'function skip(s){video.currentTime=Math.max(0,Math.min(video.duration||0,video.currentTime+s));flash((s>0?"+":"")+s+"s")}\n'
         'function setSpeed(v){v=parseFloat(v);video.playbackRate=v;speedSel.value=v;flash(v+"x")}\n'
         'function cycleSpeed(dir){const i=speeds.indexOf(video.playbackRate);const ni=Math.max(0,Math.min(speeds.length-1,i+dir));setSpeed(speeds[ni])}\n'
-        'video.addEventListener("ended",()=>{window.location.href=nextUrl});\n'
+        'let autoplay=localStorage.getItem("sp-autoplay")!=="false";\n'
+        'let repeat=localStorage.getItem("sp-repeat")||"off";\n'
+        'const btnAuto=document.getElementById("btn-autoplay");\n'
+        'const btnRepeat=document.getElementById("btn-repeat");\n'
+        'function updateAutoBtn(){btnAuto.classList.toggle("active",autoplay);btnAuto.textContent=autoplay?"Autoplay":"Autoplay"}\n'
+        'function updateRepeatBtn(){btnRepeat.classList.toggle("active",repeat!=="off");btnRepeat.textContent=repeat==="one"?"Repeat 1":"Repeat"}\n'
+        'btnAuto.addEventListener("click",()=>{autoplay=!autoplay;localStorage.setItem("sp-autoplay",autoplay);updateAutoBtn();flash(autoplay?"Autoplay on":"Autoplay off")});\n'
+        'btnRepeat.addEventListener("click",()=>{repeat=repeat==="off"?"all":repeat==="all"?"one":"off";localStorage.setItem("sp-repeat",repeat);updateRepeatBtn();flash(repeat==="off"?"Repeat off":repeat==="one"?"Repeat one":"Repeat all")});\n'
+        'updateAutoBtn();updateRepeatBtn();\n'
+        'video.addEventListener("ended",()=>{if(repeat==="one"){video.currentTime=0;video.play()}else if(repeat==="all"||autoplay){window.location.href=nextUrl}});\n'
         'video.play().catch(()=>{});\n'
         'document.addEventListener("keydown",e=>{\n'
         '  if(e.target.tagName==="INPUT"||e.target.tagName==="SELECT")return;\n'
@@ -1216,6 +1227,8 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         '    case">":e.preventDefault();cycleSpeed(1);break;\n'
         '    case"Escape":window.location.href=browseUrl;break;\n'
         '    case"d":document.querySelector("#delete-form button")?.click();break;\n'
+        '    case"a":btnAuto.click();break;\n'
+        '    case"r":btnRepeat.click();break;\n'
         '  }\n'
         '});\n'
         '</script>'
