@@ -926,7 +926,7 @@ def render_sort_pills(path, selected_tags, sort, direction):
     return ''.join(pieces)
 
 
-def render_tag_filter(tags_map, selected_tags, path):
+def render_tag_filter(tags_map, selected_tags, path, filtered_count=None):
     """Render tag filter: selected pills + searchable dropdown of viable tags."""
     if not tags_map:
         return ''
@@ -958,6 +958,24 @@ def render_tag_filter(tags_map, selected_tags, path):
         pieces.append(
             f'<a class="tag-clear" href="{esc(url_for_browse(path))}">Clear all</a>'
         )
+        if _config.get('allow_delete') and filtered_count:
+            tags_csv = ','.join(selected_tags)
+            tags_label = ', '.join(selected_tags)
+            confirm = (
+                f'Delete all {filtered_count} video'
+                f'{"" if filtered_count == 1 else "s"} tagged "{tags_label}"? '
+                'This cannot be undone.'
+            )
+            pieces.append(
+                f'<form class="tag-delete-all" hx-post="/delete-by-tag" '
+                f'hx-confirm="{esc(confirm)}" style="display:inline">'
+                f'<input type="hidden" name="path" value="{esc(path)}">'
+                f'<input type="hidden" name="tags" value="{esc(tags_csv)}">'
+                f'<button type="submit" class="btn-del" '
+                f'title="Delete all videos with these tags">'
+                f'\U0001F5D1 Delete all ({filtered_count})</button>'
+                f'</form>'
+            )
         pieces.append('</div>')
 
     # Search input + dropdown
@@ -1009,7 +1027,10 @@ def render_tag_filter(tags_map, selected_tags, path):
 def render_browse_page(data, tags_map=None, selected_tags=None, sort='name', direction='asc'):
     title = f'SimpleParty \u2014 {data["path"].split("/")[-1]}' if data['path'] else 'SimpleParty'
     body = render_nav(data['path'], data.get('encryptedDir'))
-    body += render_tag_filter(tags_map, selected_tags, data['path'])
+    body += render_tag_filter(
+        tags_map, selected_tags, data['path'],
+        filtered_count=len(data['videos']),
+    )
     body += render_file_list(
         data, tags_map=tags_map, selected_tags=selected_tags,
         sort=sort, direction=direction,
@@ -2070,6 +2091,51 @@ def handle_delete(handler, root):
         handler.end_headers()
 
 
+def handle_delete_by_tag(handler, root):
+    if not _config['allow_delete']:
+        handler.send_error(403, 'Delete disabled')
+        return
+    if not _config['allow_tag']:
+        handler.send_error(403, 'Tagging not enabled')
+        return
+    form = read_form_body(handler)
+    rel_path = form.get('path', '')
+    raw_tags = form.get('tags', '')
+    selected_tags = [t.strip() for t in raw_tags.split(',') if t.strip()]
+    if not selected_tags:
+        handler.send_error(400, 'No tags specified')
+        return
+    resolved_dir = resolve_path(root, rel_path)
+    if not resolved_dir.is_dir():
+        handler.send_error(400, 'Not a directory')
+        return
+
+    data = list_directory(root, rel_path)
+    if 'error' in data or data.get('locked'):
+        handler.send_error(400, 'Cannot list directory')
+        return
+
+    from simpleparty.tagger import load_tags, save_tags
+    tags_map = load_tags(resolved_dir)
+    targets = filter_videos_by_tags(data['videos'], tags_map, selected_tags)
+
+    for video in targets:
+        video_path = resolved_dir / video['name']
+        try:
+            os.remove(video_path)
+        except OSError as e:
+            logger.warning('delete-by-tag: failed to remove %s: %s', video_path, e)
+            continue
+        tags_map.pop(video['name'], None)
+
+    try:
+        save_tags(resolved_dir, tags_map)
+    except OSError as e:
+        logger.warning('delete-by-tag: failed to save tags for %s: %s', resolved_dir, e)
+
+    send_hx_redirect(handler, url_for_browse(rel_path))
+
+
 def handle_unlock(handler, root):
     form = read_form_body(handler)
     encrypted_path = form.get('path', '')
@@ -2580,6 +2646,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == '/delete':
             handle_delete(self, self.root)
+        elif path == '/delete-by-tag':
+            handle_delete_by_tag(self, self.root)
         elif path == '/unlock':
             handle_unlock(self, self.root)
         elif path == '/lock':
