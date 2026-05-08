@@ -256,7 +256,7 @@ def parse_query(url):
     return {k: v[0] for k, v in params.items()}
 
 
-def url_for_browse(path='', tags=None, sort=None, direction=None):
+def url_for_browse(path='', tags=None, sort=None, direction=None, starred=False):
     params = {}
     if path:
         params['path'] = path
@@ -266,10 +266,12 @@ def url_for_browse(path='', tags=None, sort=None, direction=None):
         params['sort'] = sort
     if direction and direction != 'asc':
         params['dir'] = direction
+    if starred:
+        params['starred'] = '1'
     return '/' if not params else '/browse?' + urllib.parse.urlencode(params)
 
 
-def url_for_play(dir_path, idx, shuffle=False, seed=None, pos=None, tags=None, video=None, sort=None, direction=None):
+def url_for_play(dir_path, idx, shuffle=False, seed=None, pos=None, tags=None, video=None, sort=None, direction=None, starred=False):
     params = {'path': dir_path, 'idx': str(idx)}
     if video:
         params['video'] = video
@@ -285,6 +287,8 @@ def url_for_play(dir_path, idx, shuffle=False, seed=None, pos=None, tags=None, v
         params['sort'] = sort
     if direction and direction != 'asc':
         params['dir'] = direction
+    if starred:
+        params['starred'] = '1'
     return '/play?' + urllib.parse.urlencode(params)
 
 
@@ -306,6 +310,11 @@ def parse_tags_param(params):
     """Parse comma-separated tags from URL params into a list."""
     raw = params.get('tags', '')
     return [t.strip() for t in raw.split(',') if t.strip()] if raw else []
+
+
+def parse_starred_param(params):
+    """Return True if the request asks for starred-only filtering."""
+    return params.get('starred', '') == '1'
 
 
 _SORT_FIELDS = {'name', 'size', 'date'}
@@ -344,6 +353,15 @@ def filter_videos_by_tags(videos, tags_map, selected_tags):
         if v['name'] in tags_map
         and selected_lower <= {t.lower() for t in tags_map[v['name']].get('tags', [])}
     ]
+
+
+def filter_videos_by_starred(videos, tags_map, starred_only):
+    """Filter video list to only those marked starred."""
+    if not starred_only:
+        return videos
+    if not tags_map:
+        return []
+    return [v for v in videos if tags_map.get(v['name'], {}).get('starred')]
 
 
 def _compute_related_videos(data, idx, tags_map, max_results=8):
@@ -421,6 +439,13 @@ nav{
 .btn.active{background:#7c3aed;color:#fff;border-color:#7c3aed}
 .btn-lock{border-color:#991b1b}
 .btn-lock:hover{background:#7f1d1d;border-color:#dc2626}
+.btn-star{padding:6px 10px;line-height:1}
+.btn-star .star-icon{font-size:18px}
+.btn-star.active{background:#facc15;color:#1a1a2e;border-color:#facc15}
+.btn-star.active:hover{background:#eab308;border-color:#eab308}
+.btn-star[disabled]{opacity:0.6;cursor:wait}
+.tag-pill.star-pill{color:#facc15}
+.tag-pill.star-pill.active{background:#facc15;color:#1a1a2e}
 #player-area{position:sticky;top:0;z-index:5;background:#000}
 #transcode-notice{
   background:#3a2e0a;color:#fde68a;border-bottom:1px solid #78350f;
@@ -658,7 +683,7 @@ def _render_train_btn(path_param, is_busy):
     )
 
 
-def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, selected_tags=None, sort='name', direction='asc'):
+def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, selected_tags=None, sort='name', direction='asc', starred_only=False):
     pieces = ['<div id="file-list">']
 
     shuffle_btn = ''
@@ -670,6 +695,8 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
             shuffle_params['sort'] = sort
         if direction and direction != 'asc':
             shuffle_params['dir'] = direction
+        if starred_only:
+            shuffle_params['starred'] = '1'
         shuffle_url = '/play?' + urllib.parse.urlencode(shuffle_params)
         shuffle_btn = f'<a class="btn" href="{esc(shuffle_url)}">\u21C5 Shuffle Play</a>'
     want_action_bar = bool(shuffle_btn) or _config.get('allow_download')
@@ -725,7 +752,7 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
                 f'hx-swap="outerHTML" class="download-progress-panel" '
                 f'id="download-progress"></div>'
             )
-        sort_html = render_sort_pills(data['path'], selected_tags, sort, direction) if data['videos'] else ''
+        sort_html = render_sort_pills(data['path'], selected_tags, sort, direction, starred_only=starred_only) if data['videos'] else ''
         pieces.append(
             f'<div class="action-bar">'
             f'{shuffle_btn}'
@@ -753,7 +780,7 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
     root_dir = _config.get('root', '.')
     for i, v in enumerate(data['videos']):
         cls = ' playing' if i == current_idx else ''
-        play_url = url_for_play(data['path'], i, tags=selected_tags, video=v['name'], sort=sort, direction=direction)
+        play_url = url_for_play(data['path'], i, tags=selected_tags, video=v['name'], sort=sort, direction=direction, starred=starred_only)
         resolved_dir = resolve_path(root_dir, data['path'])
         has_thumb = thumb_path(str(resolved_dir), v['name']).exists()
         pieces.append(f'<div class="item item-video{cls}">')
@@ -797,7 +824,7 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
     return ''.join(pieces)
 
 
-def render_related_videos(data, idx, tags_map, selected_tags=None, sort='name', direction='asc'):
+def render_related_videos(data, idx, tags_map, selected_tags=None, sort='name', direction='asc', starred_only=False):
     """Render a 'Related Videos' section based on tag overlap."""
     related = _compute_related_videos(data, idx, tags_map)
     if not related:
@@ -811,7 +838,7 @@ def render_related_videos(data, idx, tags_map, selected_tags=None, sort='name', 
     ]
     for video_idx, _overlap in related:
         v = data['videos'][video_idx]
-        play_url = url_for_play(data['path'], video_idx, tags=selected_tags, video=v['name'], sort=sort, direction=direction)
+        play_url = url_for_play(data['path'], video_idx, tags=selected_tags, video=v['name'], sort=sort, direction=direction, starred=starred_only)
         resolved_dir = resolve_path(root_dir, data['path'])
         has_thumb = thumb_path(str(resolved_dir), v['name']).exists()
         thumb_url = f'/thumb/{urllib.parse.quote(v["path"])}'
@@ -833,7 +860,7 @@ def render_related_videos(data, idx, tags_map, selected_tags=None, sort='name', 
     return ''.join(pieces)
 
 
-def render_playlist(data, current_idx, play_order, shuffle_seed, selected_tags=None, sort='name', direction='asc'):
+def render_playlist(data, current_idx, play_order, shuffle_seed, selected_tags=None, sort='name', direction='asc', starred_only=False):
     """Render playlist showing videos in playback order with current highlighted."""
     from simpleparty.tagger import thumb_path
     root_dir = _config.get('root', '.')
@@ -861,9 +888,9 @@ def render_playlist(data, current_idx, play_order, shuffle_seed, selected_tags=N
 
         if is_shuffled:
             pos_in_order = (current_pos + offset) % n
-            play_url = url_for_play(data['path'], video_idx, shuffle=True, seed=shuffle_seed, pos=pos_in_order, tags=selected_tags, video=v['name'], sort=sort, direction=direction)
+            play_url = url_for_play(data['path'], video_idx, shuffle=True, seed=shuffle_seed, pos=pos_in_order, tags=selected_tags, video=v['name'], sort=sort, direction=direction, starred=starred_only)
         else:
-            play_url = url_for_play(data['path'], video_idx, tags=selected_tags, video=v['name'], sort=sort, direction=direction)
+            play_url = url_for_play(data['path'], video_idx, tags=selected_tags, video=v['name'], sort=sort, direction=direction, starred=starred_only)
 
         resolved_dir = resolve_path(root_dir, data['path'])
         has_thumb = thumb_path(str(resolved_dir), v['name']).exists()
@@ -901,7 +928,7 @@ def _compute_viable_tags(tags_map, selected_tags):
     return viable
 
 
-def render_sort_pills(path, selected_tags, sort, direction):
+def render_sort_pills(path, selected_tags, sort, direction, starred_only=False):
     """Render three sort pills (Name/Size/Date). Active pill shows direction arrow;
     clicking the active pill flips direction, clicking an inactive one switches
     to that field at a sensible default direction."""
@@ -919,14 +946,14 @@ def render_sort_pills(path, selected_tags, sort, direction):
         else:
             new_dir = default_dir
             arrow = ''
-        href = url_for_browse(path, tags=selected_tags, sort=field, direction=new_dir)
+        href = url_for_browse(path, tags=selected_tags, sort=field, direction=new_dir, starred=starred_only)
         cls = 'sort-pill' + (' active' if active else '')
         pieces.append(f'<a class="{cls}" href="{esc(href)}">{label}{arrow}</a>')
     pieces.append('</div>')
     return ''.join(pieces)
 
 
-def render_tag_filter(tags_map, selected_tags, path, filtered_count=None):
+def render_tag_filter(tags_map, selected_tags, path, filtered_count=None, starred_only=False):
     """Render tag filter: selected pills + searchable dropdown of viable tags."""
     if not tags_map:
         return ''
@@ -937,7 +964,8 @@ def render_tag_filter(tags_map, selected_tags, path, filtered_count=None):
             key = tag.lower().strip()
             if key:
                 counts[key] = counts.get(key, 0) + 1
-    if not counts:
+    has_starred = any(e.get('starred') for e in tags_map.values())
+    if not counts and not has_starred:
         return ''
 
     selected_lower = {t.lower() for t in selected_tags} if selected_tags else set()
@@ -945,18 +973,34 @@ def render_tag_filter(tags_map, selected_tags, path, filtered_count=None):
 
     pieces = ['<div class="tag-filter">']
 
+    # Star filter pill (if any starred videos exist in this directory)
+    if has_starred:
+        if starred_only:
+            href = url_for_browse(path, tags=selected_tags, starred=False)
+            pieces.append(
+                f'<a class="tag-pill star-pill active" href="{esc(href)}" '
+                f'title="Show all videos">'
+                f'★ Starred only <span class="tag-pill-x">×</span></a>'
+            )
+        else:
+            href = url_for_browse(path, tags=selected_tags, starred=True)
+            pieces.append(
+                f'<a class="tag-pill star-pill" href="{esc(href)}" '
+                f'title="Show only starred videos">★ Starred only</a>'
+            )
+
     # Selected tag pills
     if selected_tags:
         pieces.append('<div class="tag-selected-pills">')
         for tag in selected_tags:
             remove_tags = [t for t in selected_tags if t.lower() != tag.lower()]
-            href = url_for_browse(path, tags=remove_tags if remove_tags else None)
+            href = url_for_browse(path, tags=remove_tags if remove_tags else None, starred=starred_only)
             pieces.append(
                 f'<a class="tag-pill active" href="{esc(href)}">'
                 f'{esc(tag)} <span class="tag-pill-x">\u00d7</span></a>'
             )
         pieces.append(
-            f'<a class="tag-clear" href="{esc(url_for_browse(path))}">Clear all</a>'
+            f'<a class="tag-clear" href="{esc(url_for_browse(path, starred=starred_only))}">Clear all</a>'
         )
         if _config.get('allow_delete') and filtered_count:
             tags_csv = ','.join(selected_tags)
@@ -993,7 +1037,7 @@ def render_tag_filter(tags_map, selected_tags, path, filtered_count=None):
         pieces.append('<div class="tag-dropdown" id="tag-dropdown">')
         for tag, count in viable_sorted:
             new_tags = list(selected_tags or []) + [tag]
-            href = url_for_browse(path, tags=new_tags)
+            href = url_for_browse(path, tags=new_tags, starred=starred_only)
             cnt = f' <span class="cnt">({count})</span>' if count > 1 else ''
             pieces.append(f'<a href="{esc(href)}">{esc(tag)}{cnt}</a>')
         pieces.append('</div></div>')
@@ -1024,16 +1068,17 @@ def render_tag_filter(tags_map, selected_tags, path, filtered_count=None):
     return ''.join(pieces)
 
 
-def render_browse_page(data, tags_map=None, selected_tags=None, sort='name', direction='asc'):
+def render_browse_page(data, tags_map=None, selected_tags=None, sort='name', direction='asc', starred_only=False):
     title = f'SimpleParty \u2014 {data["path"].split("/")[-1]}' if data['path'] else 'SimpleParty'
     body = render_nav(data['path'], data.get('encryptedDir'))
     body += render_tag_filter(
         tags_map, selected_tags, data['path'],
         filtered_count=len(data['videos']),
+        starred_only=starred_only,
     )
     body += render_file_list(
         data, tags_map=tags_map, selected_tags=selected_tags,
-        sort=sort, direction=direction,
+        sort=sort, direction=direction, starred_only=starred_only,
     )
     return render_page(title, body)
 
@@ -1131,10 +1176,10 @@ def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'
     return ''.join(pieces)
 
 
-def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info, tags_map=None, selected_tags=None, play_order=None, shuffle_seed=None, transcode_plan=None, sort='name', direction='asc'):
+def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info, tags_map=None, selected_tags=None, play_order=None, shuffle_seed=None, transcode_plan=None, sort='name', direction='asc', starred_only=False):
     v = data['videos'][idx]
     video_src = url_for_video(v['path'])
-    browse_url = url_for_browse(data['path'], tags=selected_tags, sort=sort, direction=direction)
+    browse_url = url_for_browse(data['path'], tags=selected_tags, sort=sort, direction=direction, starred=starred_only)
 
     body = render_nav(data['path'], data.get('encryptedDir'))
     if transcode_plan == 'reencode':
@@ -1173,6 +1218,15 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         f'<button id="btn-autoplay" class="btn" title="Autoplay (a)">Autoplay</button>'
         f'<button id="btn-repeat" class="btn" title="Repeat (r)">Repeat</button>'
     )
+    if _config['allow_tag']:
+        is_video_starred = bool(tags_map and tags_map.get(v['name'], {}).get('starred'))
+        body += (
+            f'<button id="btn-star" type="button" class="btn btn-star{" active" if is_video_starred else ""}" '
+            f'data-starred="{"1" if is_video_starred else "0"}" '
+            f'data-dir="{esc(data["path"])}" data-video="{esc(v["name"])}" '
+            f'title="Star this video">'
+            f'<span class="star-icon">{"★" if is_video_starred else "☆"}</span></button>'
+        )
     if _config['allow_delete']:
         body += (
             f'<form id="delete-form" hx-post="/delete" hx-confirm="Delete {esc(v["name"])}?">'
@@ -1203,9 +1257,9 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         body += f'<div class="video-meta" id="video-meta">{meta_html}</div>'
 
     if tags_map:
-        body += render_related_videos(data, idx, tags_map, selected_tags=selected_tags, sort=sort, direction=direction)
+        body += render_related_videos(data, idx, tags_map, selected_tags=selected_tags, sort=sort, direction=direction, starred_only=starred_only)
 
-    body += render_playlist(data, idx, play_order, shuffle_seed, selected_tags=selected_tags, sort=sort, direction=direction)
+    body += render_playlist(data, idx, play_order, shuffle_seed, selected_tags=selected_tags, sort=sort, direction=direction, starred_only=starred_only)
 
     body += (
         '<script>\n'
@@ -1230,6 +1284,20 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         'btnAuto.addEventListener("click",()=>{autoplay=!autoplay;localStorage.setItem("sp-autoplay",autoplay);updateAutoBtn();flash(autoplay?"Autoplay on":"Autoplay off")});\n'
         'btnRepeat.addEventListener("click",()=>{repeat=repeat==="off"?"all":repeat==="all"?"one":"off";localStorage.setItem("sp-repeat",repeat);updateRepeatBtn();flash(repeat==="off"?"Repeat off":repeat==="one"?"Repeat one":"Repeat all")});\n'
         'updateAutoBtn();updateRepeatBtn();\n'
+        'const btnStar=document.getElementById("btn-star");\n'
+        'if(btnStar){btnStar.addEventListener("click",async()=>{\n'
+        '  const cur=btnStar.dataset.starred==="1";const next=!cur;\n'
+        '  const fd=new FormData();fd.set("dir",btnStar.dataset.dir);fd.set("name",btnStar.dataset.video);fd.set("starred",next?"1":"0");\n'
+        '  btnStar.disabled=true;\n'
+        '  try{const r=await fetch("/star-update",{method:"POST",body:new URLSearchParams(fd)});\n'
+        '    if(!r.ok)throw new Error("HTTP "+r.status);\n'
+        '    btnStar.dataset.starred=next?"1":"0";\n'
+        '    btnStar.classList.toggle("active",next);\n'
+        '    btnStar.querySelector(".star-icon").textContent=next?"★":"☆";\n'
+        '    flash(next?"Starred":"Unstarred");\n'
+        '  }catch(e){flash("Star failed")}\n'
+        '  finally{btnStar.disabled=false}\n'
+        '})}\n'
         'video.addEventListener("ended",()=>{if(repeat==="one"){video.currentTime=0;video.play()}else if(repeat==="all"||autoplay){window.location.href=nextUrl}});\n'
         'video.play().catch(()=>{});\n'
         'document.addEventListener("keydown",e=>{\n'
@@ -1903,17 +1971,19 @@ def handle_browse(handler, root):
     else:
         tags_map = None
         selected_tags = parse_tags_param(params)
+        starred_only = parse_starred_param(params)
         sort, direction = parse_sort_params(params)
         resolved = resolve_path(root, rel_path)
         if _config['allow_tag']:
             from simpleparty.tagger import load_tags
             tags_map = load_tags(resolved)
             data['videos'] = filter_videos_by_tags(data['videos'], tags_map, selected_tags)
+            data['videos'] = filter_videos_by_starred(data['videos'], tags_map, starred_only)
         data['videos'] = sort_videos(data['videos'], sort, direction)
         _maybe_start_thumbs(resolved, data['videos'])
         send_html(handler, render_browse_page(
             data, tags_map=tags_map, selected_tags=selected_tags,
-            sort=sort, direction=direction,
+            sort=sort, direction=direction, starred_only=starred_only,
         ))
 
 
@@ -1927,6 +1997,7 @@ def handle_play(handler, root):
         return
 
     selected_tags = parse_tags_param(params)
+    starred_only = parse_starred_param(params)
     sort, direction = parse_sort_params(params)
     tags_map = None
     if _config['allow_tag']:
@@ -1934,10 +2005,11 @@ def handle_play(handler, root):
         resolved = resolve_path(root, dir_path)
         tags_map = load_tags(resolved)
         data['videos'] = filter_videos_by_tags(data['videos'], tags_map, selected_tags)
+        data['videos'] = filter_videos_by_starred(data['videos'], tags_map, starred_only)
     data['videos'] = sort_videos(data['videos'], sort, direction)
 
     if 'error' in data or not data.get('videos'):
-        send_redirect(handler, url_for_browse(dir_path, tags=selected_tags, sort=sort, direction=direction))
+        send_redirect(handler, url_for_browse(dir_path, tags=selected_tags, sort=sort, direction=direction, starred=starred_only))
         return
 
     n = len(data['videos'])
@@ -1960,10 +2032,10 @@ def handle_play(handler, root):
                 pos = order.index(idx) if idx in order else pos
         next_pos = (pos + 1) % n
         prev_pos = (pos - 1) % n
-        next_url = url_for_play(dir_path, order[next_pos], shuffle=True, seed=seed, pos=next_pos, tags=selected_tags, video=data['videos'][order[next_pos]]['name'], sort=sort, direction=direction)
-        prev_url = url_for_play(dir_path, order[prev_pos], shuffle=True, seed=seed, pos=prev_pos, tags=selected_tags, video=data['videos'][order[prev_pos]]['name'], sort=sort, direction=direction)
+        next_url = url_for_play(dir_path, order[next_pos], shuffle=True, seed=seed, pos=next_pos, tags=selected_tags, video=data['videos'][order[next_pos]]['name'], sort=sort, direction=direction, starred=starred_only)
+        prev_url = url_for_play(dir_path, order[prev_pos], shuffle=True, seed=seed, pos=prev_pos, tags=selected_tags, video=data['videos'][order[prev_pos]]['name'], sort=sort, direction=direction, starred=starred_only)
         pos_info = f'{pos + 1}/{n}'
-        shuffle_url = url_for_play(dir_path, idx, tags=selected_tags, video=data['videos'][idx]['name'], sort=sort, direction=direction)
+        shuffle_url = url_for_play(dir_path, idx, tags=selected_tags, video=data['videos'][idx]['name'], sort=sort, direction=direction, starred=starred_only)
         play_order = order
         shuffle_seed = seed
     else:
@@ -1973,8 +2045,8 @@ def handle_play(handler, root):
         idx = found if found is not None else max(0, min(idx_param, n - 1))
         next_idx = (idx + 1) % n
         prev_idx = (idx - 1) % n
-        next_url = url_for_play(dir_path, next_idx, tags=selected_tags, video=data['videos'][next_idx]['name'], sort=sort, direction=direction)
-        prev_url = url_for_play(dir_path, prev_idx, tags=selected_tags, video=data['videos'][prev_idx]['name'], sort=sort, direction=direction)
+        next_url = url_for_play(dir_path, next_idx, tags=selected_tags, video=data['videos'][next_idx]['name'], sort=sort, direction=direction, starred=starred_only)
+        prev_url = url_for_play(dir_path, prev_idx, tags=selected_tags, video=data['videos'][prev_idx]['name'], sort=sort, direction=direction, starred=starred_only)
         pos_info = f'{idx + 1}/{n}'
         shuffle_params = {'path': dir_path, 'shuffle': '1'}
         if selected_tags:
@@ -1983,6 +2055,8 @@ def handle_play(handler, root):
             shuffle_params['sort'] = sort
         if direction and direction != 'asc':
             shuffle_params['dir'] = direction
+        if starred_only:
+            shuffle_params['starred'] = '1'
         shuffle_url = '/play?' + urllib.parse.urlencode(shuffle_params)
 
     transcode_plan = None
@@ -1996,7 +2070,7 @@ def handle_play(handler, root):
         except OSError:
             pass
 
-    send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info, tags_map=tags_map, selected_tags=selected_tags, play_order=play_order, shuffle_seed=shuffle_seed, transcode_plan=transcode_plan, sort=sort, direction=direction))
+    send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info, tags_map=tags_map, selected_tags=selected_tags, play_order=play_order, shuffle_seed=shuffle_seed, transcode_plan=transcode_plan, sort=sort, direction=direction, starred_only=starred_only))
 
 
 def handle_video(handler, root):
@@ -2509,6 +2583,38 @@ def handle_save_tags(handler, root):
     send_html(handler, render_video_tags_inline(rel_path, video_name, tags_list))
 
 
+def handle_star_update(handler, root):
+    if not _config['allow_tag']:
+        handler.send_error(403, 'Tagging not enabled')
+        return
+    from simpleparty.tagger import load_tags, save_tags, set_starred
+
+    form = read_form_body(handler)
+    rel_dir = form.get('dir', '')
+    video_name = form.get('name', '')
+    starred_flag = form.get('starred', '') == '1'
+
+    if not video_name:
+        handler.send_error(400, 'Missing video name')
+        return
+
+    resolved = resolve_path(root, rel_dir)
+    if not resolved.is_dir():
+        handler.send_error(404, 'Directory not found')
+        return
+    if not (resolved / video_name).exists():
+        handler.send_error(404, 'Video not found')
+        return
+
+    all_tags = load_tags(resolved)
+    set_starred(all_tags, video_name, starred_flag)
+    save_tags(resolved, all_tags)
+
+    handler.send_response(204)
+    handler.send_header('Content-Length', '0')
+    handler.end_headers()
+
+
 def handle_thumb(handler, root):
     """Serve a thumbnail JPEG from .simpleparty/thumbs/."""
     raw = urllib.parse.urlparse(handler.path).path
@@ -2668,6 +2774,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             handle_reject_tag(self, self.root)
         elif path == '/save-tags':
             handle_save_tags(self, self.root)
+        elif path == '/star-update':
+            handle_star_update(self, self.root)
         elif path == '/download':
             handle_download_submit(self, self.root)
         elif path == '/download-cancel':

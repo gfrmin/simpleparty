@@ -87,6 +87,42 @@ def untagged_videos(directory_path, existing_tags):
     return result
 
 
+def is_starred(entry):
+    """Return True if a tags-map entry is starred."""
+    return bool(entry) and bool(entry.get('starred'))
+
+
+def _entry_is_empty(entry):
+    """An entry with no tags, no rejected_tags, and no starred flag is dead weight."""
+    if not entry:
+        return True
+    if entry.get('tags'):
+        return False
+    if entry.get('rejected_tags'):
+        return False
+    if entry.get('starred'):
+        return False
+    return True
+
+
+def set_starred(tags, video_name, starred):
+    """Mutate `tags` to set/clear starred for `video_name`. Returns the updated dict.
+
+    Removes the entry entirely if it ends up empty after clearing.
+    """
+    entry = tags.get(video_name, {})
+    if starred:
+        entry['starred'] = True
+        tags[video_name] = entry
+    else:
+        entry.pop('starred', None)
+        if _entry_is_empty(entry):
+            tags.pop(video_name, None)
+        else:
+            tags[video_name] = entry
+    return tags
+
+
 def confirmed_entries(tags):
     """Return dict of entries with status != 'suggested'."""
     return {
