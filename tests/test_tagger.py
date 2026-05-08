@@ -10,6 +10,7 @@ from simpleparty.tagger import (
     _LEGACY_TAGS, _LEGACY_MODEL,
     load_tags, save_tags, model_path, thumb_path,
     untagged_videos, confirmed_entries,
+    is_starred, set_starred,
 )
 
 
@@ -96,6 +97,53 @@ def test_confirmed_entries_filters_suggested():
     assert 'a.mp4' in result
     assert 'b.mp4' not in result
     assert 'c.mp4' in result
+
+
+def test_is_starred():
+    assert is_starred({'starred': True}) is True
+    assert is_starred({'starred': False}) is False
+    assert is_starred({}) is False
+    assert is_starred(None) is False
+    assert is_starred({'tags': ['x']}) is False
+
+
+def test_set_starred_adds_flag_to_existing_entry():
+    tags = {'a.mp4': {'tags': ['x'], 'status': 'confirmed'}}
+    set_starred(tags, 'a.mp4', True)
+    assert tags['a.mp4'] == {'tags': ['x'], 'status': 'confirmed', 'starred': True}
+
+
+def test_set_starred_creates_minimal_entry():
+    tags = {}
+    set_starred(tags, 'a.mp4', True)
+    assert tags == {'a.mp4': {'starred': True}}
+
+
+def test_set_starred_unstar_preserves_entry_with_other_state():
+    tags = {'a.mp4': {'tags': ['x'], 'starred': True}}
+    set_starred(tags, 'a.mp4', False)
+    assert tags == {'a.mp4': {'tags': ['x']}}
+
+
+def test_set_starred_unstar_drops_now_empty_entry():
+    tags = {'a.mp4': {'starred': True}}
+    set_starred(tags, 'a.mp4', False)
+    assert tags == {}
+
+
+def test_set_starred_unstar_missing_is_noop():
+    tags = {}
+    set_starred(tags, 'a.mp4', False)
+    assert tags == {}
+
+
+def test_starred_round_trip(tmp_path):
+    save_tags(str(tmp_path), {'a.mp4': {'starred': True}})
+    loaded = load_tags(str(tmp_path))
+    assert is_starred(loaded.get('a.mp4', {})) is True
+    set_starred(loaded, 'a.mp4', False)
+    save_tags(str(tmp_path), loaded)
+    assert load_tags(str(tmp_path)) == {}
 
 
 def test_untagged_videos(tmp_path):

@@ -14,6 +14,7 @@ Easily enjoy your private video collection. Browse and play local video files fr
 - **URL download** - paste a URL from the browse page or `/download` and yt-dlp fetches it into that directory (opt-in extra)
 - **AI video tagging** - automatically tag videos using a local Ollama vision model (opt-in, requires `--tag` flag)
 - **Manual tagging** - add or edit tags on any video from the player page
+- **Star favourites** - star videos from the player page and filter the browse view to starred only
 - **Tag summary** - see all tags in a directory at a glance, with counts
 - **Encrypted directories** - unlock/lock fscrypt-encrypted folders from the browser (if fscrypt is installed)
 - **Zero dependencies** - pure Python standard library, nothing to install
