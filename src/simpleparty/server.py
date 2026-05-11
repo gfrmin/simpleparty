@@ -317,7 +317,7 @@ def parse_starred_param(params):
     return params.get('starred', '') == '1'
 
 
-_SORT_FIELDS = {'name', 'size', 'date'}
+_SORT_FIELDS = {'name', 'size', 'date', 'length'}
 _SORT_DIRS = {'asc', 'desc'}
 
 
@@ -338,9 +338,31 @@ def sort_videos(videos, sort, direction):
         key = lambda v: (v.get('size', 0), v['name'].lower())
     elif sort == 'date':
         key = lambda v: (v.get('mtime', 0.0), v['name'].lower())
+    elif sort == 'length':
+        key = lambda v: (v.get('duration', 0.0), v['name'].lower())
     else:
         key = lambda v: v['name'].lower()
     return sorted(videos, key=key, reverse=reverse)
+
+
+def _populate_durations(root, videos, tags_map, resolved):
+    """Fill v['duration'] for each video. If tags_map is provided, cache durations
+    in the tags file (saved only when something new was probed)."""
+    if tags_map is None:
+        from simpleparty.tagger import _get_duration
+        for v in videos:
+            v['duration'] = _get_duration(Path(root) / v['path'])
+        return
+    from simpleparty.tagger import get_video_duration, save_tags
+    changed = False
+    for v in videos:
+        dur, ch = get_video_duration(
+            v['name'], Path(root) / v['path'], tags_map, v.get('mtime', 0.0),
+        )
+        v['duration'] = dur
+        changed = changed or ch
+    if changed:
+        save_tags(resolved, tags_map)
 
 
 def filter_videos_by_tags(videos, tags_map, selected_tags):
@@ -936,6 +958,7 @@ def render_sort_pills(path, selected_tags, sort, direction, starred_only=False):
         ('name', 'Name', 'asc'),
         ('size', 'Size', 'desc'),
         ('date', 'Date', 'desc'),
+        ('length', 'Length', 'desc'),
     ]
     pieces = ['<div class="sort-pills">']
     for field, label, default_dir in fields:
@@ -1979,6 +2002,8 @@ def handle_browse(handler, root):
             tags_map = load_tags(resolved)
             data['videos'] = filter_videos_by_tags(data['videos'], tags_map, selected_tags)
             data['videos'] = filter_videos_by_starred(data['videos'], tags_map, starred_only)
+        if sort == 'length':
+            _populate_durations(root, data['videos'], tags_map, resolved)
         data['videos'] = sort_videos(data['videos'], sort, direction)
         _maybe_start_thumbs(resolved, data['videos'])
         send_html(handler, render_browse_page(
@@ -2000,12 +2025,14 @@ def handle_play(handler, root):
     starred_only = parse_starred_param(params)
     sort, direction = parse_sort_params(params)
     tags_map = None
+    resolved = resolve_path(root, dir_path)
     if _config['allow_tag']:
         from simpleparty.tagger import load_tags
-        resolved = resolve_path(root, dir_path)
         tags_map = load_tags(resolved)
         data['videos'] = filter_videos_by_tags(data['videos'], tags_map, selected_tags)
         data['videos'] = filter_videos_by_starred(data['videos'], tags_map, starred_only)
+    if sort == 'length':
+        _populate_durations(root, data['videos'], tags_map, resolved)
     data['videos'] = sort_videos(data['videos'], sort, direction)
 
     if 'error' in data or not data.get('videos'):

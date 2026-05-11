@@ -93,7 +93,7 @@ def is_starred(entry):
 
 
 def _entry_is_empty(entry):
-    """An entry with no tags, no rejected_tags, and no starred flag is dead weight."""
+    """An entry with no tags, no rejected_tags, no starred flag, and no cached duration is dead weight."""
     if not entry:
         return True
     if entry.get('tags'):
@@ -102,7 +102,24 @@ def _entry_is_empty(entry):
         return False
     if entry.get('starred'):
         return False
+    if entry.get('duration') is not None:
+        return False
     return True
+
+
+def get_video_duration(video_name, video_path, tags, file_mtime):
+    """Return (duration_seconds, tags_changed). Reads cached duration from tags entry
+    if mtime matches; otherwise probes via ffprobe and writes back into the entry."""
+    entry = tags.get(video_name, {})
+    cached_dur = entry.get('duration')
+    cached_mtime = entry.get('duration_mtime')
+    if cached_dur is not None and cached_mtime == file_mtime:
+        return cached_dur, False
+    dur = _get_duration(video_path)
+    entry['duration'] = dur
+    entry['duration_mtime'] = file_mtime
+    tags[video_name] = entry
+    return dur, True
 
 
 def set_starred(tags, video_name, starred):
