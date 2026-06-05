@@ -262,9 +262,9 @@ def url_for_browse(path='', tags=None, sort=None, direction=None, starred=False)
         params['path'] = path
     if tags:
         params['tags'] = ','.join(tags)
-    if sort and sort != 'name':
+    if sort and sort != 'date':
         params['sort'] = sort
-    if direction and direction != 'asc':
+    if direction and direction != 'desc':
         params['dir'] = direction
     if starred:
         params['starred'] = '1'
@@ -283,9 +283,9 @@ def url_for_play(dir_path, idx, shuffle=False, seed=None, pos=None, tags=None, v
             params['pos'] = str(pos)
     if tags:
         params['tags'] = ','.join(tags)
-    if sort and sort != 'name':
+    if sort and sort != 'date':
         params['sort'] = sort
-    if direction and direction != 'asc':
+    if direction and direction != 'desc':
         params['dir'] = direction
     if starred:
         params['starred'] = '1'
@@ -571,7 +571,7 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .download-details{display:inline-block}
 .download-details[open] summary{color:#a78bfa}
 .download-form{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:8px;width:100%}
-.download-form input[type="url"],.download-form input[type="text"]{background:#0f0f1a;border:1px solid #2d2d44;border-radius:6px;color:#e2e8f0;padding:8px 10px;font-size:14px;flex:1;min-width:200px;outline:none}
+.download-form input[type="url"],.download-form input[type="text"]{background:#0f0f1a;border:1px solid #2d2d44;border-radius:6px;color:#e2e8f0;padding:8px 10px;font-size:14px;flex:1;min-width:120px;outline:none}
 .download-form input:focus{border-color:#7c3aed}
 .download-progress-panel{display:flex;align-items:center;gap:10px;min-height:0;flex-wrap:wrap;transition:all .3s ease}
 .download-progress-panel:empty{display:none}
@@ -704,8 +704,23 @@ a:focus-visible,button:focus-visible,select:focus-visible,input:focus-visible,su
 /* P3: in landscape, don't trap the controls under a viewport-filling video */
 @media(orientation:landscape) and (max-height:520px){
   nav,#player-area{position:static}
-  video{max-height:82vh}
-}"""
+  video{max-height:68vh}
+  #controls{padding-top:4px;padding-bottom:4px;gap:6px}
+  .btn,.btn-skip,.speed-select,.btn-star{min-height:36px}
+}
+/* P9: legible 2-line titles for the touch-navigation lists; clearer current item */
+.related-list .item-name,.playlist-name{white-space:normal;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;line-height:1.25}
+.playlist-item.playing{background:#241b4d}
+.playlist-item.playing .playlist-name{color:#c4b5fd;font-weight:600}
+/* T1: bring the last sub-floor controls up to a 44px touch target on phones */
+@media(max-width:640px){
+  .crumb{min-height:44px;display:inline-flex;align-items:center}
+  .tag-dropdown a{min-height:44px;align-items:center}
+}
+/* V1: tighten the type scale — no sub-12px text, drop the stray 15px step */
+.crumb,.empty{font-size:16px}
+.item-tags,.tag-pill-count,.tag-dropdown a .cnt,.tag-pill-x{font-size:12px}
+"""
 
 
 def render_page(title, body):
@@ -835,7 +850,7 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
             path_q = urllib.parse.urlencode({'path': data['path']})
             download_html = (
                 f'<details class="download-details">'
-                f'<summary class="btn">\u2B07\uFE0F Download URL</summary>'
+                f'<summary class="btn">\u2B07 Download URL</summary>'
                 f'<div style="flex-basis:100%">{render_download_form(data["path"], autofocus=False)}</div>'
                 f'</details>'
                 f'<a class="btn" href="/download">Manage</a>'
@@ -1465,15 +1480,18 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         '})}\n'
         'video.addEventListener("ended",()=>{if(repeat==="one"){video.currentTime=0;video.play()}else if(repeat==="all"||autoplay){window.location.href=nextUrl}});\n'
         'video.play().catch(()=>{});\n'
-        # Touch: horizontal swipe on the video -> next/prev (parity with n/p keys)
-        '(function(){var x0=0,y0=0,t0=0;\n'
+        # Touch: swipe -> next/prev, double-tap left/right half -> skip -/+10s (parity with keys)
+        '(function(){var x0=0,y0=0,t0=0,lastTap=0,lastSide=0;\n'
         'video.addEventListener("touchstart",function(e){if(e.touches.length!==1){t0=0;return}var t=e.touches[0];var r=video.getBoundingClientRect();if(t.clientY>r.bottom-48){t0=0;return}x0=t.clientX;y0=t.clientY;t0=Date.now()},{passive:true});\n'
         'video.addEventListener("touchend",function(e){if(!t0)return;var t=e.changedTouches[0];var dx=t.clientX-x0,dy=t.clientY-y0,dt=Date.now()-t0;t0=0;\n'
-        '  if(dt<700&&Math.abs(dx)>60&&Math.abs(dx)>Math.abs(dy)*1.7){window.location.href=dx<0?nextUrl:prevUrl}},{passive:true});\n'
+        '  if(dt<700&&Math.abs(dx)>60&&Math.abs(dx)>Math.abs(dy)*1.7){window.location.href=dx<0?nextUrl:prevUrl;return}\n'
+        '  if(dt<350&&Math.abs(dx)<24&&Math.abs(dy)<24){var r2=video.getBoundingClientRect();var side=t.clientX>r2.left+r2.width/2?1:-1;var now=Date.now();\n'
+        '    if(now-lastTap<320&&side===lastSide){skip(side*10);lastTap=0}else{lastTap=now;lastSide=side}}},{passive:true});\n'
         '})();\n'
         'document.addEventListener("keydown",e=>{\n'
         '  var tn=e.target.tagName;\n'
         '  if(tn==="INPUT"||tn==="SELECT"||tn==="TEXTAREA"||e.target.isContentEditable)return;\n'
+        '  if(e.target.closest&&e.target.closest("a,button,summary,[tabindex]"))return;\n'
         '  if(e.ctrlKey||e.metaKey||e.altKey)return;\n'
         '  switch(e.key){\n'
         '    case"n":case"ArrowRight":window.location.href=nextUrl;break;\n'
@@ -1878,7 +1896,13 @@ def _download_worker_loop(root):
                 job['url'], job['target_dir'], job,
                 format_str=_config.get('yt_dlp_format'),
             )
-            job['state'] = 'error' if job.get('error') else 'done'
+            if job.get('cancel_requested'):
+                job['state'] = 'cancelled'
+                job.pop('error', None)
+            elif job.get('error'):
+                job['state'] = 'error'
+            else:
+                job['state'] = 'done'
         except Exception as e:
             logger.exception('download worker: unexpected failure')
             job['error'] = str(e) or e.__class__.__name__
@@ -1886,7 +1910,8 @@ def _download_worker_loop(root):
         finally:
             job['running'] = False
             job['finished_at'] = time.time()
-            _finalize_download_job(job, root)
+            if job.get('state') != 'cancelled':
+                _finalize_download_job(job, root)
 
 
 def _ensure_download_worker(root):
@@ -1969,20 +1994,24 @@ def _render_download_job_card(job, *, full=True):
             f'<div class="tag-progress-bar" style="width:{pct}%"></div>'
             f'</div>'
         )
-        parts = [job.get('phase', 'downloading')]
+        line1 = [job.get('phase', 'downloading')]
         total = job.get('total_bytes', 0)
         done = job.get('downloaded_bytes', 0)
         if total:
-            parts.append(f'{_render_bytes(done)} / {_render_bytes(total)} ({pct}%)')
+            line1.append(f'{_render_bytes(done)} / {_render_bytes(total)} ({pct}%)')
         elif done:
-            parts.append(_render_bytes(done))
+            line1.append(_render_bytes(done))
+        line2 = []
         sp = _render_speed(job.get('speed'))
         if sp:
-            parts.append(sp)
+            line2.append(sp)
         eta = _render_eta(job.get('eta'))
         if eta:
-            parts.append('ETA ' + eta)
-        meta = f'<div class="meta">{esc(" · ".join(parts))}</div>'
+            line2.append('ETA ' + eta)
+        # Two short rows so the progress doesn't wrap unpredictably on a 360px card
+        meta = f'<div class="meta">{esc(" · ".join(line1))}</div>'
+        if line2:
+            meta += f'<div class="meta">{esc(" · ".join(line2))}</div>'
     elif state == 'done':
         meta_bits = ['Done']
         final_name = job.get('final_name')
@@ -2004,7 +2033,7 @@ def _render_download_job_card(job, *, full=True):
         meta = '<div class="meta">Queued</div>'
 
     cancel = ''
-    if full and state == 'queued':
+    if full and state in ('queued', 'running'):
         cancel = (
             f'<form hx-post="/download-cancel" style="display:inline">'
             f'<input type="hidden" name="id" value="{esc(job["id"])}">'
@@ -2887,6 +2916,9 @@ def handle_download_cancel(handler, root):
         if job and job.get('state') == 'queued':
             job['state'] = 'cancelled'
             job['finished_at'] = time.time()
+        elif job and job.get('state') == 'running':
+            # Signal the worker's progress hook to abort the in-flight download.
+            job['cancel_requested'] = True
     send_hx_redirect(handler, '/download')
 
 

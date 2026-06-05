@@ -7,6 +7,10 @@ from pathlib import Path
 logger = logging.getLogger('simpleparty.downloader')
 
 
+class DownloadCancelled(Exception):
+    """Raised from the progress hook when a running download is cancelled."""
+
+
 _URL_RE = re.compile(r'^https?://[^\s<>"\']+$')
 _MAX_URL = 2048
 
@@ -117,6 +121,8 @@ def download_video(url, target_dir, progress, *, format_str=None):
         progress['running'] = True
 
         def _hook(d):
+            if progress.get('cancel_requested'):
+                raise DownloadCancelled()
             _apply_progress_hook(d, progress, state)
 
         def _pp_hook(d):
@@ -150,6 +156,10 @@ def download_video(url, target_dir, progress, *, format_str=None):
             progress['final_name'] = p.name
         progress['phase'] = 'done'
         progress['status'] = 'finished'
+    except DownloadCancelled:
+        # Cancelled by the user mid-download — not an error.
+        progress['phase'] = 'cancelled'
+        progress['status'] = 'cancelled'
     except Exception as e:
         logger.exception('download failed: %s', url)
         progress['error'] = str(e) or e.__class__.__name__
