@@ -280,15 +280,18 @@ def _populate_durations(root, videos, tags_map, resolved):
         save_tags(resolved, tags_map)
 
 
-def filter_videos_by_tags(videos, tags_map, selected_tags):
-    """Filter video list to those having ALL selected tags (AND logic)."""
-    if not selected_tags or not tags_map:
+def filter_videos_by_tags(videos, lower_index, selected_tags):
+    """Filter video list to those having ALL selected tags (AND logic).
+
+    `lower_index` maps video name -> frozenset of lowercased tags
+    (from tagger.load_tags_index), so nothing is re-lowercased per request.
+    """
+    if not selected_tags or not lower_index:
         return videos
     selected_lower = {t.lower() for t in selected_tags}
     return [
         v for v in videos
-        if v['name'] in tags_map
-        and selected_lower <= {t.lower() for t in tags_map[v['name']].get('tags', [])}
+        if selected_lower <= lower_index.get(v['name'], frozenset())
     ]
 
 
@@ -301,20 +304,18 @@ def filter_videos_by_starred(videos, tags_map, starred_only):
     return [v for v in videos if tags_map.get(v['name'], {}).get('starred')]
 
 
-def _compute_related_videos(data, idx, tags_map, max_results=8):
+def _compute_related_videos(data, idx, lower_index, max_results=8):
     """Return list of (video_index, shared_tag_count) for videos sharing tags with current."""
-    if not tags_map:
+    if not lower_index:
         return []
-    current = data['videos'][idx]
-    current_tags = {t.lower() for t in tags_map.get(current['name'], {}).get('tags', [])}
+    current_tags = lower_index.get(data['videos'][idx]['name'], frozenset())
     if not current_tags:
         return []
     scored = []
     for i, v in enumerate(data['videos']):
         if i == idx:
             continue
-        vtags = {t.lower() for t in tags_map.get(v['name'], {}).get('tags', [])}
-        overlap = len(current_tags & vtags)
+        overlap = len(current_tags & lower_index.get(v['name'], frozenset()))
         if overlap > 0:
             scored.append((i, overlap))
     scored.sort(key=lambda x: x[1], reverse=True)

@@ -202,25 +202,28 @@ def _generate_thumbnails(directory, videos):
     """
     from simpleparty.tagger import (
         FRAMES_DIR, thumb_path, extract_thumbnail,
-        extract_frame, _downscale_frame, _get_duration,
+        extract_frame, _downscale_frame,
+        list_thumbs, videos_with_frames,
     )
     try:
         t0 = time.monotonic()
         frames_dir = Path(directory) / FRAMES_DIR
         frames_dir.mkdir(parents=True, exist_ok=True)
 
-        # Pre-scan: classify each video
+        # Pre-scan: classify each video (two scandirs instead of per-video
+        # exists()/glob checks)
+        existing_thumbs = list_thumbs(directory)
+        existing_frames = videos_with_frames(directory)
         skip = []
         need_frame = []       # no full-res frame (extract frame + maybe thumb)
         need_thumb_only = []   # frame exists but no thumbnail
         for v in videos:
             name = v['name']
-            tp = thumb_path(directory, name)
-            has_frame = bool(sorted(frames_dir.glob(f'{name}.f*.jpg')))
+            has_frame = name in existing_frames
             video_file = Path(directory) / name
             if not video_file.exists():
                 continue
-            if has_frame and tp.exists():
+            if has_frame and name in existing_thumbs:
                 skip.append(name)
             elif not has_frame:
                 need_frame.append(name)
@@ -252,20 +255,20 @@ def _generate_thumbnails(directory, videos):
         jobs.thumb_jobs.discard(str(directory))
 
 
-def _maybe_start_thumbs(directory, videos):
-    """Spawn background thumbnail generation if needed and not already running."""
+def _maybe_start_thumbs(directory, videos, thumbs=frozenset(), frames=frozenset()):
+    """Spawn background thumbnail generation if needed and not already running.
+
+    `thumbs`/`frames` are the name sets from tagger.list_thumbs() /
+    tagger.videos_with_frames(), computed once by the caller.
+    """
     if not _config['has_ffmpeg'] or not videos:
         return
     dir_str = str(directory)
     if dir_str in jobs.thumb_jobs:
         return
-    from simpleparty.tagger import FRAMES_DIR, thumb_path
-    frames_dir = Path(directory) / FRAMES_DIR
-    def _needs_work(name):
-        has_thumb = thumb_path(directory, name).exists()
-        has_frame = bool(sorted(frames_dir.glob(f'{name}.f*.jpg'))) if frames_dir.exists() else False
-        return not has_thumb or not has_frame
-    missing = any(_needs_work(v['name']) for v in videos)
+    missing = any(
+        v['name'] not in thumbs or v['name'] not in frames for v in videos
+    )
     if not missing:
         return
     jobs.thumb_jobs.add(dir_str)

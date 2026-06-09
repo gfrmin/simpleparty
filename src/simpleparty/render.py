@@ -93,7 +93,7 @@ def _render_train_btn(path_param, is_busy):
     )
 
 
-def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=None):
+def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=None, thumbs=frozenset()):
     pieces = ['<div id="file-list">']
 
     shuffle_btn = ''
@@ -192,13 +192,10 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
             f'</a>'
         )
 
-    from simpleparty.tagger import thumb_path
-    root_dir = _config.get('root', '.')
     for i, v in enumerate(data['videos']):
         cls = ' playing' if i == current_idx else ''
         play_url = url_for_play(data['path'], i, view, video=v['name'])
-        resolved_dir = resolve_path(root_dir, data['path'])
-        has_thumb = thumb_path(str(resolved_dir), v['name']).exists()
+        has_thumb = v['name'] in thumbs
         pieces.append(f'<div class="item item-video{cls}">')
         thumb_url = f'/thumb/{urllib.parse.quote(v["path"])}'
         if has_thumb:
@@ -245,13 +242,11 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
     return ''.join(pieces)
 
 
-def render_related_videos(data, idx, tags_map, view):
+def render_related_videos(data, idx, lower_index, view, thumbs=frozenset()):
     """Render a 'Related Videos' section based on tag overlap."""
-    related = _compute_related_videos(data, idx, tags_map)
+    related = _compute_related_videos(data, idx, lower_index)
     if not related:
         return ''
-    from simpleparty.tagger import thumb_path
-    root_dir = _config.get('root', '.')
     pieces = [
         '<div id="related-videos">'
         '<h2 class="related-heading">Related Videos</h2>'
@@ -260,8 +255,7 @@ def render_related_videos(data, idx, tags_map, view):
     for video_idx, _overlap in related:
         v = data['videos'][video_idx]
         play_url = url_for_play(data['path'], video_idx, view, video=v['name'])
-        resolved_dir = resolve_path(root_dir, data['path'])
-        has_thumb = thumb_path(str(resolved_dir), v['name']).exists()
+        has_thumb = v['name'] in thumbs
         thumb_url = f'/thumb/{urllib.parse.quote(v["path"])}'
         if has_thumb:
             thumb_html = f'<img src="{thumb_url}" loading="lazy" class="item-thumb" alt="">'
@@ -281,10 +275,8 @@ def render_related_videos(data, idx, tags_map, view):
     return ''.join(pieces)
 
 
-def render_playlist(data, current_idx, play_order, shuffle_seed, view):
+def render_playlist(data, current_idx, play_order, shuffle_seed, view, thumbs=frozenset()):
     """Render playlist showing videos in playback order with current highlighted."""
-    from simpleparty.tagger import thumb_path
-    root_dir = _config.get('root', '.')
     n = len(data['videos'])
     is_shuffled = play_order is not None
 
@@ -313,8 +305,7 @@ def render_playlist(data, current_idx, play_order, shuffle_seed, view):
         else:
             play_url = url_for_play(data['path'], video_idx, view, video=v['name'])
 
-        resolved_dir = resolve_path(root_dir, data['path'])
-        has_thumb = thumb_path(str(resolved_dir), v['name']).exists()
+        has_thumb = v['name'] in thumbs
         thumb_url = f'/thumb/{urllib.parse.quote(v["path"])}'
 
         cls = ' playing' if is_current else ''
@@ -336,12 +327,11 @@ def render_playlist(data, current_idx, play_order, shuffle_seed, view):
     return ''.join(pieces)
 
 
-def _compute_viable_tags(tags_map, selected_tags):
+def _compute_viable_tags(lower_index, selected_tags):
     """Return set of lowercased tags that can be added without producing zero results."""
     selected_lower = {t.lower() for t in selected_tags} if selected_tags else set()
     viable = set()
-    for video_data in tags_map.values():
-        vtags = {t.lower().strip() for t in video_data.get('tags', [])}
+    for vtags in lower_index.values():
         if selected_lower <= vtags:
             viable |= vtags
     # Remove already-selected tags from viable set
@@ -385,7 +375,7 @@ def render_sort_pills(path, view):
     return ''.join(pieces)
 
 
-def render_tag_filter(tags_map, view, path, filtered_count=None):
+def render_tag_filter(tags_map, view, path, filtered_count=None, lower_index=None):
     """Render tag filter: selected pills + searchable dropdown of viable tags."""
     if not tags_map:
         return ''
@@ -402,7 +392,7 @@ def render_tag_filter(tags_map, view, path, filtered_count=None):
 
     # NOTE: pre-existing behavior preserved below — tag/star pill links drop
     # the current sort and reset to the default (date/desc).
-    viable = _compute_viable_tags(tags_map, view.tags)
+    viable = _compute_viable_tags(lower_index or {}, view.tags)
 
     pieces = ['<div class="tag-filter">']
 
@@ -523,7 +513,7 @@ def render_tag_filter(tags_map, view, path, filtered_count=None):
     return ''.join(pieces)
 
 
-def render_browse_page(data, view, tags_map=None):
+def render_browse_page(data, view, tags_map=None, lower_index=None, thumbs=frozenset()):
     title = f'SimpleParty \u2014 {data["path"].split("/")[-1]}' if data['path'] else 'SimpleParty'
     heading = data['path'].split('/')[-1] if data['path'] else 'Library'
     body = render_nav(data['path'], data.get('encryptedDir'))
@@ -539,8 +529,9 @@ def render_browse_page(data, view, tags_map=None):
     body += render_tag_filter(
         tags_map, view, data['path'],
         filtered_count=len(data['videos']),
+        lower_index=lower_index,
     )
-    body += render_file_list(data, view, tags_map=tags_map)
+    body += render_file_list(data, view, tags_map=tags_map, thumbs=thumbs)
     body += '</div></main>'
     return render_page(title, body)
 
@@ -650,7 +641,7 @@ def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'
     return ''.join(pieces)
 
 
-def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info, view=None, tags_map=None, play_order=None, shuffle_seed=None, transcode_plan=None):
+def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info, view=None, tags_map=None, lower_index=None, thumbs=frozenset(), play_order=None, shuffle_seed=None, transcode_plan=None):
     v = data['videos'][idx]
     video_src = url_for_video(v['path'])
     view = view if view is not None else ViewState(sort='name', direction='asc')
@@ -739,9 +730,9 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         body += f'<div class="video-meta" id="video-meta">{meta_html}</div>'
 
     if tags_map:
-        body += render_related_videos(data, idx, tags_map, view)
+        body += render_related_videos(data, idx, lower_index, view, thumbs)
 
-    body += render_playlist(data, idx, play_order, shuffle_seed, view)
+    body += render_playlist(data, idx, play_order, shuffle_seed, view, thumbs)
     body += '</main>'
 
     sp_data = json.dumps({'next': next_url, 'prev': prev_url, 'browse': browse_url})
