@@ -21,43 +21,15 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
 
+from simpleparty.state import (
+    CONFIG as _config,
+    BROWSER_NATIVE,
+    DOWNLOAD_HISTORY_LIMIT,
+    MIME_TYPES,
+    VIDEO_EXTENSIONS,
+)
+
 logger = logging.getLogger('simpleparty.server')
-
-VIDEO_EXTENSIONS = frozenset({
-    '.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4v', '.ogv',
-})
-
-BROWSER_NATIVE = frozenset({'.mp4', '.webm', '.ogv', '.m4v'})
-
-_config = {
-    'has_ffmpeg': False,
-    'has_vlc': False,
-    'has_ytdlp': False,
-    'allow_delete': True,
-    'allow_transcode': True,
-    'allow_tag': True,
-    'allow_download': False,
-    'tag_jobs': {},  # path -> progress dict
-    'thumb_jobs': set(),  # directories currently generating thumbs
-    'download_queue': None,          # queue.Queue[str], lazy
-    'download_jobs': {},             # job_id -> job dict (see _new_download_job)
-    'download_order': [],            # job_ids in enqueue order, capped
-    'download_lock': threading.Lock(),
-    'download_worker': None,         # threading.Thread, lazy
-    'yt_dlp_format': None,
-}
-
-DOWNLOAD_HISTORY_LIMIT = 20
-
-MIME_TYPES = {
-    '.mp4': 'video/mp4',
-    '.webm': 'video/webm',
-    '.mkv': 'video/x-matroska',
-    '.mov': 'video/quicktime',
-    '.avi': 'video/x-msvideo',
-    '.m4v': 'video/mp4',
-    '.ogv': 'video/ogg',
-}
 
 
 # --- Filesystem ---
