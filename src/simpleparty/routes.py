@@ -48,10 +48,8 @@ from simpleparty.render import (
 )
 from simpleparty.state import CONFIG as _config, BROWSER_NATIVE, MIME_TYPES
 from simpleparty.urls import (
+    ViewState,
     parse_query,
-    parse_sort_params,
-    parse_starred_param,
-    parse_tags_param,
     safe_int,
     url_for_browse,
     url_for_play,
@@ -106,23 +104,18 @@ def handle_browse(handler, root):
         send_html(handler, render_error_page(rel_path, data['error']), status)
     else:
         tags_map = None
-        selected_tags = parse_tags_param(params)
-        starred_only = parse_starred_param(params)
-        sort, direction = parse_sort_params(params)
+        view = ViewState.from_params(params)
         resolved = resolve_path(root, rel_path)
         if _config['allow_tag']:
             from simpleparty.tagger import load_tags
             tags_map = load_tags(resolved)
-            data['videos'] = filter_videos_by_tags(data['videos'], tags_map, selected_tags)
-            data['videos'] = filter_videos_by_starred(data['videos'], tags_map, starred_only)
-        if sort == 'length':
+            data['videos'] = filter_videos_by_tags(data['videos'], tags_map, view.tags)
+            data['videos'] = filter_videos_by_starred(data['videos'], tags_map, view.starred)
+        if view.sort == 'length':
             _populate_durations(root, data['videos'], tags_map, resolved)
-        data['videos'] = sort_videos(data['videos'], sort, direction)
+        data['videos'] = sort_videos(data['videos'], view.sort, view.direction)
         _maybe_start_thumbs(resolved, data['videos'])
-        send_html(handler, render_browse_page(
-            data, tags_map=tags_map, selected_tags=selected_tags,
-            sort=sort, direction=direction, starred_only=starred_only,
-        ))
+        send_html(handler, render_browse_page(data, view, tags_map=tags_map))
 
 
 def handle_play(handler, root):
@@ -134,22 +127,20 @@ def handle_play(handler, root):
         send_html(handler, render_locked_page(dir_path, data['encryptedDir']))
         return
 
-    selected_tags = parse_tags_param(params)
-    starred_only = parse_starred_param(params)
-    sort, direction = parse_sort_params(params)
+    view = ViewState.from_params(params)
     tags_map = None
     resolved = resolve_path(root, dir_path)
     if _config['allow_tag']:
         from simpleparty.tagger import load_tags
         tags_map = load_tags(resolved)
-        data['videos'] = filter_videos_by_tags(data['videos'], tags_map, selected_tags)
-        data['videos'] = filter_videos_by_starred(data['videos'], tags_map, starred_only)
-    if sort == 'length':
+        data['videos'] = filter_videos_by_tags(data['videos'], tags_map, view.tags)
+        data['videos'] = filter_videos_by_starred(data['videos'], tags_map, view.starred)
+    if view.sort == 'length':
         _populate_durations(root, data['videos'], tags_map, resolved)
-    data['videos'] = sort_videos(data['videos'], sort, direction)
+    data['videos'] = sort_videos(data['videos'], view.sort, view.direction)
 
     if 'error' in data or not data.get('videos'):
-        send_redirect(handler, url_for_browse(dir_path, tags=selected_tags, sort=sort, direction=direction, starred=starred_only))
+        send_redirect(handler, url_for_browse(dir_path, view))
         return
 
     n = len(data['videos'])
@@ -172,10 +163,10 @@ def handle_play(handler, root):
                 pos = order.index(idx) if idx in order else pos
         next_pos = (pos + 1) % n
         prev_pos = (pos - 1) % n
-        next_url = url_for_play(dir_path, order[next_pos], shuffle=True, seed=seed, pos=next_pos, tags=selected_tags, video=data['videos'][order[next_pos]]['name'], sort=sort, direction=direction, starred=starred_only)
-        prev_url = url_for_play(dir_path, order[prev_pos], shuffle=True, seed=seed, pos=prev_pos, tags=selected_tags, video=data['videos'][order[prev_pos]]['name'], sort=sort, direction=direction, starred=starred_only)
+        next_url = url_for_play(dir_path, order[next_pos], view, shuffle=True, seed=seed, pos=next_pos, video=data['videos'][order[next_pos]]['name'])
+        prev_url = url_for_play(dir_path, order[prev_pos], view, shuffle=True, seed=seed, pos=prev_pos, video=data['videos'][order[prev_pos]]['name'])
         pos_info = f'{pos + 1}/{n}'
-        shuffle_url = url_for_play(dir_path, idx, tags=selected_tags, video=data['videos'][idx]['name'], sort=sort, direction=direction, starred=starred_only)
+        shuffle_url = url_for_play(dir_path, idx, view, video=data['videos'][idx]['name'])
         play_order = order
         shuffle_seed = seed
     else:
@@ -185,17 +176,17 @@ def handle_play(handler, root):
         idx = found if found is not None else max(0, min(idx_param, n - 1))
         next_idx = (idx + 1) % n
         prev_idx = (idx - 1) % n
-        next_url = url_for_play(dir_path, next_idx, tags=selected_tags, video=data['videos'][next_idx]['name'], sort=sort, direction=direction, starred=starred_only)
-        prev_url = url_for_play(dir_path, prev_idx, tags=selected_tags, video=data['videos'][prev_idx]['name'], sort=sort, direction=direction, starred=starred_only)
+        next_url = url_for_play(dir_path, next_idx, view, video=data['videos'][next_idx]['name'])
+        prev_url = url_for_play(dir_path, prev_idx, view, video=data['videos'][prev_idx]['name'])
         pos_info = f'{idx + 1}/{n}'
         shuffle_params = {'path': dir_path, 'shuffle': '1'}
-        if selected_tags:
-            shuffle_params['tags'] = ','.join(selected_tags)
-        if sort and sort != 'name':
-            shuffle_params['sort'] = sort
-        if direction and direction != 'asc':
-            shuffle_params['dir'] = direction
-        if starred_only:
+        if view.tags:
+            shuffle_params['tags'] = ','.join(view.tags)
+        if view.sort and view.sort != 'name':
+            shuffle_params['sort'] = view.sort
+        if view.direction and view.direction != 'asc':
+            shuffle_params['dir'] = view.direction
+        if view.starred:
             shuffle_params['starred'] = '1'
         shuffle_url = '/play?' + urllib.parse.urlencode(shuffle_params)
 
@@ -210,7 +201,7 @@ def handle_play(handler, root):
         except OSError:
             pass
 
-    send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info, tags_map=tags_map, selected_tags=selected_tags, play_order=play_order, shuffle_seed=shuffle_seed, transcode_plan=transcode_plan, sort=sort, direction=direction, starred_only=starred_only))
+    send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info, view, tags_map=tags_map, play_order=play_order, shuffle_seed=shuffle_seed, transcode_plan=transcode_plan))
 
 
 def handle_video(handler, root):
