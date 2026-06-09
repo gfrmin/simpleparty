@@ -38,6 +38,7 @@ from simpleparty.library import (
     shuffle_indices,
     sort_videos,
 )
+from simpleparty import jobs
 from simpleparty.urls import (
     parse_query,
     parse_sort_params,
@@ -458,7 +459,7 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
             resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
             has_model = _model_path(resolved_dir).exists() if resolved_dir.is_dir() else False
             resolved_str = str(resolved_dir)
-            job = _config['tag_jobs'].get(resolved_str)
+            job = jobs.get_tag_job(resolved_str)
             is_busy = bool(job and job.get('running'))
             tag_html = _render_train_btn(path_param, is_busy)
             if has_model:
@@ -1427,7 +1428,7 @@ def _generate_thumbnails(directory, videos):
 
         logger.debug('thumbnail generation done for %s (%.1fs)', directory, time.monotonic() - t0)
     finally:
-        _config['thumb_jobs'].discard(str(directory))
+        jobs.thumb_jobs.discard(str(directory))
 
 
 def _maybe_start_thumbs(directory, videos):
@@ -1435,7 +1436,7 @@ def _maybe_start_thumbs(directory, videos):
     if not _config['has_ffmpeg'] or not videos:
         return
     dir_str = str(directory)
-    if dir_str in _config['thumb_jobs']:
+    if dir_str in jobs.thumb_jobs:
         return
     from simpleparty.tagger import FRAMES_DIR, thumb_path
     frames_dir = Path(directory) / FRAMES_DIR
@@ -1446,7 +1447,7 @@ def _maybe_start_thumbs(directory, videos):
     missing = any(_needs_work(v['name']) for v in videos)
     if not missing:
         return
-    _config['thumb_jobs'].add(dir_str)
+    jobs.thumb_jobs.add(dir_str)
     logger.debug('starting background thumbnail thread for %s (%d videos to check)',
                  directory, len(videos))
     t = threading.Thread(
@@ -1455,133 +1456,6 @@ def _maybe_start_thumbs(directory, videos):
         daemon=True,
     )
     t.start()
-
-
-# --- Download queue ---
-
-def _new_download_job(job_id, url, target_dir, target_rel):
-    return {
-        'id': job_id,
-        'url': url,
-        'target_dir': target_dir,
-        'target_rel': target_rel,
-        'state': 'queued',
-        'running': False,
-        'status': '',
-        'phase': 'queued',
-        'enqueued_at': time.time(),
-        'started_at': None,
-        'finished_at': None,
-        'title': '',
-        'filename': '',
-        'downloaded_bytes': 0,
-        'total_bytes': 0,
-        'percent': 0,
-        'speed': None,
-        'eta': None,
-        'final_path': None,
-        'final_name': None,
-        'play_dir': None,
-        'play_name': None,
-        'error': None,
-    }
-
-
-def _evict_download_history():
-    """Trim non-running jobs beyond the history limit (oldest first)."""
-    order = _config['download_order']
-    jobs = _config['download_jobs']
-    non_running = [jid for jid in order if not jobs.get(jid, {}).get('running')]
-    excess = len(non_running) - DOWNLOAD_HISTORY_LIMIT
-    if excess <= 0:
-        return
-    to_drop = set(non_running[:excess])
-    _config['download_order'] = [jid for jid in order if jid not in to_drop]
-    for jid in to_drop:
-        jobs.pop(jid, None)
-
-
-def _finalize_download_job(job, root):
-    """After a download ends, compute play/browse links if final file is in root."""
-    final = job.get('final_path')
-    if not final:
-        return
-    try:
-        rel = Path(final).resolve().relative_to(Path(root).resolve())
-    except (ValueError, OSError):
-        return
-    if not Path(final).exists() or not is_video(Path(final).name):
-        return
-    rel_str = str(rel)
-    if '/' in rel_str:
-        parent, name = rel_str.rsplit('/', 1)
-    else:
-        parent, name = '', rel_str
-    job['play_dir'] = parent
-    job['play_name'] = name
-
-
-def _download_worker_loop(root):
-    from simpleparty.downloader import download_video
-    q = _config['download_queue']
-    while True:
-        job_id = q.get()
-        with _config['download_lock']:
-            job = _config['download_jobs'].get(job_id)
-        if not job:
-            continue
-        if job.get('state') == 'cancelled':
-            continue
-        job['state'] = 'running'
-        job['started_at'] = time.time()
-        try:
-            download_video(
-                job['url'], job['target_dir'], job,
-                format_str=_config.get('yt_dlp_format'),
-            )
-            if job.get('cancel_requested'):
-                job['state'] = 'cancelled'
-                job.pop('error', None)
-            elif job.get('error'):
-                job['state'] = 'error'
-            else:
-                job['state'] = 'done'
-        except Exception as e:
-            logger.exception('download worker: unexpected failure')
-            job['error'] = str(e) or e.__class__.__name__
-            job['state'] = 'error'
-        finally:
-            job['running'] = False
-            job['finished_at'] = time.time()
-            if job.get('state') != 'cancelled':
-                _finalize_download_job(job, root)
-
-
-def _ensure_download_worker(root):
-    """Create queue + daemon worker on first use."""
-    with _config['download_lock']:
-        if _config['download_queue'] is None:
-            _config['download_queue'] = queue.Queue()
-        if _config['download_worker'] is None or not _config['download_worker'].is_alive():
-            t = threading.Thread(
-                target=_download_worker_loop,
-                args=(root,),
-                daemon=True,
-            )
-            _config['download_worker'] = t
-            t.start()
-
-
-def _snapshot_download_jobs():
-    with _config['download_lock']:
-        order = list(_config['download_order'])
-        jobs = {jid: dict(_config['download_jobs'][jid])
-                for jid in order if jid in _config['download_jobs']}
-    return order, jobs
-
-
-def _any_download_running(jobs):
-    return any(j.get('running') for j in jobs.values())
 
 
 def render_download_form(target_rel='', *, autofocus=False):
@@ -1717,13 +1591,13 @@ def render_download_status(path_filter=None):
     inline panel on the browse page. Without it, returns the full board for
     the dedicated page.
     """
-    order, jobs = _snapshot_download_jobs()
-    running = _any_download_running(jobs)
+    order, jobs_map = jobs.snapshot_download_jobs()
+    running = jobs.any_download_running(jobs_map)
     poll = 'every 1s' if running else 'every 10s'
 
     if path_filter is not None:
-        scoped = [jobs[jid] for jid in order
-                  if jobs[jid].get('target_rel') == path_filter]
+        scoped = [jobs_map[jid] for jid in order
+                  if jobs_map[jid].get('target_rel') == path_filter]
         active = [j for j in scoped if j.get('state') in ('queued', 'running')]
         inner = ''
         if active:
@@ -1750,10 +1624,10 @@ def render_download_status(path_filter=None):
         )
 
     # Full board
-    active = [jobs[jid] for jid in order if jobs[jid].get('state') == 'running']
-    queued = [jobs[jid] for jid in order if jobs[jid].get('state') == 'queued']
-    finished = [jobs[jid] for jid in order
-                if jobs[jid].get('state') in ('done', 'error', 'cancelled')]
+    active = [jobs_map[jid] for jid in order if jobs_map[jid].get('state') == 'running']
+    queued = [jobs_map[jid] for jid in order if jobs_map[jid].get('state') == 'queued']
+    finished = [jobs_map[jid] for jid in order
+                if jobs_map[jid].get('state') in ('done', 'error', 'cancelled')]
     finished.reverse()  # most recent first
 
     pieces = []
@@ -2101,13 +1975,13 @@ def handle_train(handler, root):
         return
 
     resolved_str = str(resolved)
-    existing = _config['tag_jobs'].get(resolved_str)
+    existing = jobs.get_tag_job(resolved_str)
     if existing and existing.get('running'):
         send_hx_redirect(handler, url_for_browse(rel_path))
         return
 
     progress = {'running': True, 'done': 0, 'total': 0, 'current': '', 'phase': 'preparing'}
-    _config['tag_jobs'][resolved_str] = progress
+    jobs.set_tag_job(resolved_str, progress)
 
     t = threading.Thread(
         target=train,
@@ -2140,13 +2014,13 @@ def handle_suggest(handler, root):
         return
 
     resolved_str = str(resolved)
-    existing = _config['tag_jobs'].get(resolved_str)
+    existing = jobs.get_tag_job(resolved_str)
     if existing and existing.get('running'):
         send_hx_redirect(handler, url_for_browse(rel_path))
         return
 
     progress = {'running': True, 'done': 0, 'total': 0, 'current': '', 'phase': 'suggesting'}
-    _config['tag_jobs'][resolved_str] = progress
+    jobs.set_tag_job(resolved_str, progress)
 
     t = threading.Thread(
         target=suggest_for_directory,
@@ -2334,7 +2208,7 @@ def handle_tag_status(handler, root):
     status_url = f'/tag-status?{urllib.parse.urlencode({"path": rel_path})}'
     path_param = esc(rel_path)
 
-    progress = _config['tag_jobs'].get(resolved)
+    progress = jobs.get_tag_job(resolved)
 
     # OOB swap to keep train button in sync
     def train_btn_oob(busy):
@@ -2523,13 +2397,13 @@ def handle_download_submit(handler, root):
         return
 
     job_id = uuid.uuid4().hex
-    job = _new_download_job(job_id, url, str(resolved), rel_path)
-    with _config['download_lock']:
-        _config['download_jobs'][job_id] = job
-        _config['download_order'].append(job_id)
-        _evict_download_history()
-    _ensure_download_worker(root)
-    _config['download_queue'].put(job_id)
+    job = jobs.new_download_job(job_id, url, str(resolved), rel_path)
+    with jobs.download_lock:
+        jobs.download_jobs[job_id] = job
+        jobs.download_order.append(job_id)
+        jobs.evict_download_history()
+    jobs.ensure_download_worker(root)
+    jobs.download_queue.put(job_id)
 
     send_hx_redirect(handler, redirect_url or '/download')
 
@@ -2554,8 +2428,8 @@ def handle_download_cancel(handler, root):
         return
     form = read_form_body(handler)
     job_id = form.get('id', '')
-    with _config['download_lock']:
-        job = _config['download_jobs'].get(job_id)
+    with jobs.download_lock:
+        job = jobs.download_jobs.get(job_id)
         if job and job.get('state') == 'queued':
             job['state'] = 'cancelled'
             job['finished_at'] = time.time()
@@ -2569,15 +2443,13 @@ def handle_download_clear(handler, root):
     if not _config['allow_download']:
         handler.send_error(403, 'Download disabled')
         return
-    with _config['download_lock']:
-        jobs = _config['download_jobs']
-        order = _config['download_order']
-        keep = [jid for jid in order
-                if jobs.get(jid, {}).get('state') in ('queued', 'running')]
-        dropped = [jid for jid in order if jid not in keep]
+    with jobs.download_lock:
+        keep = [jid for jid in jobs.download_order
+                if jobs.download_jobs.get(jid, {}).get('state') in ('queued', 'running')]
+        dropped = [jid for jid in jobs.download_order if jid not in keep]
         for jid in dropped:
-            jobs.pop(jid, None)
-        _config['download_order'] = keep
+            jobs.download_jobs.pop(jid, None)
+        jobs.download_order = keep
     send_hx_redirect(handler, '/download')
 
 
