@@ -34,6 +34,14 @@ _LEGACY_MODEL = '.simpleparty-model.pt'
 _tags_cache = {}        # str(dir) -> (stat_key, tags_dict, lower_index)
 _tags_cache_lock = threading.Lock()
 _dir_write_locks = {}   # str(dir) -> threading.Lock, created under _tags_cache_lock
+_TAGS_CACHE_MAX = 64    # directories; parsed maps can be large
+
+
+def _tags_cache_put(key, value):
+    """Insert under _tags_cache_lock with oldest-first eviction."""
+    _tags_cache[key] = value
+    while len(_tags_cache) > _TAGS_CACHE_MAX:
+        _tags_cache.pop(next(iter(_tags_cache)))
 
 
 def _sp_dir(directory_path):
@@ -96,7 +104,7 @@ def load_tags_index(directory_path):
             tags = {}
     index = _build_lower_index(tags)
     with _tags_cache_lock:
-        _tags_cache[key] = (stat_key, tags, index)
+        _tags_cache_put(key, (stat_key, tags, index))
     return tags, index
 
 
@@ -118,9 +126,9 @@ def save_tags(directory_path, tags):
             pass
         raise
     with _tags_cache_lock:
-        _tags_cache[str(Path(directory_path))] = (
+        _tags_cache_put(str(Path(directory_path)), (
             _stat_key(tags_file), tags, _build_lower_index(tags),
-        )
+        ))
 
 
 def _write_lock(directory_path):
@@ -148,14 +156,35 @@ def update_tags(directory_path, transform):
         return updated
 
 
+_thumbs_cache = {}  # str(thumbs dir) -> (mtime_ns, frozenset of names)
+_thumbs_cache_lock = threading.Lock()
+_THUMBS_CACHE_MAX = 64
+
+
 def list_thumbs(directory_path):
-    """Names of videos with a thumbnail — one scandir, no per-file stats."""
+    """Names of videos with a thumbnail. Cached on the thumbs directory's
+    mtime (writing a thumbnail bumps it), so repeat requests — e.g. each
+    pagination fragment — cost one stat instead of a scandir."""
     thumbs_dir = Path(directory_path) / SIMPLEPARTY_DIR / THUMB_DIR
     try:
-        with os.scandir(thumbs_dir) as it:
-            return frozenset(e.name[:-4] for e in it if e.name.endswith('.jpg'))
+        mtime_ns = os.stat(thumbs_dir).st_mtime_ns
     except OSError:
         return frozenset()
+    key = str(thumbs_dir)
+    with _thumbs_cache_lock:
+        cached = _thumbs_cache.get(key)
+        if cached and cached[0] == mtime_ns:
+            return cached[1]
+    try:
+        with os.scandir(thumbs_dir) as it:
+            names = frozenset(e.name[:-4] for e in it if e.name.endswith('.jpg'))
+    except OSError:
+        return frozenset()
+    with _thumbs_cache_lock:
+        _thumbs_cache[key] = (mtime_ns, names)
+        while len(_thumbs_cache) > _THUMBS_CACHE_MAX:
+            _thumbs_cache.pop(next(iter(_thumbs_cache)))
+    return names
 
 
 def videos_with_frames(directory_path):

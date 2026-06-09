@@ -69,6 +69,14 @@ def url_for_play(dir_path, idx, view=None, *, video=None, shuffle=False, seed=No
     return '/play?' + urllib.parse.urlencode(params)
 
 
+def url_for_shuffle(dir_path, view=None):
+    """Entry URL for shuffle play of a directory, preserving the view."""
+    params = {'path': dir_path, 'shuffle': '1'}
+    if view is not None:
+        params.update(view.query_params())
+    return '/play?' + urllib.parse.urlencode(params)
+
+
 def url_for_video(path):
     return '/video/' + '/'.join(urllib.parse.quote(p, safe='') for p in path.split('/'))
 
