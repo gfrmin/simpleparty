@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "simpleparty"
-version = "0.9.6"
+version = "0.9.7"
 description = "Easily enjoy your private video collection"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -31,6 +31,9 @@ download = ["yt-dlp"]
 
 [project.scripts]
 simpleparty = "simpleparty.server:main"
+
+[tool.setuptools.package-data]
+simpleparty = ["static/*"]
 
 [dependency-groups]
 dev = [

@@ -257,3 +257,18 @@ def test_tag_status(srv):
     status, _, body = request(srv, 'GET', '/tag-status?path=')
     assert status == 200
     assert 'tag-progress' in body.decode()
+
+
+# --- Static assets ---
+
+def test_static_css(srv):
+    status, headers, body = request(srv, 'GET', '/static/style.css')
+    assert status == 200
+    assert headers['Content-Type'].startswith('text/css')
+    assert headers['Cache-Control'] == 'public, max-age=3600'
+    assert b'#file-list' in body
+
+
+def test_static_unknown_404(srv):
+    status, _, _ = request(srv, 'GET', '/static/nope.css')
+    assert status == 404

@@ -1,5 +1,6 @@
 """HTTP route handlers and response helpers."""
 
+import importlib.resources
 import logging
 import os
 import random
@@ -865,6 +866,46 @@ def handle_download_clear(handler, root):
     send_hx_redirect(handler, '/download')
 
 
+# --- Static assets ---
+
+_STATIC_MIME = {
+    '.css': 'text/css; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8',
+}
+
+
+def _load_static():
+    """Read packaged static assets once at import (works from wheels/zipapps)."""
+    base = importlib.resources.files('simpleparty') / 'static'
+    out = {}
+    for entry in base.iterdir():
+        if entry.is_file():
+            suffix = Path(entry.name).suffix
+            mime = _STATIC_MIME.get(suffix, 'application/octet-stream')
+            out[entry.name] = (entry.read_bytes(), mime)
+    return out
+
+
+_STATIC = _load_static()
+
+
+def handle_static(handler, root):
+    """Serve a packaged asset from the preloaded dict (no filesystem access)."""
+    name = urllib.parse.urlparse(handler.path).path[len('/static/'):]
+    item = _STATIC.get(name)
+    if item is None:
+        handler.send_error(404)
+        return
+    body, ctype = item
+    handler.send_response(200)
+    handler.send_header('Content-Type', ctype)
+    handler.send_header('Content-Length', str(len(body)))
+    handler.send_header('Cache-Control', 'public, max-age=3600')
+    handler.end_headers()
+    if handler.command != 'HEAD':
+        handler.wfile.write(body)
+
+
 # --- Dispatch ---
 
 GET_ROUTES = {
@@ -879,6 +920,7 @@ GET_ROUTES = {
 GET_PREFIXES = (
     ('/video/', handle_video),
     ('/thumb/', handle_thumb),
+    ('/static/', handle_static),
 )
 
 POST_ROUTES = {
