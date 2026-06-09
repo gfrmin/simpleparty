@@ -15,6 +15,7 @@ from pathlib import Path
 from simpleparty import jobs
 from simpleparty.library import (
     durations_from_tags,
+    is_safe_rel_path,
     filter_videos_by_starred,
     filter_videos_by_tags,
     find_video_idx,
@@ -261,6 +262,9 @@ def handle_play(handler, root):
 def handle_video(handler, root):
     parsed = urllib.parse.urlparse(handler.path)
     rel_path = urllib.parse.unquote(parsed.path[len('/video/'):])
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(404)
+        return
     resolved = resolve_path(root, rel_path)
 
     if not resolved.is_file():
@@ -293,6 +297,7 @@ def handle_video(handler, root):
             if start > end or start >= file_size:
                 handler.send_response(416)
                 handler.send_header('Content-Range', f'bytes */{file_size}')
+                handler.send_header('Content-Length', '0')
                 handler.end_headers()
                 return
             length = end - start + 1
@@ -322,6 +327,9 @@ def handle_delete(handler, root):
     form = read_form_body(handler)
     rel_path = form.get('path', '')
     redirect_url = form.get('redirect')
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return
     resolved = resolve_path(root, rel_path)
     if not resolved.is_file() or not is_video(resolved.name):
         handler.send_error(400, 'Invalid video path')
@@ -364,6 +372,9 @@ def handle_delete_by_tag(handler, root):
     if not selected_tags:
         handler.send_error(400, 'No tags specified')
         return
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return
     resolved_dir = resolve_path(root, rel_path)
     if not resolved_dir.is_dir():
         handler.send_error(400, 'Not a directory')
@@ -403,6 +414,9 @@ def handle_unlock(handler, root):
     encrypted_path = form.get('path', '')
     passphrase = form.get('passphrase', '')
     redirect_url = form.get('redirect', url_for_browse(encrypted_path))
+    if not is_safe_rel_path(encrypted_path):
+        handler.send_error(400, 'Invalid path')
+        return
     resolved = resolve_path(root, encrypted_path)
     ok, msg = fscrypt_unlock(resolved, passphrase)
     del passphrase
@@ -416,6 +430,9 @@ def handle_lock(handler, root):
     form = read_form_body(handler)
     path = form.get('path', '')
     redirect_url = form.get('redirect', url_for_browse(''))
+    if not is_safe_rel_path(path):
+        handler.send_error(400, 'Invalid path')
+        return
     resolved = resolve_path(root, path)
     fscrypt_lock(resolved)
     send_hx_redirect(handler, redirect_url)
@@ -430,6 +447,9 @@ def handle_train(handler, root):
     form = read_form_body(handler)
     rel_path = form.get('path', '')
     max_frames = int(form.get('frames', '1'))
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return
     resolved = resolve_path(root, rel_path)
     if not resolved.is_dir():
         handler.send_error(400, 'Not a directory')
@@ -463,6 +483,9 @@ def handle_suggest(handler, root):
 
     form = read_form_body(handler)
     rel_path = form.get('path', '')
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return
     resolved = resolve_path(root, rel_path)
     if not resolved.is_dir():
         handler.send_error(400, 'Not a directory')
@@ -504,6 +527,9 @@ def handle_suggest_one(handler, root):
     form = read_form_body(handler)
     rel_path = form.get('path', '')
     video_name = form.get('video', '')
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return
     resolved = resolve_path(root, rel_path)
 
     if not resolved.is_dir() or not video_name:
@@ -515,6 +541,9 @@ def handle_suggest_one(handler, root):
         handler.send_error(400, 'No trained model found. Train first.')
         return
 
+    if Path(video_name).name != video_name:
+        handler.send_error(400, 'Invalid request')
+        return
     video_path = resolved / video_name
     if not video_path.exists():
         handler.send_error(404, 'Video not found')
@@ -547,6 +576,9 @@ def handle_confirm_tags(handler, root):
     form = read_form_body(handler)
     rel_path = form.get('path', '')
     video_name = form.get('video', '')
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return
     resolved = resolve_path(root, rel_path)
 
     if not resolved.is_dir() or not video_name:
@@ -571,6 +603,9 @@ def handle_confirm_all(handler, root):
 
     form = read_form_body(handler)
     rel_path = form.get('path', '')
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return
     resolved = resolve_path(root, rel_path)
 
     if not resolved.is_dir():
@@ -600,6 +635,9 @@ def handle_reject_tags(handler, root):
     form = read_form_body(handler)
     rel_path = form.get('path', '')
     video_name = form.get('video', '')
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return
     resolved = resolve_path(root, rel_path)
 
     if not resolved.is_dir() or not video_name:
@@ -629,6 +667,9 @@ def handle_reject_tag(handler, root):
     rel_path = form.get('path', '')
     video_name = form.get('video', '')
     tag = form.get('tag', '')
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return
     resolved = resolve_path(root, rel_path)
 
     if not resolved.is_dir() or not video_name or not tag:
@@ -747,6 +788,9 @@ def handle_save_tags(handler, root):
     video_name = form.get('video', '')
     raw_tags = form.get('tags', '')
 
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return
     resolved = resolve_path(root, rel_path)
     if not resolved.is_dir() or not video_name:
         handler.send_error(400, 'Invalid request')
@@ -780,11 +824,14 @@ def handle_star_update(handler, root):
         handler.send_error(400, 'Missing video name')
         return
 
+    if not is_safe_rel_path(rel_dir):
+        handler.send_error(404, 'Directory not found')
+        return
     resolved = resolve_path(root, rel_dir)
     if not resolved.is_dir():
         handler.send_error(404, 'Directory not found')
         return
-    if not (resolved / video_name).exists():
+    if Path(video_name).name != video_name or not (resolved / video_name).exists():
         handler.send_error(404, 'Video not found')
         return
 
@@ -800,7 +847,7 @@ def handle_thumb(handler, root):
     raw = urllib.parse.urlparse(handler.path).path
     rel = raw[len('/thumb/'):]  # strip prefix
     rel = urllib.parse.unquote(rel)
-    if not rel:
+    if not rel or not is_safe_rel_path(rel):
         handler.send_error(404)
         return
     # rel is "dir/subdir/video.mp4" — thumb is at dir/subdir/.simpleparty/thumbs/video.mp4.jpg
@@ -844,6 +891,9 @@ def handle_download_submit(handler, root):
         handler.send_error(400, str(e))
         return
 
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return
     resolved = resolve_path(root, rel_path)
     if not is_path_within(root, resolved) or not resolved.is_dir():
         handler.send_error(400, 'Invalid target directory')

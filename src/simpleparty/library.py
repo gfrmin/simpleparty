@@ -24,6 +24,16 @@ def resolve_path(root, relative):
     return (Path(root) / relative).resolve()
 
 
+def is_safe_rel_path(relative):
+    """True if a request-supplied path stays inside the served root
+    lexically: relative, with no '..' components. Symlinks inside the
+    tree are still followed by resolve_path()."""
+    if not relative:
+        return True
+    p = Path(relative)
+    return not p.is_absolute() and '..' not in p.parts
+
+
 # Directory scans cached on the directory's mtime_ns: creates, deletes, and
 # renames bump it, so cache hits skip the listdir and the per-file stats.
 # In-place file modifications don't bump it; sizes/mtimes can briefly lag.
@@ -58,6 +68,8 @@ def scan_directory(resolved):
 
 def list_directory(root, rel_path):
     """List directory contents. Returns dict with dirs, videos, or error/locked."""
+    if not is_safe_rel_path(rel_path):
+        return {'error': 'Not found'}
     resolved = resolve_path(root, rel_path)
 
     if not resolved.exists():

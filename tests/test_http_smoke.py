@@ -124,17 +124,44 @@ def test_browse_starred_filter(srv):
     assert 'b.mp4' not in text
 
 
-def test_browse_parent_traversal(srv, media_root):
-    # CHARACTERIZATION, NOT ENDORSEMENT: resolve_path() does not constrain
-    # paths to the served root, so ../<sibling> resolves outside it. Today a
-    # nonexistent sibling yields 404; an existing one would be served. If
-    # root containment is ever enforced, update this test.
+def test_browse_parent_traversal_blocked(srv, media_root):
+    # Request paths may not escape the served root: an existing sibling
+    # directory must 404 rather than be listed.
     sibling = media_root.parent / 'outside'
     sibling.mkdir()
     (sibling / 'leak.mp4').write_bytes(b'\x00' * 64)
     status, _, body = request(srv, 'GET', '/browse?path=../outside')
-    assert status == 200
-    assert 'leak.mp4' in body.decode()
+    assert status == 404
+    assert 'leak.mp4' not in body.decode()
+
+
+def test_video_parent_traversal_blocked(srv, media_root):
+    sibling = media_root.parent / 'outside2'
+    sibling.mkdir()
+    (sibling / 'leak.mp4').write_bytes(b'\x00' * 64)
+    status, _, _ = request(srv, 'GET', '/video/../outside2/leak.mp4')
+    assert status == 404
+    status, _, _ = request(srv, 'GET', '/video/%2e%2e/outside2/leak.mp4')
+    assert status == 404
+
+
+def test_delete_parent_traversal_blocked(srv, media_root):
+    victim = media_root.parent / 'victim.mp4'
+    victim.write_bytes(b'\x00' * 64)
+    status, _, _ = post_form(srv, '/delete', {'path': '../victim.mp4'})
+    assert status == 400
+    assert victim.exists()
+
+
+def test_star_update_name_traversal_blocked(srv, media_root):
+    victim = media_root.parent / 'victim2.mp4'
+    victim.write_bytes(b'\x00' * 64)
+    status, _, _ = post_form(
+        srv, '/star-update', {'dir': '', 'name': '../victim2.mp4', 'starred': '1'},
+    )
+    assert status == 404
+    on_disk = json.loads((media_root / '.simpleparty' / 'tags.json').read_text())
+    assert '../victim2.mp4' not in on_disk
 
 
 # --- Play ---
@@ -175,14 +202,14 @@ def test_video_range(srv):
 
 
 def test_video_range_out_of_bounds(srv):
-    # The 416 response carries no Content-Length, so a keep-alive client
-    # would block waiting for a body; ask the server to close instead.
+    # Must carry Content-Length: 0 so keep-alive clients don't block
+    # waiting for a body (regression test: this used to hang).
     status, headers, _ = request(
-        srv, 'GET', '/video/a.mp4',
-        headers={'Range': 'bytes=5000-', 'Connection': 'close'},
+        srv, 'GET', '/video/a.mp4', headers={'Range': 'bytes=5000-'},
     )
     assert status == 416
     assert headers['Content-Range'] == 'bytes */1024'
+    assert headers['Content-Length'] == '0'
 
 
 def test_video_head(srv):
