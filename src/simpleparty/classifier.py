@@ -547,8 +547,22 @@ def suggest_for_directory(directory, model_path, progress=None, max_frames=1, ma
         progress['running'] = False
 
 
+_SUGGEST_FLUSH_COUNT = 10
+_SUGGEST_FLUSH_SECONDS = 60
+
+
+def _merge_suggestions(pending):
+    """Transform that overwrites only its own suggestion entries, so tag/star
+    edits made while the job runs are preserved."""
+    def _apply(tags):
+        for name, fields in pending.items():
+            tags[name] = {**tags.get(name, {}), **fields}
+        return tags
+    return _apply
+
+
 def _suggest_inner(directory, model_path, progress, max_frames, max_tags):
-    from simpleparty.tagger import untagged_videos
+    from simpleparty.tagger import untagged_videos, update_tags
 
     tags_data = load_tags(directory)
     videos = untagged_videos(directory, tags_data)
@@ -558,22 +572,37 @@ def _suggest_inner(directory, model_path, progress, max_frames, max_tags):
     progress['done'] = 0
     progress['running'] = True
 
-    for video_name in videos:
-        progress['current'] = video_name
-        video_path = Path(directory) / video_name
+    # Batch suggestions instead of rewriting the whole tags file per video.
+    pending = {}
+    last_flush = time.monotonic()
 
-        results = suggest_for_video(str(video_path), model_path, max_frames=max_frames, max_tags=max_tags)
+    def flush():
+        nonlocal pending, last_flush
+        if pending:
+            update_tags(directory, _merge_suggestions(pending))
+            pending = {}
+        last_flush = time.monotonic()
 
-        if results:
-            avg_conf = sum(c for _, c in results) / len(results)
-            entry = tags_data.get(video_name, {})
-            entry['tags'] = [tag for tag, _ in results]
-            entry['status'] = 'suggested'
-            entry['confidence'] = round(avg_conf, 3)
-            tags_data[video_name] = entry
-            save_tags(directory, tags_data)
+    try:
+        for video_name in videos:
+            progress['current'] = video_name
+            video_path = Path(directory) / video_name
 
-        progress['done'] += 1
+            results = suggest_for_video(str(video_path), model_path, max_frames=max_frames, max_tags=max_tags)
+
+            if results:
+                avg_conf = sum(c for _, c in results) / len(results)
+                pending[video_name] = {
+                    'tags': [tag for tag, _ in results],
+                    'status': 'suggested',
+                    'confidence': round(avg_conf, 3),
+                }
+            if len(pending) >= _SUGGEST_FLUSH_COUNT or time.monotonic() - last_flush > _SUGGEST_FLUSH_SECONDS:
+                flush()
+
+            progress['done'] += 1
+    finally:
+        flush()
 
     progress['running'] = False
     progress['current'] = ''

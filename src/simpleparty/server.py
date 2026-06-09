@@ -2,122 +2,26 @@
 """SimpleParty - Easily enjoy your private video collection."""
 
 import argparse
-import json
 import logging
-import os
-import queue
-import random
-import re
 import shutil
-import subprocess
 import sys
-import threading
-import time
 import urllib.parse
-import uuid
 from functools import partial
-from html import escape as esc
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
 
-from simpleparty.library import (
-    _compute_related_videos,
-    durations_from_tags,
-    filter_videos_by_starred,
-    filter_videos_by_tags,
-    find_encrypted_ancestor,
-    find_locked_ancestor,
-    find_video_idx,
-    fscrypt_lock,
-    fscrypt_unlock,
-    get_fscrypt_status,
-    is_video,
-    list_directory,
-    resolve_path,
-    shuffle_indices,
-    sort_videos,
-)
-from simpleparty import jobs
 from simpleparty.routes import (
     GET_PREFIXES,
     GET_ROUTES,
     POST_ROUTES,
     dispatch,
-    handle_browse,
-    handle_confirm_all,
-    handle_confirm_tags,
-    handle_delete,
-    handle_delete_by_tag,
-    handle_download_cancel,
-    handle_download_clear,
-    handle_download_page,
-    handle_download_status,
-    handle_download_submit,
-    handle_lock,
-    handle_play,
-    handle_reject_tag,
-    handle_reject_tags,
-    handle_save_tags,
-    handle_star_update,
-    handle_suggest,
-    handle_suggest_one,
-    handle_tag_status,
-    handle_thumb,
-    handle_train,
-    handle_unlock,
     handle_video,
-    read_form_body,
-    send_hx_redirect,
-    send_html,
-    send_redirect,
 )
-from simpleparty.render import (
-    _render_train_btn,
-    fmt_size,
-    render_browse_page,
-    render_download_form,
-    render_download_page,
-    render_download_status,
-    render_error_page,
-    render_file_list,
-    render_locked_page,
-    render_page,
-    render_play_page,
-    render_video_tags_inline,
-)
-from simpleparty.media import (
-    _is_mpegts,
-    _maybe_start_thumbs,
-    _probe_streams,
-    _remux_mpegts,
-    _serve_transcoded,
-    _stream_file,
-    _stream_range,
-    _transcode_plan,
-)
-from simpleparty.urls import (
-    parse_query,
-    parse_sort_params,
-    parse_starred_param,
-    parse_tags_param,
-    safe_int,
-    url_for_browse,
-    url_for_play,
-    url_for_video,
-)
-from simpleparty.state import (
-    CONFIG as _config,
-    BROWSER_NATIVE,
-    DOWNLOAD_HISTORY_LIMIT,
-    MIME_TYPES,
-    VIDEO_EXTENSIONS,
-)
+from simpleparty.state import CONFIG as _config
 
 logger = logging.getLogger('simpleparty.server')
 
-
-# --- Server ---
 
 class RequestHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -161,15 +65,19 @@ def main():
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.WARNING,
-        format='%(asctime)s %(name)s %(message)s',
-        datefmt='%H:%M:%S',
-    )
+    if args.debug:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='%(asctime)s %(name)s %(message)s',
+            datefmt='%H:%M:%S',
+        )
+    else:
+        # Plain messages so the startup banner stays clean
+        logging.basicConfig(level=logging.INFO, format='%(message)s')
 
     root = str(Path(args.root).resolve())
     if not Path(root).is_dir():
-        print(f'Error: {root} is not a directory', file=sys.stderr)
+        logger.error('Error: %s is not a directory', root)
         raise SystemExit(1)
 
     _config['has_ffmpeg'] = shutil.which('ffmpeg') is not None
@@ -215,19 +123,19 @@ def main():
 
     from simpleparty import __version__
     url = f'http://{args.bind}:{args.port}'
-    print(f'SimpleParty {__version__} serving {root}')
-    print(f'  {url}')
+    logger.info('SimpleParty %s serving %s', __version__, root)
+    logger.info('  %s', url)
     if features:
-        print(f'  [{", ".join(features)}]')
+        logger.info('  [%s]', ', '.join(features))
     if _config['allow_tag'] and not has_torch:
-        print(f'  To train a tagger: uvx simpleparty[classifier]=={__version__}')
+        logger.info('  To train a tagger: uvx simpleparty[classifier]==%s', __version__)
     if (not args.no_download) and (not _config['has_ytdlp']):
-        print(f'  To enable downloads: uvx simpleparty[download]=={__version__}')
+        logger.info('  To enable downloads: uvx simpleparty[download]==%s', __version__)
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print('\nShutting down.')
+        logger.info('\nShutting down.')
         server.shutdown()
 
 
