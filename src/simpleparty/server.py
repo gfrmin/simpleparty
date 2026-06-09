@@ -23,7 +23,7 @@ from socketserver import ThreadingMixIn
 
 from simpleparty.library import (
     _compute_related_videos,
-    _populate_durations,
+    durations_from_tags,
     filter_videos_by_starred,
     filter_videos_by_tags,
     find_encrypted_ancestor,

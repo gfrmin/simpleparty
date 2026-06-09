@@ -19,6 +19,7 @@ _tag_jobs = {}  # resolved dir path -> progress dict
 _tag_jobs_lock = threading.Lock()
 
 thumb_jobs = set()  # directories currently generating thumbs
+duration_jobs = set()  # directories currently probing durations
 
 download_queue = None          # queue.Queue[str], lazy
 download_jobs = {}             # job_id -> job dict (see new_download_job)

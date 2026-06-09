@@ -127,3 +127,22 @@ def test_list_directory_cached_until_dir_mtime_changes(tmp_path, monkeypatch):
     third = library.list_directory(str(tmp_path), '')
     assert calls['n'] >= 2
     assert [v['name'] for v in third['videos']] == ['a.mp4', 'b.mp4']
+
+
+# --- Cached durations ---
+
+def test_durations_from_tags():
+    from simpleparty.library import durations_from_tags
+    videos = [
+        {'name': 'a.mp4', 'mtime': 5.0},
+        {'name': 'b.mp4', 'mtime': 5.0},
+        {'name': 'c.mp4', 'mtime': 5.0},
+    ]
+    tags_map = {
+        'a.mp4': {'duration': 12.5, 'duration_mtime': 5.0},
+        'b.mp4': {'duration': 99.0, 'duration_mtime': 4.0},  # stale mtime
+    }
+    out = durations_from_tags(videos, tags_map)
+    assert [v['duration'] for v in out] == [12.5, 0.0, 0.0]
+    assert all('duration' not in v for v in videos)  # inputs untouched
+    assert durations_from_tags(videos, None) == durations_from_tags(videos, {})

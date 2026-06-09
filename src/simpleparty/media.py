@@ -191,6 +191,67 @@ def _stream_file(handler, path):
 
 
 
+# --- Duration probing ---
+
+_DURATION_FLUSH_EVERY = 25
+
+
+def _merge_durations(batch):
+    """Transform that writes only duration/duration_mtime for its own
+    entries, so concurrent tag/star edits survive."""
+    def _apply(tags):
+        for name, dur, mtime in batch:
+            entry = tags.get(name, {})
+            entry['duration'] = dur
+            entry['duration_mtime'] = mtime
+            tags[name] = entry
+        return tags
+    return _apply
+
+
+def _probe_durations(resolved, items):
+    """Background worker: ffprobe each (name, path, mtime), flushing the
+    results into tags.json in batches."""
+    from simpleparty.tagger import _get_duration, update_tags
+    try:
+        t0 = time.monotonic()
+        batch = []
+        for name, path, mtime in items:
+            batch.append((name, _get_duration(path), mtime))
+            if len(batch) >= _DURATION_FLUSH_EVERY:
+                update_tags(resolved, _merge_durations(batch))
+                batch = []
+        if batch:
+            update_tags(resolved, _merge_durations(batch))
+        logger.debug('duration probe done for %s: %d videos (%.1fs)',
+                     resolved, len(items), time.monotonic() - t0)
+    finally:
+        jobs.duration_jobs.discard(str(resolved))
+
+
+def _maybe_start_durations(resolved, videos, tags_map):
+    """Spawn a background duration probe for videos lacking a valid cached
+    duration. Returns True while results are still pending."""
+    if not _config['has_ffmpeg'] or not videos:
+        return False
+    tags_map = tags_map or {}
+    missing = []
+    for v in videos:
+        entry = tags_map.get(v['name'], {})
+        if entry.get('duration') is None or entry.get('duration_mtime') != v.get('mtime', 0.0):
+            missing.append((v['name'], Path(resolved) / v['name'], v.get('mtime', 0.0)))
+    if not missing:
+        return False
+    dir_str = str(resolved)
+    if dir_str in jobs.duration_jobs:
+        return True
+    jobs.duration_jobs.add(dir_str)
+    threading.Thread(
+        target=_probe_durations, args=(resolved, missing), daemon=True,
+    ).start()
+    return True
+
+
 # --- Thumbnail generation ---
 
 def _generate_thumbnails(directory, videos):

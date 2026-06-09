@@ -513,7 +513,7 @@ def render_tag_filter(tags_map, view, path, filtered_count=None, lower_index=Non
     return ''.join(pieces)
 
 
-def render_browse_page(data, view, tags_map=None, lower_index=None, thumbs=frozenset()):
+def render_browse_page(data, view, tags_map=None, lower_index=None, thumbs=frozenset(), duration_pending=False):
     title = f'SimpleParty \u2014 {data["path"].split("/")[-1]}' if data['path'] else 'SimpleParty'
     heading = data['path'].split('/')[-1] if data['path'] else 'Library'
     body = render_nav(data['path'], data.get('encryptedDir'))
@@ -526,6 +526,17 @@ def render_browse_page(data, view, tags_map=None, lower_index=None, thumbs=froze
             'Install ffmpeg to enable them.</div>'
         )
     body += '<div id="browse-content">'
+    if duration_pending:
+        # Self-terminating poller: refreshes #browse-content until the
+        # background duration probe finishes, at which point the rendered
+        # content no longer includes this element and polling stops.
+        poll_url = url_for_browse(data['path'], view)
+        body += (
+            f'<div class="notice" role="status" hx-get="{esc(poll_url)}" '
+            f'hx-trigger="every 4s" hx-target="#browse-content" '
+            f'hx-select="#browse-content" hx-swap="outerHTML">'
+            f'\u23F3 Calculating video lengths\u2026</div>'
+        )
     body += render_tag_filter(
         tags_map, view, data['path'],
         filtered_count=len(data['videos']),
