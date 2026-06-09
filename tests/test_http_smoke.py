@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from simpleparty import library as sp_library
 from simpleparty import server as sp_server
 from simpleparty.server import RequestHandler, ThreadedServer
 
@@ -23,7 +24,7 @@ from simpleparty.server import RequestHandler, ThreadedServer
 def _config_snapshot():
     """Snapshot/restore mutable server config so tests can flip flags."""
     saved = dict(sp_server._config)
-    saved_fscrypt_missing = sp_server._fscrypt_missing
+    saved_fscrypt_missing = sp_library._fscrypt_missing
     # Keep tests hermetic and fast: no ffmpeg probing, no fscrypt subprocesses.
     sp_server._config['has_ffmpeg'] = False
     sp_server._config['has_vlc'] = False
@@ -31,11 +32,11 @@ def _config_snapshot():
     sp_server._config['allow_tag'] = True
     sp_server._config['allow_delete'] = True
     sp_server._config['allow_download'] = False
-    sp_server._fscrypt_missing = True
+    sp_library._fscrypt_missing = True
     yield
     sp_server._config.clear()
     sp_server._config.update(saved)
-    sp_server._fscrypt_missing = saved_fscrypt_missing
+    sp_library._fscrypt_missing = saved_fscrypt_missing
 
 
 @pytest.fixture
