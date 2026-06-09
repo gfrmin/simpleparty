@@ -93,6 +93,88 @@ def _render_train_btn(path_param, is_busy):
     )
 
 
+PAGE_SIZE = 100        # browse grid items per chunk
+PLAYLIST_PAGE = 50     # play-page playlist items per chunk
+
+
+def _load_more_sentinel(url):
+    """Invisible htmx trigger: fetches the next chunk when scrolled into view."""
+    return (
+        f'<div class="load-more" hx-get="{esc(url)}" '
+        f'hx-trigger="revealed" hx-swap="outerHTML"></div>'
+    )
+
+
+def _browse_frag_url(path, view, offset):
+    params = {}
+    if path:
+        params['path'] = path
+    params.update(view.query_params())
+    params['frag'] = 'list'
+    params['offset'] = str(offset)
+    return '/browse?' + urllib.parse.urlencode(params)
+
+
+def render_video_item(v, i, data_path, view, *, current_idx=-1, tags_map=None, thumbs=frozenset()):
+    """One video card. `i` is the video's index in the full filtered+sorted
+    list (play URLs are index-based)."""
+    cls = ' playing' if i == current_idx else ''
+    play_url = url_for_play(data_path, i, view, video=v['name'])
+    pieces = [f'<div class="item item-video{cls}">']
+    thumb_url = f'/thumb/{urllib.parse.quote(v["path"])}'
+    if v['name'] in thumbs:
+        thumb_html = f'<img src="{thumb_url}" loading="lazy" class="item-thumb" alt="">'
+    else:
+        thumb_html = '<div class="item-thumb item-thumb-placeholder" aria-hidden="true">\U0001F3AC</div>'
+    pieces.append(
+        f'<a class="item-link" href="{esc(play_url)}">'
+        f'{thumb_html}'
+        f'<span class="item-info">'
+        f'<span class="item-name">{esc(v["name"])}</span>'
+        f'<span class="item-size">{fmt_size(v["size"])}</span>'
+        f'</span>'
+        f'</a>'
+    )
+    if _config['allow_delete']:
+        pieces.append(
+            f'<form hx-post="/delete" hx-target="closest .item" hx-swap="delete" '
+            f'hx-confirm="Delete {esc(v["name"])}?">'
+            f'<input type="hidden" name="path" value="{esc(v["path"])}">'
+            f'<button type="submit" class="btn-del" title="Delete" '
+            f'aria-label="Delete {esc(v["name"])}">'
+            f'<span aria-hidden="true">\U0001F5D1</span></button>'
+            f'</form>'
+        )
+    if tags_map and v['name'] in tags_map:
+        entry = tags_map[v['name']]
+        video_tags = entry.get('tags', [])
+        if video_tags:
+            is_suggested = entry.get('status') == 'suggested'
+            tags_text = esc(' \u00B7 '.join(video_tags[:8]))
+            tcls = ' suggested' if is_suggested else ''
+            prefix = (
+                '<span class="visually-hidden">Suggested tags: </span>'
+                '<span aria-hidden="true">\u2753\u2009</span>'
+            ) if is_suggested else ''
+            pieces.append(f'<div class="item-tags{tcls}">{prefix}{tags_text}</div>')
+    pieces.append('</div>')
+    return ''.join(pieces)
+
+
+def render_video_items(data, view, offset, *, current_idx=-1, tags_map=None, thumbs=frozenset()):
+    """A chunk of video cards plus, when more remain, a lazy-load sentinel."""
+    videos = data['videos']
+    pieces = [
+        render_video_item(v, offset + j, data['path'], view,
+                          current_idx=current_idx, tags_map=tags_map, thumbs=thumbs)
+        for j, v in enumerate(videos[offset:offset + PAGE_SIZE])
+    ]
+    if offset + PAGE_SIZE < len(videos):
+        pieces.append(_load_more_sentinel(
+            _browse_frag_url(data['path'], view, offset + PAGE_SIZE)))
+    return ''.join(pieces)
+
+
 def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=None, thumbs=frozenset()):
     pieces = ['<div id="file-list">']
 
@@ -192,48 +274,10 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
             f'</a>'
         )
 
-    for i, v in enumerate(data['videos']):
-        cls = ' playing' if i == current_idx else ''
-        play_url = url_for_play(data['path'], i, view, video=v['name'])
-        has_thumb = v['name'] in thumbs
-        pieces.append(f'<div class="item item-video{cls}">')
-        thumb_url = f'/thumb/{urllib.parse.quote(v["path"])}'
-        if has_thumb:
-            thumb_html = f'<img src="{thumb_url}" loading="lazy" class="item-thumb" alt="">'
-        else:
-            thumb_html = '<div class="item-thumb item-thumb-placeholder" aria-hidden="true">\U0001F3AC</div>'
-        pieces.append(
-            f'<a class="item-link" href="{esc(play_url)}">'
-            f'{thumb_html}'
-            f'<span class="item-info">'
-            f'<span class="item-name">{esc(v["name"])}</span>'
-            f'<span class="item-size">{fmt_size(v["size"])}</span>'
-            f'</span>'
-            f'</a>'
-        )
-        if _config['allow_delete']:
-            pieces.append(
-                f'<form hx-post="/delete" hx-target="closest .item" hx-swap="delete" '
-                f'hx-confirm="Delete {esc(v["name"])}?">'
-                f'<input type="hidden" name="path" value="{esc(v["path"])}">'
-                f'<button type="submit" class="btn-del" title="Delete" '
-                f'aria-label="Delete {esc(v["name"])}">'
-                f'<span aria-hidden="true">\U0001F5D1</span></button>'
-                f'</form>'
-            )
-        if tags_map and v['name'] in tags_map:
-            entry = tags_map[v['name']]
-            video_tags = entry.get('tags', [])
-            if video_tags:
-                is_suggested = entry.get('status') == 'suggested'
-                tags_text = esc(' \u00B7 '.join(video_tags[:8]))
-                cls = ' suggested' if is_suggested else ''
-                prefix = (
-                    '<span class="visually-hidden">Suggested tags: </span>'
-                    '<span aria-hidden="true">\u2753\u2009</span>'
-                ) if is_suggested else ''
-                pieces.append(f'<div class="item-tags{cls}">{prefix}{tags_text}</div>')
-        pieces.append('</div>')
+    pieces.append(render_video_items(
+        data, view, 0,
+        current_idx=current_idx, tags_map=tags_map, thumbs=thumbs,
+    ))
 
     if not data['dirs'] and not data['videos']:
         pieces.append('<div class="empty">Empty directory</div>')
@@ -275,8 +319,31 @@ def render_related_videos(data, idx, lower_index, view, thumbs=frozenset()):
     return ''.join(pieces)
 
 
-def render_playlist(data, current_idx, play_order, shuffle_seed, view, thumbs=frozenset()):
-    """Render playlist showing videos in playback order with current highlighted."""
+def render_playlist_item(v, play_url, position, thumbs):
+    """One playlist row; position 0 is the currently playing video."""
+    is_current = position == 0
+    if v['name'] in thumbs:
+        thumb_html = f'<img src="/thumb/{urllib.parse.quote(v["path"])}" loading="lazy" class="playlist-thumb" alt="">'
+    else:
+        thumb_html = '<div class="playlist-thumb-placeholder" aria-hidden="true">\U0001F3AC</div>'
+    cls = ' playing' if is_current else ''
+    label = '\u25B6 Now' if is_current else str(position)
+    return (
+        f'<a class="playlist-item{cls}" href="{esc(play_url)}">'
+        f'{thumb_html}'
+        f'<span class="playlist-name">{esc(v["name"])}</span>'
+        f'<span class="playlist-pos">{label}</span>'
+        f'</a>'
+    )
+
+
+def render_playlist(data, current_idx, play_order, shuffle_seed, view, thumbs=frozenset(), offset=0, frag_only=False):
+    """Render playlist in playback order, PLAYLIST_PAGE items at a time.
+
+    The order is deterministic from (current_idx | seed/pos already in the
+    URL), so each lazily loaded chunk continues exactly where the previous
+    one stopped. With frag_only, returns just the rows + next sentinel.
+    """
     n = len(data['videos'])
     is_shuffled = play_order is not None
 
@@ -287,44 +354,37 @@ def render_playlist(data, current_idx, play_order, shuffle_seed, view, thumbs=fr
         current_pos = play_order.index(current_idx)
         ordered = [(play_order[(current_pos + i) % n], i) for i in range(n)]
     else:
+        current_pos = None
         ordered = [((current_idx + i) % n, i) for i in range(n)]
 
-    pieces = [
-        '<div class="playlist">'
-        '<h2 class="playlist-heading">Playlist</h2>'
-        '<div class="playlist-items">'
-    ]
-
-    for video_idx, offset in ordered:
+    pieces = []
+    for video_idx, position in ordered[offset:offset + PLAYLIST_PAGE]:
         v = data['videos'][video_idx]
-        is_current = (offset == 0)
-
         if is_shuffled:
-            pos_in_order = (current_pos + offset) % n
+            pos_in_order = (current_pos + position) % n
             play_url = url_for_play(data['path'], video_idx, view, shuffle=True, seed=shuffle_seed, pos=pos_in_order, video=v['name'])
         else:
             play_url = url_for_play(data['path'], video_idx, view, video=v['name'])
+        pieces.append(render_playlist_item(v, play_url, position, thumbs))
 
-        has_thumb = v['name'] in thumbs
-        thumb_url = f'/thumb/{urllib.parse.quote(v["path"])}'
-
-        cls = ' playing' if is_current else ''
-        if has_thumb:
-            thumb_html = f'<img src="{thumb_url}" loading="lazy" class="playlist-thumb" alt="">'
+    next_offset = offset + PLAYLIST_PAGE
+    if next_offset < n:
+        cur = data['videos'][current_idx]
+        if is_shuffled:
+            base = url_for_play(data['path'], current_idx, view, shuffle=True, seed=shuffle_seed, pos=current_pos, video=cur['name'])
         else:
-            thumb_html = '<div class="playlist-thumb-placeholder" aria-hidden="true">\U0001F3AC</div>'
+            base = url_for_play(data['path'], current_idx, view, video=cur['name'])
+        frag_url = base + '&' + urllib.parse.urlencode(
+            {'frag': 'playlist', 'offset': str(next_offset)})
+        pieces.append(_load_more_sentinel(frag_url))
 
-        label = '\u25B6 Now' if is_current else str(offset)
-        pieces.append(
-            f'<a class="playlist-item{cls}" href="{esc(play_url)}">'
-            f'{thumb_html}'
-            f'<span class="playlist-name">{esc(v["name"])}</span>'
-            f'<span class="playlist-pos">{label}</span>'
-            f'</a>'
-        )
-
-    pieces.append('</div></div>')
-    return ''.join(pieces)
+    if frag_only:
+        return ''.join(pieces)
+    return (
+        '<div class="playlist">'
+        '<h2 class="playlist-heading">Playlist</h2>'
+        '<div class="playlist-items">' + ''.join(pieces) + '</div></div>'
+    )
 
 
 def _compute_viable_tags(lower_index, selected_tags):

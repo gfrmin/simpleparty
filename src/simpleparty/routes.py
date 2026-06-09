@@ -40,6 +40,8 @@ from simpleparty.media import (
 from simpleparty.render import (
     _render_train_btn,
     render_browse_page,
+    render_playlist,
+    render_video_items,
     render_download_page,
     render_download_status,
     render_error_page,
@@ -143,6 +145,12 @@ def handle_browse(handler, root):
         data['videos'] = durations_from_tags(data['videos'], dur_source)
         duration_pending = _maybe_start_durations(resolved, data['videos'], dur_source)
     data['videos'] = sort_videos(data['videos'], view.sort, view.direction)
+    if params.get('frag') == 'list':
+        send_html(handler, render_video_items(
+            data, view, safe_int(params.get('offset')),
+            tags_map=tags_map, thumbs=ctx['thumbs'],
+        ))
+        return
     from simpleparty.tagger import videos_with_frames
     _maybe_start_thumbs(resolved, data['videos'],
                         thumbs=ctx['thumbs'], frames=videos_with_frames(resolved))
@@ -224,6 +232,14 @@ def handle_play(handler, root):
         if view.starred:
             shuffle_params['starred'] = '1'
         shuffle_url = '/play?' + urllib.parse.urlencode(shuffle_params)
+
+    if params.get('frag') == 'playlist':
+        send_html(handler, render_playlist(
+            data, idx, play_order, shuffle_seed, view,
+            thumbs=ctx.get('thumbs', frozenset()),
+            offset=safe_int(params.get('offset')), frag_only=True,
+        ))
+        return
 
     transcode_plan = None
     if _config['allow_transcode'] and (_config['has_ffmpeg'] or _config['has_vlc']):
