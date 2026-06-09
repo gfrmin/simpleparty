@@ -863,3 +863,49 @@ def handle_download_clear(handler, root):
             jobs.download_jobs.pop(jid, None)
         jobs.download_order = keep
     send_hx_redirect(handler, '/download')
+
+
+# --- Dispatch ---
+
+GET_ROUTES = {
+    '/': handle_browse,
+    '/browse': handle_browse,
+    '/play': handle_play,
+    '/tag-status': handle_tag_status,
+    '/download': handle_download_page,
+    '/download-status': handle_download_status,
+}
+
+GET_PREFIXES = (
+    ('/video/', handle_video),
+    ('/thumb/', handle_thumb),
+)
+
+POST_ROUTES = {
+    '/delete': handle_delete,
+    '/delete-by-tag': handle_delete_by_tag,
+    '/unlock': handle_unlock,
+    '/lock': handle_lock,
+    '/train': handle_train,
+    '/suggest': handle_suggest,
+    '/suggest-one': handle_suggest_one,
+    '/confirm-tags': handle_confirm_tags,
+    '/confirm-all': handle_confirm_all,
+    '/reject-tags': handle_reject_tags,
+    '/reject-tag': handle_reject_tag,
+    '/save-tags': handle_save_tags,
+    '/star-update': handle_star_update,
+    '/download': handle_download_submit,
+    '/download-cancel': handle_download_cancel,
+    '/download-clear': handle_download_clear,
+}
+
+
+def dispatch(handler, root, exact, prefixes=()):
+    path = urllib.parse.urlparse(handler.path).path
+    fn = exact.get(path) or next(
+        (f for p, f in prefixes if path.startswith(p)), None)
+    if fn is None:
+        handler.send_error(404)
+    else:
+        fn(handler, root)

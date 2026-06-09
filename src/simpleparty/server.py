@@ -40,6 +40,10 @@ from simpleparty.library import (
 )
 from simpleparty import jobs
 from simpleparty.routes import (
+    GET_PREFIXES,
+    GET_ROUTES,
+    POST_ROUTES,
+    dispatch,
     handle_browse,
     handle_confirm_all,
     handle_confirm_tags,
@@ -123,60 +127,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         super().__init__(*args, **kwargs)
 
     def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path
-        if path == '/' or path == '/browse':
-            handle_browse(self, self.root)
-        elif path == '/play':
-            handle_play(self, self.root)
-        elif path.startswith('/video/'):
-            handle_video(self, self.root)
-        elif path == '/tag-status':
-            handle_tag_status(self, self.root)
-        elif path.startswith('/thumb/'):
-            handle_thumb(self, self.root)
-        elif path == '/download':
-            handle_download_page(self, self.root)
-        elif path == '/download-status':
-            handle_download_status(self, self.root)
-        else:
-            self.send_error(404)
+        dispatch(self, self.root, GET_ROUTES, GET_PREFIXES)
 
     def do_POST(self):
-        path = urllib.parse.urlparse(self.path).path
-        if path == '/delete':
-            handle_delete(self, self.root)
-        elif path == '/delete-by-tag':
-            handle_delete_by_tag(self, self.root)
-        elif path == '/unlock':
-            handle_unlock(self, self.root)
-        elif path == '/lock':
-            handle_lock(self, self.root)
-        elif path == '/train':
-            handle_train(self, self.root)
-        elif path == '/suggest':
-            handle_suggest(self, self.root)
-        elif path == '/suggest-one':
-            handle_suggest_one(self, self.root)
-        elif path == '/confirm-tags':
-            handle_confirm_tags(self, self.root)
-        elif path == '/confirm-all':
-            handle_confirm_all(self, self.root)
-        elif path == '/reject-tags':
-            handle_reject_tags(self, self.root)
-        elif path == '/reject-tag':
-            handle_reject_tag(self, self.root)
-        elif path == '/save-tags':
-            handle_save_tags(self, self.root)
-        elif path == '/star-update':
-            handle_star_update(self, self.root)
-        elif path == '/download':
-            handle_download_submit(self, self.root)
-        elif path == '/download-cancel':
-            handle_download_cancel(self, self.root)
-        elif path == '/download-clear':
-            handle_download_clear(self, self.root)
-        else:
-            self.send_error(404)
+        dispatch(self, self.root, POST_ROUTES)
 
     def do_HEAD(self):
         path = urllib.parse.urlparse(self.path).path
