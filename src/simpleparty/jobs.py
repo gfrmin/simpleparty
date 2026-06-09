@@ -20,6 +20,17 @@ _tag_jobs_lock = threading.Lock()
 
 thumb_jobs = set()  # directories currently generating thumbs
 duration_jobs = set()  # directories currently probing durations
+_job_sets_lock = threading.Lock()
+
+
+def try_claim(job_set, key):
+    """Atomically claim a job slot. Returns False if already claimed —
+    prevents concurrent requests from spawning duplicate workers."""
+    with _job_sets_lock:
+        if key in job_set:
+            return False
+        job_set.add(key)
+        return True
 
 download_queue = None          # queue.Queue[str], lazy
 download_jobs = {}             # job_id -> job dict (see new_download_job)

@@ -243,9 +243,8 @@ def _maybe_start_durations(resolved, videos, tags_map):
     if not missing:
         return False
     dir_str = str(resolved)
-    if dir_str in jobs.duration_jobs:
+    if not jobs.try_claim(jobs.duration_jobs, dir_str):
         return True
-    jobs.duration_jobs.add(dir_str)
     threading.Thread(
         target=_probe_durations, args=(resolved, missing), daemon=True,
     ).start()
@@ -332,7 +331,8 @@ def _maybe_start_thumbs(directory, videos, thumbs=frozenset(), frames=frozenset(
     )
     if not missing:
         return
-    jobs.thumb_jobs.add(dir_str)
+    if not jobs.try_claim(jobs.thumb_jobs, dir_str):
+        return
     logger.debug('starting background thumbnail thread for %s (%d videos to check)',
                  directory, len(videos))
     t = threading.Thread(
