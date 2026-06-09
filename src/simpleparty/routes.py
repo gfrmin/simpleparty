@@ -93,55 +93,81 @@ def read_form_body(handler):
 
 # --- Route handlers ---
 
+def get_dir_context(root, rel_path, params):
+    """One-stop per-request snapshot of a directory.
+
+    Returns {'data': ...} when listing failed/locked; otherwise also
+    resolved path, ViewState, tags (+ lowercased index), and the set of
+    existing thumbnails — each computed exactly once per request.
+    """
+    data = list_directory(root, rel_path)
+    if data.get('locked') or 'error' in data:
+        return {'data': data}
+    view = ViewState.from_params(params)
+    resolved = resolve_path(root, rel_path)
+    tags_map = None
+    lower_index = None
+    if _config['allow_tag']:
+        from simpleparty.tagger import list_thumbs, load_tags_index
+        tags_map, lower_index = load_tags_index(resolved)
+        videos = filter_videos_by_tags(data['videos'], lower_index, view.tags)
+        data['videos'] = filter_videos_by_starred(videos, tags_map, view.starred)
+        thumbs = list_thumbs(resolved)
+    else:
+        from simpleparty.tagger import list_thumbs
+        thumbs = list_thumbs(resolved)
+    return {
+        'data': data, 'resolved': resolved, 'view': view,
+        'tags_map': tags_map, 'lower_index': lower_index, 'thumbs': thumbs,
+    }
+
+
 def handle_browse(handler, root):
     params = parse_query(handler.path)
     rel_path = params.get('path', '')
-    data = list_directory(root, rel_path)
+    ctx = get_dir_context(root, rel_path, params)
+    data = ctx['data']
     if data.get('locked'):
         send_html(handler, render_locked_page(rel_path, data['encryptedDir']))
-    elif 'error' in data:
+        return
+    if 'error' in data:
         status = 404 if data['error'] == 'Not found' else 400
         send_html(handler, render_error_page(rel_path, data['error']), status)
-    else:
-        tags_map = None
-        view = ViewState.from_params(params)
-        resolved = resolve_path(root, rel_path)
-        if _config['allow_tag']:
-            from simpleparty.tagger import load_tags
-            tags_map = load_tags(resolved)
-            data['videos'] = filter_videos_by_tags(data['videos'], tags_map, view.tags)
-            data['videos'] = filter_videos_by_starred(data['videos'], tags_map, view.starred)
-        if view.sort == 'length':
-            if tags_map:
-                tags_map = {k: dict(v) for k, v in tags_map.items()}
-            _populate_durations(root, data['videos'], tags_map, resolved)
-        data['videos'] = sort_videos(data['videos'], view.sort, view.direction)
-        _maybe_start_thumbs(resolved, data['videos'])
-        send_html(handler, render_browse_page(data, view, tags_map=tags_map))
-
-
-def handle_play(handler, root):
-    params = parse_query(handler.path)
-    dir_path = params.get('path', '')
-    data = list_directory(root, dir_path)
-
-    if data.get('locked'):
-        send_html(handler, render_locked_page(dir_path, data['encryptedDir']))
         return
-
-    view = ViewState.from_params(params)
-    tags_map = None
-    resolved = resolve_path(root, dir_path)
-    if _config['allow_tag']:
-        from simpleparty.tagger import load_tags
-        tags_map = load_tags(resolved)
-        data['videos'] = filter_videos_by_tags(data['videos'], tags_map, view.tags)
-        data['videos'] = filter_videos_by_starred(data['videos'], tags_map, view.starred)
+    view, resolved, tags_map = ctx['view'], ctx['resolved'], ctx['tags_map']
     if view.sort == 'length':
         if tags_map:
             tags_map = {k: dict(v) for k, v in tags_map.items()}
         _populate_durations(root, data['videos'], tags_map, resolved)
     data['videos'] = sort_videos(data['videos'], view.sort, view.direction)
+    from simpleparty.tagger import videos_with_frames
+    _maybe_start_thumbs(resolved, data['videos'],
+                        thumbs=ctx['thumbs'], frames=videos_with_frames(resolved))
+    send_html(handler, render_browse_page(
+        data, view, tags_map=tags_map,
+        lower_index=ctx['lower_index'], thumbs=ctx['thumbs'],
+    ))
+
+
+def handle_play(handler, root):
+    params = parse_query(handler.path)
+    dir_path = params.get('path', '')
+    ctx = get_dir_context(root, dir_path, params)
+    data = ctx['data']
+
+    if data.get('locked'):
+        send_html(handler, render_locked_page(dir_path, data['encryptedDir']))
+        return
+
+    view = ctx.get('view') or ViewState.from_params(params)
+    tags_map = ctx.get('tags_map')
+    resolved = ctx.get('resolved')
+    if view.sort == 'length' and resolved is not None:
+        if tags_map:
+            tags_map = {k: dict(v) for k, v in tags_map.items()}
+        _populate_durations(root, data['videos'], tags_map, resolved)
+    if 'videos' in data:
+        data['videos'] = sort_videos(data['videos'], view.sort, view.direction)
 
     if 'error' in data or not data.get('videos'):
         send_redirect(handler, url_for_browse(dir_path, view))
@@ -205,7 +231,7 @@ def handle_play(handler, root):
         except OSError:
             pass
 
-    send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info, view, tags_map=tags_map, play_order=play_order, shuffle_seed=shuffle_seed, transcode_plan=transcode_plan))
+    send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info, view, tags_map=tags_map, lower_index=ctx.get('lower_index'), thumbs=ctx.get('thumbs', frozenset()), play_order=play_order, shuffle_seed=shuffle_seed, transcode_plan=transcode_plan))
 
 
 def handle_video(handler, root):
@@ -324,9 +350,9 @@ def handle_delete_by_tag(handler, root):
         handler.send_error(400, 'Cannot list directory')
         return
 
-    from simpleparty.tagger import load_tags, update_tags
-    tags_map = load_tags(resolved_dir)
-    targets = filter_videos_by_tags(data['videos'], tags_map, selected_tags)
+    from simpleparty.tagger import load_tags_index, update_tags
+    tags_map, lower_index = load_tags_index(resolved_dir)
+    targets = filter_videos_by_tags(data['videos'], lower_index, selected_tags)
 
     removed = set()
     for video in targets:
