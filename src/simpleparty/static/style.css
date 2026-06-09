@@ -287,3 +287,5 @@ a:focus-visible,button:focus-visible,select:focus-visible,input:focus-visible,su
 /* V1: tighten the type scale — no sub-12px text, drop the stray 15px step */
 .crumb,.empty{font-size:16px}
 .item-tags,.tag-pill-count,.tag-dropdown a .cnt,.tag-pill-x{font-size:12px}
+/* lazy-load sentinel for paginated lists */
+.load-more{width:100%;height:1px}

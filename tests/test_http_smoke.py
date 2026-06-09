@@ -280,3 +280,74 @@ def test_browse_sort_by_length_returns_immediately(srv):
     status, _, body = request(srv, 'GET', '/browse?sort=length')
     assert status == 200
     assert 'a.mp4' in body.decode()
+
+
+# --- Lazy-loading pagination ---
+
+@pytest.fixture
+def big_srv(tmp_path):
+    for i in range(250):
+        (tmp_path / f'v{i:03d}.mp4').write_bytes(b'\x00' * 16)
+    sp_server._config['root'] = str(tmp_path)
+    server = ThreadedServer(
+        ('127.0.0.1', 0), partial(RequestHandler, str(tmp_path)),
+    )
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    yield server
+    server.shutdown()
+    server.server_close()
+
+
+def test_browse_renders_first_page_plus_sentinel(big_srv):
+    status, _, body = request(big_srv, 'GET', '/browse?sort=name&dir=asc')
+    text = body.decode()
+    assert status == 200
+    assert text.count('class="item item-video"') == 100
+    assert 'load-more' in text
+    assert 'frag=list' in text and 'offset=100' in text
+    # view params propagate through the sentinel URL
+    assert 'sort=name' in text.split('load-more')[1][:200]
+
+
+def test_browse_fragment_middle_page(big_srv):
+    status, _, body = request(big_srv, 'GET', '/browse?sort=name&dir=asc&frag=list&offset=100')
+    text = body.decode()
+    assert status == 200
+    assert text.count('class="item item-video"') == 100
+    assert 'offset=200' in text
+    assert '<nav' not in text and 'file-list' not in text  # bare fragment
+
+
+def test_browse_fragment_last_page_has_no_sentinel(big_srv):
+    status, _, body = request(big_srv, 'GET', '/browse?sort=name&dir=asc&frag=list&offset=200')
+    text = body.decode()
+    assert status == 200
+    assert text.count('class="item item-video"') == 50
+    assert 'load-more' not in text
+
+
+def test_fragment_play_urls_use_absolute_indices(big_srv):
+    _, _, body = request(big_srv, 'GET', '/browse?sort=name&dir=asc&frag=list&offset=100')
+    text = body.decode()
+    # First item of the second page is index 100 in the full sorted list
+    assert 'idx=100' in text and 'v100.mp4' in text
+
+
+def test_playlist_paginated_and_preserves_shuffle_seed(big_srv):
+    status, _, body = request(big_srv, 'GET', '/play?path=&shuffle=1&seed=42&pos=0&sort=name&dir=asc')
+    text = body.decode()
+    assert status == 200
+    assert text.count('<a class="playlist-item') == 50
+    sentinel = text.split('load-more')[1][:300]
+    assert 'frag=playlist' in sentinel and 'offset=50' in sentinel
+    assert 'seed=42' in sentinel
+
+
+def test_playlist_fragment_continues_order(big_srv):
+    full, _, body0 = request(big_srv, 'GET', '/play?path=&idx=0&sort=name&dir=asc')
+    _, _, body1 = request(big_srv, 'GET', '/play?path=&idx=0&sort=name&dir=asc&frag=playlist&offset=50')
+    text = body1.decode()
+    assert text.count('<a class="playlist-item') == 50
+    # Continues at playlist position 50 (video v050 when starting from v000)
+    assert '>50</span>' in text and 'v050.mp4' in text
