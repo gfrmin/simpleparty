@@ -155,3 +155,92 @@ def test_untagged_videos(tmp_path):
     existing = {'a.mp4': {'tags': ['x']}}
     result = untagged_videos(str(tmp_path), existing)
     assert result == ['b.mkv']
+
+
+# --- Tags cache + update_tags ---
+
+def test_load_tags_cached_until_file_changes(tmp_path):
+    from simpleparty.tagger import load_tags, save_tags
+    save_tags(str(tmp_path), {'a.mp4': {'tags': ['x']}})
+    first = load_tags(str(tmp_path))
+    assert load_tags(str(tmp_path)) is first  # served from cache
+
+    # Rewrite out-of-band (different mtime/size) -> reloaded
+    tags_file = tmp_path / SIMPLEPARTY_DIR / TAGS_FILENAME
+    os.utime(tags_file, ns=(0, 0))
+    tags_file.write_text(json.dumps({'b.mp4': {'tags': ['y']}}))
+    assert load_tags(str(tmp_path)) == {'b.mp4': {'tags': ['y']}}
+
+
+def test_save_tags_refreshes_cache(tmp_path):
+    from simpleparty.tagger import load_tags, save_tags
+    save_tags(str(tmp_path), {'a.mp4': {'tags': ['x']}})
+    load_tags(str(tmp_path))
+    save_tags(str(tmp_path), {'a.mp4': {'tags': ['z']}})
+    assert load_tags(str(tmp_path))['a.mp4']['tags'] == ['z']
+
+
+def test_load_tags_index_lowercases(tmp_path):
+    from simpleparty.tagger import load_tags_index, save_tags
+    save_tags(str(tmp_path), {'a.mp4': {'tags': ['Cat', 'DOG']}, 'b.mp4': {}})
+    _, index = load_tags_index(str(tmp_path))
+    assert index == {'a.mp4': frozenset({'cat', 'dog'}), 'b.mp4': frozenset()}
+
+
+def test_update_tags_concurrent_writers_lose_nothing(tmp_path):
+    import threading
+    from simpleparty.tagger import load_tags, update_tags
+
+    def writer(i):
+        update_tags(str(tmp_path), lambda tags: {**tags, f'v{i}.mp4': {'tags': [f't{i}']}})
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    loaded = load_tags(str(tmp_path))
+    assert set(loaded) == {f'v{i}.mp4' for i in range(8)}
+
+
+def test_update_tags_transform_gets_copy(tmp_path):
+    from simpleparty.tagger import load_tags, save_tags, update_tags
+    save_tags(str(tmp_path), {'a.mp4': {'tags': ['x'], 'starred': True}})
+    before = load_tags(str(tmp_path))
+
+    def transform(tags):
+        tags['a.mp4']['status'] = 'confirmed'
+        return tags
+
+    update_tags(str(tmp_path), transform)
+    assert 'status' not in before['a.mp4']  # cached snapshot untouched
+    assert load_tags(str(tmp_path))['a.mp4']['status'] == 'confirmed'
+
+
+# --- Thumb / frame set scans ---
+
+def test_list_thumbs(tmp_path):
+    from simpleparty.tagger import list_thumbs
+    thumbs = tmp_path / SIMPLEPARTY_DIR / THUMB_DIR
+    thumbs.mkdir(parents=True)
+    (thumbs / 'a.mp4.jpg').write_bytes(b'')
+    (thumbs / 'b.mkv.jpg').write_bytes(b'')
+    (thumbs / 'notes.txt').write_bytes(b'')
+    assert list_thumbs(str(tmp_path)) == frozenset({'a.mp4', 'b.mkv'})
+    assert list_thumbs(str(tmp_path / 'nope')) == frozenset()
+
+
+def test_videos_with_frames(tmp_path):
+    from simpleparty.tagger import FRAMES_DIR, videos_with_frames
+    frames = tmp_path / FRAMES_DIR
+    frames.mkdir(parents=True)
+    (frames / 'a.mp4.f0.jpg').write_bytes(b'')
+    (frames / 'a.mp4.f1.jpg').write_bytes(b'')
+    (frames / 'b.mkv.f0.jpg').write_bytes(b'')
+    assert videos_with_frames(str(tmp_path)) == frozenset({'a.mp4', 'b.mkv'})
+
+
+def test_untagged_videos_accepts_prelisted_names(tmp_path):
+    names = ['a.mp4', 'b.mp4', '.hidden.mp4', 'c.txt']
+    existing = {'a.mp4': {'tags': ['x'], 'status': 'confirmed'}}
+    assert untagged_videos(str(tmp_path), existing, names=names) == ['b.mp4']

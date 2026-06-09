@@ -112,6 +112,8 @@ def handle_browse(handler, root):
             data['videos'] = filter_videos_by_tags(data['videos'], tags_map, view.tags)
             data['videos'] = filter_videos_by_starred(data['videos'], tags_map, view.starred)
         if view.sort == 'length':
+            if tags_map:
+                tags_map = {k: dict(v) for k, v in tags_map.items()}
             _populate_durations(root, data['videos'], tags_map, resolved)
         data['videos'] = sort_videos(data['videos'], view.sort, view.direction)
         _maybe_start_thumbs(resolved, data['videos'])
@@ -136,6 +138,8 @@ def handle_play(handler, root):
         data['videos'] = filter_videos_by_tags(data['videos'], tags_map, view.tags)
         data['videos'] = filter_videos_by_starred(data['videos'], tags_map, view.starred)
     if view.sort == 'length':
+        if tags_map:
+            tags_map = {k: dict(v) for k, v in tags_map.items()}
         _populate_durations(root, data['videos'], tags_map, resolved)
     data['videos'] = sort_videos(data['videos'], view.sort, view.direction)
 
@@ -280,12 +284,12 @@ def handle_delete(handler, root):
     # Clean up tags entry for deleted video
     if _config['allow_tag']:
         try:
-            from simpleparty.tagger import load_tags, save_tags
+            from simpleparty.tagger import load_tags, update_tags
             dir_path = resolved.parent
-            all_tags = load_tags(dir_path)
-            if resolved.name in all_tags:
-                del all_tags[resolved.name]
-                save_tags(dir_path, all_tags)
+            if resolved.name in load_tags(dir_path):
+                update_tags(dir_path, lambda t: {
+                    k: v for k, v in t.items() if k != resolved.name
+                })
         except Exception:
             pass  # best-effort cleanup
     if redirect_url:
@@ -320,10 +324,11 @@ def handle_delete_by_tag(handler, root):
         handler.send_error(400, 'Cannot list directory')
         return
 
-    from simpleparty.tagger import load_tags, save_tags
+    from simpleparty.tagger import load_tags, update_tags
     tags_map = load_tags(resolved_dir)
     targets = filter_videos_by_tags(data['videos'], tags_map, selected_tags)
 
+    removed = set()
     for video in targets:
         video_path = resolved_dir / video['name']
         try:
@@ -331,10 +336,12 @@ def handle_delete_by_tag(handler, root):
         except OSError as e:
             logger.warning('delete-by-tag: failed to remove %s: %s', video_path, e)
             continue
-        tags_map.pop(video['name'], None)
+        removed.add(video['name'])
 
     try:
-        save_tags(resolved_dir, tags_map)
+        update_tags(resolved_dir, lambda t: {
+            k: v for k, v in t.items() if k not in removed
+        })
     except OSError as e:
         logger.warning('delete-by-tag: failed to save tags for %s: %s', resolved_dir, e)
 
@@ -442,7 +449,7 @@ def handle_suggest_one(handler, root):
         handler.send_error(403, 'Tagging not enabled')
         return
     from simpleparty.classifier import suggest_for_video
-    from simpleparty.tagger import load_tags, save_tags, model_path as _model_path
+    from simpleparty.tagger import update_tags, model_path as _model_path
 
     form = read_form_body(handler)
     rel_path = form.get('path', '')
@@ -465,14 +472,13 @@ def handle_suggest_one(handler, root):
 
     results = suggest_for_video(str(video_path), str(mp), max_tags=_config['max_tags'])
     if results:
-        all_tags = load_tags(resolved)
         avg_conf = sum(c for _, c in results) / len(results)
-        entry = all_tags.get(video_name, {})
-        entry['tags'] = [tag for tag, _ in results]
-        entry['status'] = 'suggested'
-        entry['confidence'] = round(avg_conf, 3)
-        all_tags[video_name] = entry
-        save_tags(resolved, all_tags)
+        update_tags(resolved, lambda tags: {**tags, video_name: {
+            **tags.get(video_name, {}),
+            'tags': [tag for tag, _ in results],
+            'status': 'suggested',
+            'confidence': round(avg_conf, 3),
+        }})
         send_html(handler, render_video_tags_inline(
             rel_path, video_name,
             [tag for tag, _ in results],
@@ -486,7 +492,7 @@ def handle_confirm_tags(handler, root):
     if not _config['allow_tag']:
         handler.send_error(403, 'Tagging not enabled')
         return
-    from simpleparty.tagger import load_tags, save_tags
+    from simpleparty.tagger import update_tags
 
     form = read_form_body(handler)
     rel_path = form.get('path', '')
@@ -497,15 +503,13 @@ def handle_confirm_tags(handler, root):
         handler.send_error(400, 'Invalid request')
         return
 
-    all_tags = load_tags(resolved)
-    entry = all_tags.get(video_name, {})
-    entry['status'] = 'confirmed'
     from datetime import datetime, timezone
-    entry['confirmed_at'] = datetime.now(timezone.utc).isoformat()
-    all_tags[video_name] = entry
-    save_tags(resolved, all_tags)
+    now = datetime.now(timezone.utc).isoformat()
+    updated = update_tags(resolved, lambda tags: {**tags, video_name: {
+        **tags.get(video_name, {}), 'status': 'confirmed', 'confirmed_at': now,
+    }})
 
-    tags_list = entry.get('tags', [])
+    tags_list = updated.get(video_name, {}).get('tags', [])
     send_html(handler, render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'))
 
 
@@ -513,7 +517,7 @@ def handle_confirm_all(handler, root):
     if not _config['allow_tag']:
         handler.send_error(403, 'Tagging not enabled')
         return
-    from simpleparty.tagger import load_tags, save_tags
+    from simpleparty.tagger import update_tags
 
     form = read_form_body(handler)
     rel_path = form.get('path', '')
@@ -523,16 +527,17 @@ def handle_confirm_all(handler, root):
         handler.send_error(400, 'Invalid request')
         return
 
-    all_tags = load_tags(resolved)
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
-    count = 0
-    for entry in all_tags.values():
-        if entry.get('status') == 'suggested':
-            entry['status'] = 'confirmed'
-            entry['confirmed_at'] = now
-            count += 1
-    save_tags(resolved, all_tags)
+
+    def _confirm_all(tags):
+        for entry in tags.values():
+            if entry.get('status') == 'suggested':
+                entry['status'] = 'confirmed'
+                entry['confirmed_at'] = now
+        return tags
+
+    update_tags(resolved, _confirm_all)
     send_hx_redirect(handler, url_for_browse(rel_path))
 
 
@@ -540,7 +545,7 @@ def handle_reject_tags(handler, root):
     if not _config['allow_tag']:
         handler.send_error(403, 'Tagging not enabled')
         return
-    from simpleparty.tagger import load_tags, save_tags
+    from simpleparty.tagger import load_tags, update_tags
 
     form = read_form_body(handler)
     rel_path = form.get('path', '')
@@ -551,13 +556,14 @@ def handle_reject_tags(handler, root):
         handler.send_error(400, 'Invalid request')
         return
 
-    all_tags = load_tags(resolved)
-    if video_name in all_tags:
-        entry = all_tags[video_name]
-        entry['rejected_tags'] = entry.get('rejected_tags', []) + entry.get('tags', [])
-        entry['tags'] = []
-        entry['status'] = 'rejected'
-        save_tags(resolved, all_tags)
+    if video_name in load_tags(resolved):
+        update_tags(resolved, lambda tags: {**tags, video_name: {
+            **tags.get(video_name, {}),
+            'rejected_tags': (tags.get(video_name, {}).get('rejected_tags', [])
+                              + tags.get(video_name, {}).get('tags', [])),
+            'tags': [],
+            'status': 'rejected',
+        }})
 
     send_html(handler, render_video_tags_inline(rel_path, video_name, []))
 
@@ -567,7 +573,7 @@ def handle_reject_tag(handler, root):
     if not _config['allow_tag']:
         handler.send_error(403, 'Tagging not enabled')
         return
-    from simpleparty.tagger import load_tags, save_tags
+    from simpleparty.tagger import update_tags
 
     form = read_form_body(handler)
     rel_path = form.get('path', '')
@@ -579,25 +585,22 @@ def handle_reject_tag(handler, root):
         handler.send_error(400, 'Invalid request')
         return
 
-    all_tags = load_tags(resolved)
-    entry = all_tags.get(video_name, {})
+    def _reject_one(tags):
+        entry = tags.get(video_name, {})
+        tags_list = list(entry.get('tags', []))
+        if tag in tags_list:
+            tags_list.remove(tag)
+            entry['tags'] = tags_list
+            entry['rejected_tags'] = list(entry.get('rejected_tags', [])) + [tag]
+        if not tags_list:
+            entry['status'] = 'rejected'
+        tags[video_name] = entry
+        return tags
+
+    updated = update_tags(resolved, _reject_one)
+    entry = updated.get(video_name, {})
     tags_list = entry.get('tags', [])
-
-    if tag in tags_list:
-        tags_list.remove(tag)
-        entry['tags'] = tags_list
-        rejected = entry.get('rejected_tags', [])
-        rejected.append(tag)
-        entry['rejected_tags'] = rejected
-
-    if not tags_list:
-        entry['status'] = 'rejected'
-        status = 'rejected'
-    else:
-        status = entry.get('status', 'confirmed')
-
-    all_tags[video_name] = entry
-    save_tags(resolved, all_tags)
+    status = 'rejected' if not tags_list else entry.get('status', 'confirmed')
 
     send_html(handler, render_video_tags_inline(rel_path, video_name, tags_list, status=status))
 
@@ -687,7 +690,7 @@ def handle_save_tags(handler, root):
     if not _config['allow_tag']:
         handler.send_error(403, 'Tagging not enabled')
         return
-    from simpleparty.tagger import load_tags, save_tags
+    from simpleparty.tagger import update_tags
 
     form = read_form_body(handler)
     rel_path = form.get('path', '')
@@ -701,14 +704,12 @@ def handle_save_tags(handler, root):
 
     tags_list = [t.strip() for t in raw_tags.split(',') if t.strip()]
 
-    all_tags = load_tags(resolved)
-    entry = all_tags.get(video_name, {})
-    entry['tags'] = tags_list
-    entry['status'] = 'confirmed'
     from datetime import datetime, timezone
-    entry['tagged_at'] = datetime.now(timezone.utc).isoformat()
-    all_tags[video_name] = entry
-    save_tags(resolved, all_tags)
+    now = datetime.now(timezone.utc).isoformat()
+    update_tags(resolved, lambda tags: {**tags, video_name: {
+        **tags.get(video_name, {}),
+        'tags': tags_list, 'status': 'confirmed', 'tagged_at': now,
+    }})
 
     # Return updated pill HTML for HTMX swap
     send_html(handler, render_video_tags_inline(rel_path, video_name, tags_list))
@@ -718,7 +719,7 @@ def handle_star_update(handler, root):
     if not _config['allow_tag']:
         handler.send_error(403, 'Tagging not enabled')
         return
-    from simpleparty.tagger import load_tags, save_tags, set_starred
+    from simpleparty.tagger import set_starred, update_tags
 
     form = read_form_body(handler)
     rel_dir = form.get('dir', '')
@@ -737,9 +738,7 @@ def handle_star_update(handler, root):
         handler.send_error(404, 'Video not found')
         return
 
-    all_tags = load_tags(resolved)
-    set_starred(all_tags, video_name, starred_flag)
-    save_tags(resolved, all_tags)
+    update_tags(resolved, lambda tags: set_starred(tags, video_name, starred_flag))
 
     handler.send_response(204)
     handler.send_header('Content-Length', '0')

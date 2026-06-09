@@ -95,3 +95,35 @@ def test_filter_videos_by_starred_handles_missing_entries():
     tags_map = {'a.mp4': {'starred': True}}
     result = filter_videos_by_starred(videos, tags_map, True)
     assert [v['name'] for v in result] == ['a.mp4']
+
+
+# --- Directory-listing cache ---
+
+def test_list_directory_cached_until_dir_mtime_changes(tmp_path, monkeypatch):
+    import simpleparty.library as library
+
+    (tmp_path / 'a.mp4').write_bytes(b'\x00' * 10)
+    calls = {'n': 0}
+    real_listdir = library.os.listdir
+
+    def counting_listdir(path):
+        calls['n'] += 1
+        return real_listdir(path)
+
+    monkeypatch.setattr(library.os, 'listdir', counting_listdir)
+    library._fscrypt_missing = True
+
+    first = library.list_directory(str(tmp_path), '')
+    second = library.list_directory(str(tmp_path), '')
+    assert calls['n'] == 1  # second call served from cache
+    assert [v['name'] for v in second['videos']] == ['a.mp4']
+
+    # Returned dicts are independent copies, not the cached objects
+    second['videos'][0]['name'] = 'mutated'
+    assert library.list_directory(str(tmp_path), '')['videos'][0]['name'] == 'a.mp4'
+
+    # A new file bumps the directory mtime -> rescan
+    (tmp_path / 'b.mp4').write_bytes(b'\x00' * 10)
+    third = library.list_directory(str(tmp_path), '')
+    assert calls['n'] >= 2
+    assert [v['name'] for v in third['videos']] == ['a.mp4', 'b.mp4']

@@ -24,6 +24,38 @@ def resolve_path(root, relative):
     return (Path(root) / relative).resolve()
 
 
+# Directory scans cached on the directory's mtime_ns: creates, deletes, and
+# renames bump it, so cache hits skip the listdir and the per-file stats.
+# In-place file modifications don't bump it; sizes/mtimes can briefly lag.
+_dir_cache = {}  # str(resolved) -> (dir_mtime_ns, [(name, size, mtime)], [dir names])
+_dir_cache_lock = threading.Lock()
+_DIR_CACHE_MAX = 64
+
+
+def scan_directory(resolved):
+    """One pass over a directory. Returns ([(name, size, mtime)], [dir names])
+    for videos and child directories, or None if unreadable."""
+    try:
+        entries = sorted(os.listdir(resolved))
+    except (PermissionError, OSError):
+        return None
+    videos, dir_names = [], []
+    for name in entries:
+        if name.startswith('.'):
+            continue
+        full = resolved / name
+        if full.is_dir():
+            dir_names.append(name)
+        elif full.is_file() and is_video(name):
+            try:
+                st = full.stat()
+                size, mtime = st.st_size, st.st_mtime
+            except OSError:
+                size, mtime = 0, 0.0
+            videos.append((name, size, mtime))
+    return videos, dir_names
+
+
 def list_directory(root, rel_path):
     """List directory contents. Returns dict with dirs, videos, or error/locked."""
     resolved = resolve_path(root, rel_path)
@@ -42,32 +74,45 @@ def list_directory(root, rel_path):
         return {'locked': True, 'path': rel_path, 'encryptedDir': rel_path}
 
     try:
-        entries = sorted(os.listdir(resolved))
-    except (PermissionError, OSError):
+        dir_mtime_ns = resolved.stat().st_mtime_ns
+    except OSError:
         return {'error': 'Cannot read directory'}
+
+    key = str(resolved)
+    with _dir_cache_lock:
+        cached = _dir_cache.get(key)
+    if cached and cached[0] == dir_mtime_ns:
+        video_entries, dir_names = cached[1], cached[2]
+    else:
+        scanned = scan_directory(resolved)
+        if scanned is None:
+            return {'error': 'Cannot read directory'}
+        video_entries, dir_names = scanned
+        with _dir_cache_lock:
+            _dir_cache[key] = (dir_mtime_ns, video_entries, dir_names)
+            while len(_dir_cache) > _DIR_CACHE_MAX:
+                _dir_cache.pop(next(iter(_dir_cache)))
 
     encrypted_root = find_encrypted_ancestor(root, rel_path)
 
-    dirs, videos = [], []
-    for name in entries:
-        if name.startswith('.'):
-            continue
-        full = resolved / name
-        child_path = os.path.join(rel_path, name) if rel_path else name
-        if full.is_dir():
-            dir_status = get_fscrypt_status(full)
-            dirs.append({
-                'name': name, 'path': child_path,
-                'encrypted': dir_status['encrypted'],
-                'unlocked': dir_status['unlocked'],
-            })
-        elif full.is_file() and is_video(name):
-            try:
-                st = full.stat()
-                size, mtime = st.st_size, st.st_mtime
-            except OSError:
-                size, mtime = 0, 0.0
-            videos.append({'name': name, 'path': child_path, 'size': size, 'mtime': mtime})
+    def child_path(name):
+        return os.path.join(rel_path, name) if rel_path else name
+
+    # fscrypt status is recomputed per request (it has its own TTL cache,
+    # invalidated on lock/unlock), and callers receive fresh dicts so the
+    # cached entries are never mutated downstream.
+    dirs = []
+    for name in dir_names:
+        dir_status = get_fscrypt_status(resolved / name)
+        dirs.append({
+            'name': name, 'path': child_path(name),
+            'encrypted': dir_status['encrypted'],
+            'unlocked': dir_status['unlocked'],
+        })
+    videos = [
+        {'name': name, 'path': child_path(name), 'size': size, 'mtime': mtime}
+        for name, size, mtime in video_entries
+    ]
 
     return {
         'path': rel_path, 'dirs': dirs, 'videos': videos,
