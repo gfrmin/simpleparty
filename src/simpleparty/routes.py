@@ -145,6 +145,9 @@ def handle_browse(handler, root):
         data['videos'] = durations_from_tags(data['videos'], dur_source)
         duration_pending = _maybe_start_durations(resolved, data['videos'], dur_source)
     data['videos'] = sort_videos(data['videos'], view.sort, view.direction)
+    # While a duration probe is running, sort=length order can shift between
+    # chunk requests as durations land; the 4s poller re-renders the whole
+    # list anyway, so any duplicated/skipped row self-heals within a refresh.
     if params.get('frag') == 'list':
         send_html(handler, render_video_items(
             data, view, safe_int(params.get('offset')),
