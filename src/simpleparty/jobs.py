@@ -51,6 +51,17 @@ def set_tag_job(resolved_dir, progress):
         _tag_jobs[str(resolved_dir)] = progress
 
 
+def claim_tag_job(resolved_dir, progress):
+    """Atomically install `progress` unless a job is already running for the
+    directory. Returns False when one is (caller should not spawn)."""
+    with _tag_jobs_lock:
+        existing = _tag_jobs.get(str(resolved_dir))
+        if existing and existing.get('running'):
+            return False
+        _tag_jobs[str(resolved_dir)] = progress
+        return True
+
+
 # --- Download queue ---
 
 def new_download_job(job_id, url, target_dir, target_rel):
@@ -82,14 +93,16 @@ def new_download_job(job_id, url, target_dir, target_rel):
 
 
 def evict_download_history():
-    """Trim non-running jobs beyond the history limit (oldest first). Caller holds download_lock."""
+    """Trim finished jobs beyond the history limit (oldest first). Caller
+    holds download_lock. Queued jobs are never evicted — dropping one would
+    silently swallow a pending download when its id is dequeued."""
     global download_order
-    non_running = [jid for jid in download_order
-                   if not download_jobs.get(jid, {}).get('running')]
-    excess = len(non_running) - DOWNLOAD_HISTORY_LIMIT
+    finished = [jid for jid in download_order
+                if download_jobs.get(jid, {}).get('state') in ('done', 'error', 'cancelled')]
+    excess = len(finished) - DOWNLOAD_HISTORY_LIMIT
     if excess <= 0:
         return
-    to_drop = set(non_running[:excess])
+    to_drop = set(finished[:excess])
     download_order = [jid for jid in download_order if jid not in to_drop]
     for jid in to_drop:
         download_jobs.pop(jid, None)

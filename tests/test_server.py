@@ -113,7 +113,7 @@ def test_list_directory_cached_until_dir_mtime_changes(tmp_path, monkeypatch):
     monkeypatch.setattr(library.os, 'listdir', counting_listdir)
     library._fscrypt_missing = True
 
-    first = library.list_directory(str(tmp_path), '')
+    library.list_directory(str(tmp_path), '')
     second = library.list_directory(str(tmp_path), '')
     assert calls['n'] == 1  # second call served from cache
     assert [v['name'] for v in second['videos']] == ['a.mp4']

@@ -11,7 +11,6 @@ import json
 import threading
 import urllib.parse
 from functools import partial
-from pathlib import Path
 
 import pytest
 
@@ -372,9 +371,38 @@ def test_playlist_paginated_and_preserves_shuffle_seed(big_srv):
 
 
 def test_playlist_fragment_continues_order(big_srv):
-    full, _, body0 = request(big_srv, 'GET', '/play?path=&idx=0&sort=name&dir=asc')
+    status, _, body0 = request(big_srv, 'GET', '/play?path=&idx=0&sort=name&dir=asc')
+    assert status == 200
+    assert 'v049.mp4' in body0.decode()  # full page ends its first chunk at 49
     _, _, body1 = request(big_srv, 'GET', '/play?path=&idx=0&sort=name&dir=asc&frag=playlist&offset=50')
     text = body1.decode()
     assert text.count('<a class="playlist-item') == 50
     # Continues at playlist position 50 (video v050 when starting from v000)
     assert '>50</span>' in text and 'v050.mp4' in text
+
+
+# --- Review fixes ---
+
+def test_head_html_route_sends_no_body(srv):
+    # do_HEAD falls through to do_GET for HTML routes; the body must be
+    # suppressed or keep-alive clients desync on the next response.
+    status, headers, body = request(srv, 'HEAD', '/')
+    assert status == 200
+    assert int(headers['Content-Length']) > 0
+    assert body == b''
+
+
+def test_delete_by_tag_honors_starred_filter(srv, media_root):
+    # b.mp4 gets the same tag but is not starred; with starred=1 the bulk
+    # delete must only remove the starred subset the user confirmed.
+    tags_file = media_root / '.simpleparty' / 'tags.json'
+    tags_file.write_text(json.dumps({
+        'a.mp4': {'tags': ['cat'], 'status': 'confirmed', 'starred': True},
+        'b.mp4': {'tags': ['cat'], 'status': 'confirmed'},
+    }))
+    status, _, _ = post_form(
+        srv, '/delete-by-tag', {'path': '', 'tags': 'cat', 'starred': '1'},
+    )
+    assert status == 200
+    assert not (media_root / 'a.mp4').exists()
+    assert (media_root / 'b.mp4').exists()

@@ -86,10 +86,6 @@ def _transcode_plan(path):
     return 'reencode'
 
 
-def _needs_transcode(path):
-    return _transcode_plan(path) is not None
-
-
 def _remux_mpegts(path):
     tmp = path.with_suffix('.tmp.mp4')
     try:
@@ -145,6 +141,7 @@ def _serve_transcoded(handler, path, plan='reencode'):
     if handler.command == 'HEAD':
         return
 
+    proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         while True:
@@ -157,10 +154,17 @@ def _serve_transcoded(handler, path, plan='reencode'):
         handler.wfile.write(b'0\r\n\r\n')
         proc.wait()
     except (BrokenPipeError, ConnectionResetError):
-        proc.kill()
-    except Exception:
-        if proc.poll() is None:
+        if proc is not None:
             proc.kill()
+    except Exception:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+        # Headers are already out; terminate the chunked body so a
+        # keep-alive client isn't left waiting forever.
+        try:
+            handler.wfile.write(b'0\r\n\r\n')
+        except OSError:
+            pass
 
 
 def _stream_range(handler, path, start, length):
@@ -232,7 +236,9 @@ def _probe_durations(resolved, items):
 def _maybe_start_durations(resolved, videos, tags_map):
     """Spawn a background duration probe for videos lacking a valid cached
     duration. Returns True while results are still pending."""
-    if not _config['has_ffmpeg'] or not videos:
+    if not _config['has_ffmpeg'] or not _config['allow_tag'] or not videos:
+        # Probing persists results into .simpleparty/tags.json; with
+        # tagging disabled we must not write sidecar files into the tree.
         return False
     tags_map = tags_map or {}
     missing = []
@@ -262,8 +268,7 @@ def _generate_thumbnails(directory, videos):
     """
     from simpleparty.tagger import (
         FRAMES_DIR, thumb_path, extract_thumbnail,
-        extract_frame, _downscale_frame,
-        list_thumbs, videos_with_frames,
+        _downscale_frame, list_thumbs, videos_with_frames,
     )
     try:
         t0 = time.monotonic()
@@ -315,17 +320,19 @@ def _generate_thumbnails(directory, videos):
         jobs.thumb_jobs.discard(str(directory))
 
 
-def _maybe_start_thumbs(directory, videos, thumbs=frozenset(), frames=frozenset()):
+def _maybe_start_thumbs(directory, videos, thumbs=frozenset()):
     """Spawn background thumbnail generation if needed and not already running.
 
-    `thumbs`/`frames` are the name sets from tagger.list_thumbs() /
-    tagger.videos_with_frames(), computed once by the caller.
+    `thumbs` is the name set from tagger.list_thumbs(), computed once by
+    the caller (it needs it for rendering anyway).
     """
     if not _config['has_ffmpeg'] or not videos:
         return
     dir_str = str(directory)
-    if dir_str in jobs.thumb_jobs:
+    if dir_str in jobs.thumb_jobs:  # cheap pre-check; try_claim is authoritative
         return
+    from simpleparty.tagger import videos_with_frames
+    frames = videos_with_frames(directory)
     missing = any(
         v['name'] not in thumbs or v['name'] not in frames for v in videos
     )

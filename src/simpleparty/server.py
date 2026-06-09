@@ -4,7 +4,6 @@
 import argparse
 import logging
 import shutil
-import sys
 import urllib.parse
 from functools import partial
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -72,8 +71,10 @@ def main():
             datefmt='%H:%M:%S',
         )
     else:
-        # Plain messages so the startup banner stays clean
-        logging.basicConfig(level=logging.INFO, format='%(message)s')
+        # Other modules stay at WARNING (matching the old default); only
+        # this module's banner/lifecycle messages come through, unformatted.
+        logging.basicConfig(level=logging.WARNING, format='%(message)s')
+        logger.setLevel(logging.INFO)
 
     root = str(Path(args.root).resolve())
     if not Path(root).is_dir():

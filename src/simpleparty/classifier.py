@@ -17,7 +17,7 @@ logger = logging.getLogger('simpleparty.classifier')
 from simpleparty.tagger import (
     SIMPLEPARTY_DIR, FRAMES_DIR, MODEL_FILENAME,
     _get_duration, _downscale_frame,
-    confirmed_entries, extract_frame, load_tags, model_path, save_tags,
+    confirmed_entries, extract_frame, load_tags, model_path,
     training_entries,
     thumb_path,
 )
@@ -552,11 +552,15 @@ _SUGGEST_FLUSH_SECONDS = 60
 
 
 def _merge_suggestions(pending):
-    """Transform that overwrites only its own suggestion entries, so tag/star
-    edits made while the job runs are preserved."""
+    """Transform that writes only its own suggestion entries. Edits to other
+    videos always survive; a video the user manually tagged (confirmed)
+    while the job was running keeps their tags instead of the model's."""
     def _apply(tags):
         for name, fields in pending.items():
-            tags[name] = {**tags.get(name, {}), **fields}
+            current = tags.get(name, {})
+            if current.get('status') == 'confirmed' and current.get('tags'):
+                continue
+            tags[name] = {**current, **fields}
         return tags
     return _apply
 

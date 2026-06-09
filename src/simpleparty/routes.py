@@ -57,6 +57,7 @@ from simpleparty.urls import (
     safe_int,
     url_for_browse,
     url_for_play,
+    url_for_shuffle,
 )
 
 logger = logging.getLogger('simpleparty.routes')
@@ -70,7 +71,8 @@ def send_html(handler, content, status=200):
     handler.send_header('Content-Type', 'text/html; charset=utf-8')
     handler.send_header('Content-Length', str(len(body)))
     handler.end_headers()
-    handler.wfile.write(body)
+    if handler.command != 'HEAD':
+        handler.wfile.write(body)
 
 
 def send_redirect(handler, url):
@@ -151,13 +153,11 @@ def handle_browse(handler, root):
     # list anyway, so any duplicated/skipped row self-heals within a refresh.
     if params.get('frag') == 'list':
         send_html(handler, render_video_items(
-            data, view, safe_int(params.get('offset')),
+            data, view, max(0, safe_int(params.get('offset'))),
             tags_map=tags_map, thumbs=ctx['thumbs'],
         ))
         return
-    from simpleparty.tagger import videos_with_frames
-    _maybe_start_thumbs(resolved, data['videos'],
-                        thumbs=ctx['thumbs'], frames=videos_with_frames(resolved))
+    _maybe_start_thumbs(resolved, data['videos'], thumbs=ctx['thumbs'])
     send_html(handler, render_browse_page(
         data, view, tags_map=tags_map,
         lower_index=ctx['lower_index'], thumbs=ctx['thumbs'],
@@ -226,22 +226,13 @@ def handle_play(handler, root):
         next_url = url_for_play(dir_path, next_idx, view, video=data['videos'][next_idx]['name'])
         prev_url = url_for_play(dir_path, prev_idx, view, video=data['videos'][prev_idx]['name'])
         pos_info = f'{idx + 1}/{n}'
-        shuffle_params = {'path': dir_path, 'shuffle': '1'}
-        if view.tags:
-            shuffle_params['tags'] = ','.join(view.tags)
-        if view.sort and view.sort != 'name':
-            shuffle_params['sort'] = view.sort
-        if view.direction and view.direction != 'asc':
-            shuffle_params['dir'] = view.direction
-        if view.starred:
-            shuffle_params['starred'] = '1'
-        shuffle_url = '/play?' + urllib.parse.urlencode(shuffle_params)
+        shuffle_url = url_for_shuffle(dir_path, view)
 
     if params.get('frag') == 'playlist':
         send_html(handler, render_playlist(
             data, idx, play_order, shuffle_seed, view,
             thumbs=ctx.get('thumbs', frozenset()),
-            offset=safe_int(params.get('offset')), frag_only=True,
+            offset=max(0, safe_int(params.get('offset'))), frag_only=True,
         ))
         return
 
@@ -250,9 +241,7 @@ def handle_play(handler, root):
         try:
             video_fs_path = resolve_path(root, data['videos'][idx]['path'])
             if video_fs_path.is_file():
-                transcode_plan = _transcode_plan(video_fs_path) if _config['has_ffmpeg'] else (
-                    None if video_fs_path.suffix.lower() in BROWSER_NATIVE else 'reencode'
-                )
+                transcode_plan = _transcode_plan(video_fs_path)
         except OSError:
             pass
 
@@ -272,9 +261,7 @@ def handle_video(handler, root):
         return
 
     if _config['allow_transcode'] and (_config['has_ffmpeg'] or _config['has_vlc']):
-        plan = _transcode_plan(resolved) if _config['has_ffmpeg'] else (
-            None if resolved.suffix.lower() in BROWSER_NATIVE else 'reencode'
-        )
+        plan = _transcode_plan(resolved)
         if plan is not None:
             if _is_mpegts(resolved) and _config['has_ffmpeg'] and _remux_mpegts(resolved):
                 pass  # file is now a proper MP4, fall through to normal serving
@@ -368,6 +355,7 @@ def handle_delete_by_tag(handler, root):
     form = read_form_body(handler)
     rel_path = form.get('path', '')
     raw_tags = form.get('tags', '')
+    starred_only = form.get('starred', '') == '1'
     selected_tags = [t.strip() for t in raw_tags.split(',') if t.strip()]
     if not selected_tags:
         handler.send_error(400, 'No tags specified')
@@ -388,6 +376,7 @@ def handle_delete_by_tag(handler, root):
     from simpleparty.tagger import load_tags_index, update_tags
     tags_map, lower_index = load_tags_index(resolved_dir)
     targets = filter_videos_by_tags(data['videos'], lower_index, selected_tags)
+    targets = filter_videos_by_starred(targets, tags_map, starred_only)
 
     removed = set()
     for video in targets:
@@ -456,13 +445,10 @@ def handle_train(handler, root):
         return
 
     resolved_str = str(resolved)
-    existing = jobs.get_tag_job(resolved_str)
-    if existing and existing.get('running'):
+    progress = {'running': True, 'done': 0, 'total': 0, 'current': '', 'phase': 'preparing'}
+    if not jobs.claim_tag_job(resolved_str, progress):
         send_hx_redirect(handler, url_for_browse(rel_path))
         return
-
-    progress = {'running': True, 'done': 0, 'total': 0, 'current': '', 'phase': 'preparing'}
-    jobs.set_tag_job(resolved_str, progress)
 
     t = threading.Thread(
         target=train,
@@ -498,13 +484,10 @@ def handle_suggest(handler, root):
         return
 
     resolved_str = str(resolved)
-    existing = jobs.get_tag_job(resolved_str)
-    if existing and existing.get('running'):
+    progress = {'running': True, 'done': 0, 'total': 0, 'current': '', 'phase': 'suggesting'}
+    if not jobs.claim_tag_job(resolved_str, progress):
         send_hx_redirect(handler, url_for_browse(rel_path))
         return
-
-    progress = {'running': True, 'done': 0, 'total': 0, 'current': '', 'phase': 'suggesting'}
-    jobs.set_tag_job(resolved_str, progress)
 
     t = threading.Thread(
         target=suggest_for_directory,
@@ -702,6 +685,9 @@ def handle_tag_status(handler, root):
         return
     params = parse_query(handler.path)
     rel_path = params.get('path', '')
+    if not is_safe_rel_path(rel_path):
+        send_html(handler, '')
+        return
     resolved = str(resolve_path(root, rel_path))
     status_url = f'/tag-status?{urllib.parse.urlencode({"path": rel_path})}'
     path_param = esc(rel_path)

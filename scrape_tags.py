@@ -9,6 +9,7 @@ Usage: uv run python scrape_tags.py ~/yo/more/more/
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -19,7 +20,7 @@ from pathlib import Path
 
 from scrapling.fetchers import AsyncFetcher
 
-from simpleparty.tagger import load_tags, save_tags
+from simpleparty.tagger import _LEGACY_TAGS, load_tags, update_tags
 
 CONCURRENCY = 10
 SAVE_EVERY = 50
@@ -43,6 +44,19 @@ def extract_hex_code(filename):
     if m:
         return m.group(1).upper()
     return None
+
+
+def _resume_state(directory):
+    """Names already scraped: the current tags file merged with the legacy
+    flat file older versions of this script wrote (current file wins)."""
+    legacy = {}
+    legacy_file = Path(directory) / _LEGACY_TAGS
+    if legacy_file.exists():
+        try:
+            legacy = json.loads(legacy_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {**legacy, **load_tags(directory)}
 
 
 async def fetch_one(code, semaphore, proxy):
@@ -78,7 +92,7 @@ async def main():
     else:
         log.info('No proxy (set BRIGHTDATA_PROXY to use one)')
 
-    existing = load_tags(directory)
+    existing = _resume_state(directory)
 
     to_scrape = {}
     skipped = 0
@@ -108,6 +122,7 @@ async def main():
         results = await asyncio.gather(*tasks)
 
         chunk_errors = 0
+        scraped = {}
         for (filename, code), (tags, title, err) in zip(chunk, results):
             done += 1
             if err:
@@ -117,14 +132,18 @@ async def main():
             else:
                 if tags:
                     with_tags += 1
-                existing[filename] = {
+                scraped[filename] = {
                     'tags': [t.lower() for t in tags],
                     'title': title,
                     'source': f'motherless:{code}',
                     'scraped_at': datetime.now(timezone.utc).isoformat(),
                 }
 
-        save_tags(directory, existing)
+        if scraped:
+            # Merge only this chunk's entries on top of the latest on-disk
+            # state, so edits made by a concurrently running server (stars,
+            # confirmations, durations) are not clobbered.
+            update_tags(directory, lambda t, s=scraped: {**t, **s})
         elapsed = time.monotonic() - start_time
         rate = done / elapsed if elapsed > 0 else 0
         remaining = (len(items) - done) / rate if rate > 0 else 0

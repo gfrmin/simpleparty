@@ -9,7 +9,7 @@ from pathlib import Path
 from simpleparty import __version__, jobs
 from simpleparty.library import _compute_related_videos, resolve_path
 from simpleparty.state import CONFIG as _config
-from simpleparty.urls import ViewState, url_for_browse, url_for_play, url_for_video
+from simpleparty.urls import ViewState, url_for_browse, url_for_play, url_for_shuffle, url_for_video
 
 
 # --- Format helpers ---
@@ -180,16 +180,7 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
 
     shuffle_btn = ''
     if show_shuffle and data['videos']:
-        shuffle_params = {'path': data['path'], 'shuffle': '1'}
-        if view.tags:
-            shuffle_params['tags'] = ','.join(view.tags)
-        if view.sort and view.sort != 'name':
-            shuffle_params['sort'] = view.sort
-        if view.direction and view.direction != 'asc':
-            shuffle_params['dir'] = view.direction
-        if view.starred:
-            shuffle_params['starred'] = '1'
-        shuffle_url = '/play?' + urllib.parse.urlencode(shuffle_params)
+        shuffle_url = url_for_shuffle(data['path'], view)
         shuffle_btn = f'<a class="btn" href="{esc(shuffle_url)}">\u21C5 Shuffle Play</a>'
     want_action_bar = bool(shuffle_btn) or (
         _config.get('allow_download') and (data['videos'] or data['dirs'])
@@ -501,6 +492,7 @@ def render_tag_filter(tags_map, view, path, filtered_count=None, lower_index=Non
                 f'hx-confirm="{esc(confirm)}" style="display:inline">'
                 f'<input type="hidden" name="path" value="{esc(path)}">'
                 f'<input type="hidden" name="tags" value="{esc(tags_csv)}">'
+                + ('<input type="hidden" name="starred" value="1">' if view.starred else '') +
                 f'<button type="submit" class="btn-del" '
                 f'title="Delete all videos with these tags">'
                 f'<span aria-hidden="true">\U0001F5D1</span> Delete all ({filtered_count})</button>'
