@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -28,6 +29,13 @@ _LEGACY_MODEL = '.simpleparty-model.pt'
 
 # --- Tag file I/O ---
 
+# Per-directory cache of parsed tags files, keyed on the file's
+# (mtime_ns, size) so out-of-band writes are still picked up.
+_tags_cache = {}        # str(dir) -> (stat_key, tags_dict, lower_index)
+_tags_cache_lock = threading.Lock()
+_dir_write_locks = {}   # str(dir) -> threading.Lock, created under _tags_cache_lock
+
+
 def _sp_dir(directory_path):
     """Return the .simpleparty directory path, creating it if needed."""
     d = Path(directory_path) / SIMPLEPARTY_DIR
@@ -35,25 +43,65 @@ def _sp_dir(directory_path):
     return d
 
 
-def load_tags(directory_path):
-    """Load tags JSON for a directory, or return empty dict."""
+def _tags_file(directory_path):
+    """The tags file to read: current location, or the legacy flat file."""
     tags_file = Path(directory_path) / SIMPLEPARTY_DIR / TAGS_FILENAME
-    if not tags_file.exists():
-        # Legacy fallback
-        legacy = Path(directory_path) / _LEGACY_TAGS
-        if legacy.exists():
-            tags_file = legacy
-        else:
-            return {}
+    if tags_file.exists():
+        return tags_file
+    legacy = Path(directory_path) / _LEGACY_TAGS
+    return legacy if legacy.exists() else tags_file
+
+
+def _stat_key(path):
     try:
-        with open(tags_file, 'r') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {}
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _build_lower_index(tags):
+    return {
+        name: frozenset(t.lower() for t in entry.get('tags', []))
+        for name, entry in tags.items()
+    }
+
+
+def load_tags(directory_path):
+    """Load tags JSON for a directory, or return empty dict.
+
+    The returned dict is a shared cache object: treat it as READ-ONLY and
+    go through update_tags() for modifications.
+    """
+    return load_tags_index(directory_path)[0]
+
+
+def load_tags_index(directory_path):
+    """Return (tags, lower_index); lower_index maps video name to a frozenset
+    of lowercased tags. Both are shared cache objects: read-only."""
+    key = str(Path(directory_path))
+    tags_file = _tags_file(directory_path)
+    stat_key = _stat_key(tags_file)
+    with _tags_cache_lock:
+        cached = _tags_cache.get(key)
+        if cached and cached[0] == stat_key:
+            return cached[1], cached[2]
+    if stat_key is None:
+        tags = {}
+    else:
+        try:
+            with open(tags_file, 'r') as f:
+                tags = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            tags = {}
+    index = _build_lower_index(tags)
+    with _tags_cache_lock:
+        _tags_cache[key] = (stat_key, tags, index)
+    return tags, index
 
 
 def save_tags(directory_path, tags):
-    """Atomically write tags JSON for a directory."""
+    """Atomically write tags JSON for a directory (write-through cache)."""
     sp = _sp_dir(directory_path)
     tags_file = sp / TAGS_FILENAME
     tmp_fd, tmp_path = tempfile.mkstemp(
@@ -69,21 +117,80 @@ def save_tags(directory_path, tags):
         except OSError:
             pass
         raise
+    with _tags_cache_lock:
+        _tags_cache[str(Path(directory_path))] = (
+            _stat_key(tags_file), tags, _build_lower_index(tags),
+        )
 
 
-def untagged_videos(directory_path, existing_tags):
-    """Return list of video filenames in directory not yet tagged."""
-    result = []
+def _write_lock(directory_path):
+    key = str(Path(directory_path))
+    with _tags_cache_lock:
+        lock = _dir_write_locks.get(key)
+        if lock is None:
+            lock = _dir_write_locks[key] = threading.Lock()
+    return lock
+
+
+def update_tags(directory_path, transform):
+    """Atomically read-modify-write a directory's tags file.
+
+    `transform` receives a one-level copy of the latest tags dict and
+    returns the dict to persist (it may mutate the copy and its entry
+    dicts, but must not mutate nested lists in place). Serialized per
+    directory so concurrent writers cannot lose updates. Returns the
+    persisted dict.
+    """
+    with _write_lock(directory_path):
+        current = load_tags(directory_path)
+        updated = transform({k: dict(v) for k, v in current.items()})
+        save_tags(directory_path, updated)
+        return updated
+
+
+def list_thumbs(directory_path):
+    """Names of videos with a thumbnail — one scandir, no per-file stats."""
+    thumbs_dir = Path(directory_path) / SIMPLEPARTY_DIR / THUMB_DIR
     try:
-        for name in sorted(os.listdir(directory_path)):
-            if name.startswith('.'):
-                continue
-            if Path(name).suffix.lower() in VIDEO_EXTENSIONS:
-                entry = existing_tags.get(name)
-                if not entry or entry.get('status') == 'rejected':
-                    result.append(name)
+        with os.scandir(thumbs_dir) as it:
+            return frozenset(e.name[:-4] for e in it if e.name.endswith('.jpg'))
     except OSError:
-        pass
+        return frozenset()
+
+
+def videos_with_frames(directory_path):
+    """Names of videos with at least one extracted full-res frame."""
+    frames_dir = Path(directory_path) / FRAMES_DIR
+    try:
+        with os.scandir(frames_dir) as it:
+            return frozenset(
+                e.name[:-4].rsplit('.f', 1)[0]
+                for e in it
+                if e.name.endswith('.jpg') and '.f' in e.name
+            )
+    except OSError:
+        return frozenset()
+
+
+def untagged_videos(directory_path, existing_tags, names=None):
+    """Return list of video filenames in directory not yet tagged.
+
+    `names` lets a caller that already listed the directory skip the
+    redundant listdir.
+    """
+    if names is None:
+        try:
+            names = sorted(os.listdir(directory_path))
+        except OSError:
+            return []
+    result = []
+    for name in names:
+        if name.startswith('.'):
+            continue
+        if Path(name).suffix.lower() in VIDEO_EXTENSIONS:
+            entry = existing_tags.get(name)
+            if not entry or entry.get('status') == 'rejected':
+                result.append(name)
     return result
 
 
