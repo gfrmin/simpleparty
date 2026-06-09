@@ -2,13 +2,14 @@
 
 import json
 import urllib.parse
+from dataclasses import replace
 from html import escape as esc
 from pathlib import Path
 
 from simpleparty import __version__, jobs
 from simpleparty.library import _compute_related_videos, resolve_path
 from simpleparty.state import CONFIG as _config
-from simpleparty.urls import url_for_browse, url_for_play, url_for_video
+from simpleparty.urls import ViewState, url_for_browse, url_for_play, url_for_video
 
 
 # --- Format helpers ---
@@ -92,19 +93,19 @@ def _render_train_btn(path_param, is_busy):
     )
 
 
-def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, selected_tags=None, sort='name', direction='asc', starred_only=False):
+def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=None):
     pieces = ['<div id="file-list">']
 
     shuffle_btn = ''
     if show_shuffle and data['videos']:
         shuffle_params = {'path': data['path'], 'shuffle': '1'}
-        if selected_tags:
-            shuffle_params['tags'] = ','.join(selected_tags)
-        if sort and sort != 'name':
-            shuffle_params['sort'] = sort
-        if direction and direction != 'asc':
-            shuffle_params['dir'] = direction
-        if starred_only:
+        if view.tags:
+            shuffle_params['tags'] = ','.join(view.tags)
+        if view.sort and view.sort != 'name':
+            shuffle_params['sort'] = view.sort
+        if view.direction and view.direction != 'asc':
+            shuffle_params['dir'] = view.direction
+        if view.starred:
             shuffle_params['starred'] = '1'
         shuffle_url = '/play?' + urllib.parse.urlencode(shuffle_params)
         shuffle_btn = f'<a class="btn" href="{esc(shuffle_url)}">\u21C5 Shuffle Play</a>'
@@ -164,7 +165,7 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
                 f'role="status" aria-live="polite" '
                 f'id="download-progress"></div>'
             )
-        sort_html = render_sort_pills(data['path'], selected_tags, sort, direction, starred_only=starred_only) if data['videos'] else ''
+        sort_html = render_sort_pills(data['path'], view) if data['videos'] else ''
         pieces.append(
             f'<div class="action-bar">'
             f'{shuffle_btn}'
@@ -195,7 +196,7 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
     root_dir = _config.get('root', '.')
     for i, v in enumerate(data['videos']):
         cls = ' playing' if i == current_idx else ''
-        play_url = url_for_play(data['path'], i, tags=selected_tags, video=v['name'], sort=sort, direction=direction, starred=starred_only)
+        play_url = url_for_play(data['path'], i, view, video=v['name'])
         resolved_dir = resolve_path(root_dir, data['path'])
         has_thumb = thumb_path(str(resolved_dir), v['name']).exists()
         pieces.append(f'<div class="item item-video{cls}">')
@@ -244,7 +245,7 @@ def render_file_list(data, current_idx=-1, show_shuffle=True, tags_map=None, sel
     return ''.join(pieces)
 
 
-def render_related_videos(data, idx, tags_map, selected_tags=None, sort='name', direction='asc', starred_only=False):
+def render_related_videos(data, idx, tags_map, view):
     """Render a 'Related Videos' section based on tag overlap."""
     related = _compute_related_videos(data, idx, tags_map)
     if not related:
@@ -258,7 +259,7 @@ def render_related_videos(data, idx, tags_map, selected_tags=None, sort='name', 
     ]
     for video_idx, _overlap in related:
         v = data['videos'][video_idx]
-        play_url = url_for_play(data['path'], video_idx, tags=selected_tags, video=v['name'], sort=sort, direction=direction, starred=starred_only)
+        play_url = url_for_play(data['path'], video_idx, view, video=v['name'])
         resolved_dir = resolve_path(root_dir, data['path'])
         has_thumb = thumb_path(str(resolved_dir), v['name']).exists()
         thumb_url = f'/thumb/{urllib.parse.quote(v["path"])}'
@@ -280,7 +281,7 @@ def render_related_videos(data, idx, tags_map, selected_tags=None, sort='name', 
     return ''.join(pieces)
 
 
-def render_playlist(data, current_idx, play_order, shuffle_seed, selected_tags=None, sort='name', direction='asc', starred_only=False):
+def render_playlist(data, current_idx, play_order, shuffle_seed, view):
     """Render playlist showing videos in playback order with current highlighted."""
     from simpleparty.tagger import thumb_path
     root_dir = _config.get('root', '.')
@@ -308,9 +309,9 @@ def render_playlist(data, current_idx, play_order, shuffle_seed, selected_tags=N
 
         if is_shuffled:
             pos_in_order = (current_pos + offset) % n
-            play_url = url_for_play(data['path'], video_idx, shuffle=True, seed=shuffle_seed, pos=pos_in_order, tags=selected_tags, video=v['name'], sort=sort, direction=direction, starred=starred_only)
+            play_url = url_for_play(data['path'], video_idx, view, shuffle=True, seed=shuffle_seed, pos=pos_in_order, video=v['name'])
         else:
-            play_url = url_for_play(data['path'], video_idx, tags=selected_tags, video=v['name'], sort=sort, direction=direction, starred=starred_only)
+            play_url = url_for_play(data['path'], video_idx, view, video=v['name'])
 
         resolved_dir = resolve_path(root_dir, data['path'])
         has_thumb = thumb_path(str(resolved_dir), v['name']).exists()
@@ -357,7 +358,7 @@ def _hx_browse(href):
     )
 
 
-def render_sort_pills(path, selected_tags, sort, direction, starred_only=False):
+def render_sort_pills(path, view):
     """Render three sort pills (Name/Size/Date). Active pill shows direction arrow;
     clicking the active pill flips direction, clicking an inactive one switches
     to that field at a sensible default direction."""
@@ -369,14 +370,14 @@ def render_sort_pills(path, selected_tags, sort, direction, starred_only=False):
     ]
     pieces = ['<div class="sort-pills">']
     for field, label, default_dir in fields:
-        active = field == sort
+        active = field == view.sort
         if active:
-            new_dir = 'desc' if direction == 'asc' else 'asc'
-            arrow = ' ▲' if direction == 'asc' else ' ▼'
+            new_dir = 'desc' if view.direction == 'asc' else 'asc'
+            arrow = ' ▲' if view.direction == 'asc' else ' ▼'
         else:
             new_dir = default_dir
             arrow = ''
-        href = url_for_browse(path, tags=selected_tags, sort=field, direction=new_dir, starred=starred_only)
+        href = url_for_browse(path, replace(view, sort=field, direction=new_dir))
         cls = 'sort-pill' + (' active' if active else '')
         aria = ' aria-current="true"' if active else ''
         pieces.append(f'<a class="{cls}" href="{esc(href)}" {_hx_browse(href)}{aria}>{label}{arrow}</a>')
@@ -384,7 +385,7 @@ def render_sort_pills(path, selected_tags, sort, direction, starred_only=False):
     return ''.join(pieces)
 
 
-def render_tag_filter(tags_map, selected_tags, path, filtered_count=None, starred_only=False):
+def render_tag_filter(tags_map, view, path, filtered_count=None):
     """Render tag filter: selected pills + searchable dropdown of viable tags."""
     if not tags_map:
         return ''
@@ -399,15 +400,16 @@ def render_tag_filter(tags_map, selected_tags, path, filtered_count=None, starre
     if not counts and not has_starred:
         return ''
 
-    selected_lower = {t.lower() for t in selected_tags} if selected_tags else set()
-    viable = _compute_viable_tags(tags_map, selected_tags)
+    # NOTE: pre-existing behavior preserved below — tag/star pill links drop
+    # the current sort and reset to the default (date/desc).
+    viable = _compute_viable_tags(tags_map, view.tags)
 
     pieces = ['<div class="tag-filter">']
 
     # Star filter pill (if any starred videos exist in this directory)
     if has_starred:
-        if starred_only:
-            href = url_for_browse(path, tags=selected_tags, starred=False)
+        if view.starred:
+            href = url_for_browse(path, ViewState(tags=view.tags, starred=False))
             pieces.append(
                 f'<a class="tag-pill star-pill active" href="{esc(href)}" {_hx_browse(href)} '
                 f'aria-label="Showing starred only — show all videos" '
@@ -415,30 +417,30 @@ def render_tag_filter(tags_map, selected_tags, path, filtered_count=None, starre
                 f'★ Starred only <span class="tag-pill-x" aria-hidden="true">×</span></a>'
             )
         else:
-            href = url_for_browse(path, tags=selected_tags, starred=True)
+            href = url_for_browse(path, ViewState(tags=view.tags, starred=True))
             pieces.append(
                 f'<a class="tag-pill star-pill" href="{esc(href)}" {_hx_browse(href)} '
                 f'aria-label="Show only starred videos" title="Show only starred videos">★ Starred only</a>'
             )
 
     # Selected tag pills
-    if selected_tags:
+    if view.tags:
         pieces.append('<div class="tag-selected-pills">')
-        for tag in selected_tags:
-            remove_tags = [t for t in selected_tags if t.lower() != tag.lower()]
-            href = url_for_browse(path, tags=remove_tags if remove_tags else None, starred=starred_only)
+        for tag in view.tags:
+            remove_tags = tuple(t for t in view.tags if t.lower() != tag.lower())
+            href = url_for_browse(path, ViewState(tags=remove_tags, starred=view.starred))
             pieces.append(
                 f'<a class="tag-pill active" href="{esc(href)}" {_hx_browse(href)} '
                 f'aria-label="Remove filter {esc(tag)}">'
                 f'{esc(tag)} <span class="tag-pill-x" aria-hidden="true">\u00d7</span></a>'
             )
-        clear_href = url_for_browse(path, starred=starred_only)
+        clear_href = url_for_browse(path, ViewState(starred=view.starred))
         pieces.append(
             f'<a class="tag-clear" href="{esc(clear_href)}" {_hx_browse(clear_href)}>Clear all</a>'
         )
         if _config.get('allow_delete') and filtered_count:
-            tags_csv = ','.join(selected_tags)
-            tags_label = ', '.join(selected_tags)
+            tags_csv = ','.join(view.tags)
+            tags_label = ', '.join(view.tags)
             confirm = (
                 f'Delete all {filtered_count} video'
                 f'{"" if filtered_count == 1 else "s"} tagged "{tags_label}"? '
@@ -472,8 +474,8 @@ def render_tag_filter(tags_map, selected_tags, path, filtered_count=None, starre
         )
         pieces.append('<div class="tag-dropdown" id="tag-dropdown" role="listbox">')
         for oi, (tag, count) in enumerate(viable_sorted):
-            new_tags = list(selected_tags or []) + [tag]
-            href = url_for_browse(path, tags=new_tags, starred=starred_only)
+            new_tags = view.tags + (tag,)
+            href = url_for_browse(path, ViewState(tags=new_tags, starred=view.starred))
             cnt = f' <span class="cnt">({count})</span>' if count > 1 else ''
             pieces.append(f'<a href="{esc(href)}" {_hx_browse(href)} role="option" id="tagopt-{oi}">{esc(tag)}{cnt}</a>')
         pieces.append('</div></div>')
@@ -521,7 +523,7 @@ def render_tag_filter(tags_map, selected_tags, path, filtered_count=None, starre
     return ''.join(pieces)
 
 
-def render_browse_page(data, tags_map=None, selected_tags=None, sort='name', direction='asc', starred_only=False):
+def render_browse_page(data, view, tags_map=None):
     title = f'SimpleParty \u2014 {data["path"].split("/")[-1]}' if data['path'] else 'SimpleParty'
     heading = data['path'].split('/')[-1] if data['path'] else 'Library'
     body = render_nav(data['path'], data.get('encryptedDir'))
@@ -535,14 +537,10 @@ def render_browse_page(data, tags_map=None, selected_tags=None, sort='name', dir
         )
     body += '<div id="browse-content">'
     body += render_tag_filter(
-        tags_map, selected_tags, data['path'],
+        tags_map, view, data['path'],
         filtered_count=len(data['videos']),
-        starred_only=starred_only,
     )
-    body += render_file_list(
-        data, tags_map=tags_map, selected_tags=selected_tags,
-        sort=sort, direction=direction, starred_only=starred_only,
-    )
+    body += render_file_list(data, view, tags_map=tags_map)
     body += '</div></main>'
     return render_page(title, body)
 
@@ -652,10 +650,11 @@ def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'
     return ''.join(pieces)
 
 
-def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info, tags_map=None, selected_tags=None, play_order=None, shuffle_seed=None, transcode_plan=None, sort='name', direction='asc', starred_only=False):
+def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, pos_info, view=None, tags_map=None, play_order=None, shuffle_seed=None, transcode_plan=None):
     v = data['videos'][idx]
     video_src = url_for_video(v['path'])
-    browse_url = url_for_browse(data['path'], tags=selected_tags, sort=sort, direction=direction, starred=starred_only)
+    view = view if view is not None else ViewState(sort='name', direction='asc')
+    browse_url = url_for_browse(data['path'], view)
 
     body = render_nav(data['path'], data.get('encryptedDir'))
     body += '<main id="main">'
@@ -740,9 +739,9 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         body += f'<div class="video-meta" id="video-meta">{meta_html}</div>'
 
     if tags_map:
-        body += render_related_videos(data, idx, tags_map, selected_tags=selected_tags, sort=sort, direction=direction, starred_only=starred_only)
+        body += render_related_videos(data, idx, tags_map, view)
 
-    body += render_playlist(data, idx, play_order, shuffle_seed, selected_tags=selected_tags, sort=sort, direction=direction, starred_only=starred_only)
+    body += render_playlist(data, idx, play_order, shuffle_seed, view)
     body += '</main>'
 
     sp_data = json.dumps({'next': next_url, 'prev': prev_url, 'browse': browse_url})

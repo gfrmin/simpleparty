@@ -1,6 +1,7 @@
 """URL building and query-string parsing."""
 
 import urllib.parse
+from dataclasses import dataclass
 
 
 def parse_query(url):
@@ -8,22 +9,52 @@ def parse_query(url):
     return {k: v[0] for k, v in params.items()}
 
 
-def url_for_browse(path='', tags=None, sort=None, direction=None, starred=False):
+@dataclass(frozen=True)
+class ViewState:
+    """Cross-cutting browse/play view parameters carried through every URL.
+
+    Immutable; derive variants with dataclasses.replace().
+    """
+
+    tags: tuple = ()
+    sort: str = 'date'
+    direction: str = 'desc'
+    starred: bool = False
+
+    @classmethod
+    def from_params(cls, params):
+        sort, direction = parse_sort_params(params)
+        return cls(
+            tags=tuple(parse_tags_param(params)),
+            sort=sort,
+            direction=direction,
+            starred=parse_starred_param(params),
+        )
+
+    def query_params(self):
+        """URL params dict with default values omitted."""
+        params = {}
+        if self.tags:
+            params['tags'] = ','.join(self.tags)
+        if self.sort and self.sort != 'date':
+            params['sort'] = self.sort
+        if self.direction and self.direction != 'desc':
+            params['dir'] = self.direction
+        if self.starred:
+            params['starred'] = '1'
+        return params
+
+
+def url_for_browse(path='', view=None):
     params = {}
     if path:
         params['path'] = path
-    if tags:
-        params['tags'] = ','.join(tags)
-    if sort and sort != 'date':
-        params['sort'] = sort
-    if direction and direction != 'desc':
-        params['dir'] = direction
-    if starred:
-        params['starred'] = '1'
+    if view is not None:
+        params.update(view.query_params())
     return '/' if not params else '/browse?' + urllib.parse.urlencode(params)
 
 
-def url_for_play(dir_path, idx, shuffle=False, seed=None, pos=None, tags=None, video=None, sort=None, direction=None, starred=False):
+def url_for_play(dir_path, idx, view=None, *, video=None, shuffle=False, seed=None, pos=None):
     params = {'path': dir_path, 'idx': str(idx)}
     if video:
         params['video'] = video
@@ -33,14 +64,8 @@ def url_for_play(dir_path, idx, shuffle=False, seed=None, pos=None, tags=None, v
             params['seed'] = str(seed)
         if pos is not None:
             params['pos'] = str(pos)
-    if tags:
-        params['tags'] = ','.join(tags)
-    if sort and sort != 'date':
-        params['sort'] = sort
-    if direction and direction != 'desc':
-        params['dir'] = direction
-    if starred:
-        params['starred'] = '1'
+    if view is not None:
+        params.update(view.query_params())
     return '/play?' + urllib.parse.urlencode(params)
 
 
