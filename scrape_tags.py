@@ -2,26 +2,25 @@
 """Scrape tags from motherless.com for videos with 7-hex codes in filenames.
 
 Uses scrapling AsyncFetcher for concurrent requests.
-Resumable: skips filenames already present in .simpleparty-tags.json.
+Resumable: skips filenames already present in the tags file.
 Uses BRIGHTDATA_PROXY env var if set.
 
 Usage: uv run python scrape_tags.py ~/yo/more/more/
 """
 
 import asyncio
-import json
 import logging
 import os
 import re
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from scrapling.fetchers import AsyncFetcher
 
-TAGS_FILENAME = '.simpleparty-tags.json'
+from simpleparty.tagger import load_tags, save_tags
+
 CONCURRENCY = 10
 SAVE_EVERY = 50
 
@@ -44,29 +43,6 @@ def extract_hex_code(filename):
     if m:
         return m.group(1).upper()
     return None
-
-
-def load_tags(directory):
-    tags_file = Path(directory) / TAGS_FILENAME
-    if not tags_file.exists():
-        return {}
-    with open(tags_file) as f:
-        return json.load(f)
-
-
-def save_tags(directory, tags):
-    tags_file = Path(directory) / TAGS_FILENAME
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=directory, suffix='.tmp')
-    try:
-        with os.fdopen(tmp_fd, 'w') as f:
-            json.dump(tags, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, tags_file)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
 
 
 async def fetch_one(code, semaphore, proxy):
