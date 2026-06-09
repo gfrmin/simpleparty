@@ -260,24 +260,20 @@ def sort_videos(videos, sort, direction):
     return sorted(videos, key=key, reverse=reverse)
 
 
-def _populate_durations(root, videos, tags_map, resolved):
-    """Fill v['duration'] for each video. If tags_map is provided, cache durations
-    in the tags file (saved only when something new was probed)."""
-    if tags_map is None:
-        from simpleparty.tagger import _get_duration
-        for v in videos:
-            v['duration'] = _get_duration(Path(root) / v['path'])
-        return
-    from simpleparty.tagger import get_video_duration, save_tags
-    changed = False
+def durations_from_tags(videos, tags_map):
+    """Return new video dicts with 'duration' filled from cached tag entries.
+
+    A cached duration counts only when its duration_mtime matches the
+    file's mtime; anything else sorts as 0.0 until the background probe
+    (media._maybe_start_durations) refreshes the cache."""
+    tags_map = tags_map or {}
+    out = []
     for v in videos:
-        dur, ch = get_video_duration(
-            v['name'], Path(root) / v['path'], tags_map, v.get('mtime', 0.0),
-        )
-        v['duration'] = dur
-        changed = changed or ch
-    if changed:
-        save_tags(resolved, tags_map)
+        entry = tags_map.get(v['name'], {})
+        dur = entry.get('duration')
+        cached_ok = dur is not None and entry.get('duration_mtime') == v.get('mtime', 0.0)
+        out.append({**v, 'duration': dur if cached_ok else 0.0})
+    return out
 
 
 def filter_videos_by_tags(videos, lower_index, selected_tags):

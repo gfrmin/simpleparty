@@ -272,3 +272,11 @@ def test_static_css(srv):
 def test_static_unknown_404(srv):
     status, _, _ = request(srv, 'GET', '/static/nope.css')
     assert status == 404
+
+
+def test_browse_sort_by_length_returns_immediately(srv):
+    # Durations come from the tags cache; missing ones sort as 0 and are
+    # probed in the background (no ffmpeg here, so no probe is spawned).
+    status, _, body = request(srv, 'GET', '/browse?sort=length')
+    assert status == 200
+    assert 'a.mp4' in body.decode()

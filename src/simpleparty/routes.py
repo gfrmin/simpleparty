@@ -14,7 +14,7 @@ from pathlib import Path
 
 from simpleparty import jobs
 from simpleparty.library import (
-    _populate_durations,
+    durations_from_tags,
     filter_videos_by_starred,
     filter_videos_by_tags,
     find_video_idx,
@@ -28,6 +28,7 @@ from simpleparty.library import (
 )
 from simpleparty.media import (
     _is_mpegts,
+    _maybe_start_durations,
     _maybe_start_thumbs,
     _probe_streams,
     _remux_mpegts,
@@ -135,10 +136,12 @@ def handle_browse(handler, root):
         send_html(handler, render_error_page(rel_path, data['error']), status)
         return
     view, resolved, tags_map = ctx['view'], ctx['resolved'], ctx['tags_map']
+    duration_pending = False
     if view.sort == 'length':
-        if tags_map:
-            tags_map = {k: dict(v) for k, v in tags_map.items()}
-        _populate_durations(root, data['videos'], tags_map, resolved)
+        from simpleparty.tagger import load_tags
+        dur_source = tags_map if tags_map is not None else load_tags(resolved)
+        data['videos'] = durations_from_tags(data['videos'], dur_source)
+        duration_pending = _maybe_start_durations(resolved, data['videos'], dur_source)
     data['videos'] = sort_videos(data['videos'], view.sort, view.direction)
     from simpleparty.tagger import videos_with_frames
     _maybe_start_thumbs(resolved, data['videos'],
@@ -146,6 +149,7 @@ def handle_browse(handler, root):
     send_html(handler, render_browse_page(
         data, view, tags_map=tags_map,
         lower_index=ctx['lower_index'], thumbs=ctx['thumbs'],
+        duration_pending=duration_pending,
     ))
 
 
@@ -163,9 +167,10 @@ def handle_play(handler, root):
     tags_map = ctx.get('tags_map')
     resolved = ctx.get('resolved')
     if view.sort == 'length' and resolved is not None:
-        if tags_map:
-            tags_map = {k: dict(v) for k, v in tags_map.items()}
-        _populate_durations(root, data['videos'], tags_map, resolved)
+        from simpleparty.tagger import load_tags
+        dur_source = tags_map if tags_map is not None else load_tags(resolved)
+        data['videos'] = durations_from_tags(data['videos'], dur_source)
+        _maybe_start_durations(resolved, data['videos'], dur_source)
     if 'videos' in data:
         data['videos'] = sort_videos(data['videos'], view.sort, view.direction)
 
