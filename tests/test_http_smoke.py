@@ -79,11 +79,22 @@ def request(server, method, path, body=None, headers=None):
 
 
 def post_form(server, path, fields):
+    # `fields` may be a dict or a list of (k, v) tuples (for repeated fields).
     body = urllib.parse.urlencode(fields)
     return request(
         server, 'POST', path, body=body,
         headers={'Content-Type': 'application/x-www-form-urlencoded'},
     )
+
+
+def _embed_video(media_root, rel_dir, name):
+    """Write a fresh cached embedding so the video counts as 'embedded'."""
+    import numpy as np
+    from simpleparty.embeddings import cached_embedding_path
+    d = media_root if rel_dir == '' else media_root / rel_dir
+    npy, _fail = cached_embedding_path(str(d), name)
+    npy.parent.mkdir(parents=True, exist_ok=True)
+    np.save(npy, np.ones(4, dtype='float32'))
 
 
 # --- Browse ---
@@ -203,9 +214,11 @@ def test_suggest_button_hidden_without_model_or_vocab(srv):
     assert 'Suggest' not in text
 
 
-def test_suggest_button_labels_zero_shot_when_only_vocab(srv):
+def test_suggest_button_labels_zero_shot_when_only_vocab(srv, media_root):
     # b.mp4 is untagged; the directory has a confirmed tag ('cat') but no model,
-    # so the per-video button must advertise the zero-shot path.
+    # so the per-video button must advertise the zero-shot path. Suggest is now
+    # gated on the video being embedded, so embed it first.
+    _embed_video(media_root, '', 'b.mp4')
     status, _, body = request(srv, 'GET', '/play?path=&idx=1&sort=name&dir=asc')
     text = body.decode()
     assert status == 200
@@ -217,6 +230,7 @@ def test_suggest_button_labels_zero_shot_when_only_vocab(srv):
 def test_suggest_button_labels_model_when_model_present(srv, media_root):
     # A model checkpoint existing flips the button to the supervised label.
     (media_root / '.simpleparty' / 'model.pt').write_bytes(b'stub')
+    _embed_video(media_root, '', 'b.mp4')  # Suggest requires an embedding
     status, _, body = request(srv, 'GET', '/play?path=&idx=1&sort=name&dir=asc')
     text = body.decode()
     assert status == 200
@@ -247,6 +261,108 @@ def test_dir_suggest_and_confirm_all_routes_removed(srv):
     s2, _, _ = post_form(srv, '/confirm-all', {'path': ''})
     assert s1 == 404
     assert s2 == 404
+
+
+# --- Embed vs Train: coverage-gated actions ---
+
+def test_browse_shows_embed_and_badge_when_videos_missing(srv):
+    # No embeddings yet: the tag bar must offer Embed (all missing) + a coverage
+    # badge, and must NOT offer Train (nothing embedded to train on).
+    sp_server._config['has_ffmpeg'] = True
+    status, _, body = request(srv, 'GET', '/browse?path=')
+    text = body.decode()
+    assert status == 200
+    assert 'embedded' in text                 # coverage badge
+    assert 'Embed all missing (2)' in text     # a.mp4 + b.mp4
+    assert 'btn-train' not in text
+
+
+def test_browse_shows_train_when_all_embedded(srv, media_root):
+    sp_server._config['has_ffmpeg'] = True
+    _embed_video(media_root, '', 'a.mp4')
+    _embed_video(media_root, '', 'b.mp4')
+    status, _, body = request(srv, 'GET', '/browse?path=')
+    text = body.decode()
+    assert status == 200
+    assert 'btn-train' in text
+    assert 'Embed all missing' not in text     # nothing missing
+
+
+def test_browse_missing_videos_get_embed_checkbox(srv):
+    sp_server._config['has_ffmpeg'] = True
+    status, _, body = request(srv, 'GET', '/browse?path=')
+    text = body.decode()
+    assert 'class="embed-check"' in text
+    assert 'name="video" value="a.mp4"' in text
+
+
+def test_embed_all_missing_dispatches_all(srv, media_root, monkeypatch):
+    import simpleparty.embeddings as emb
+    seen = {}
+    done = threading.Event()
+
+    def rec(directory, names, max_frames=8, progress=None):
+        seen['names'] = list(names)
+        if progress is not None:
+            progress['running'] = False
+        done.set()
+
+    monkeypatch.setattr(emb, 'embed_videos', rec)
+    status, headers, _ = post_form(srv, '/embed', {'path': ''})
+    assert status == 200
+    assert done.wait(5)
+    assert sorted(seen['names']) == ['a.mp4', 'b.mp4']
+
+
+def test_embed_selected_subset(srv, media_root, monkeypatch):
+    import simpleparty.embeddings as emb
+    seen = {}
+    done = threading.Event()
+
+    def rec(directory, names, max_frames=8, progress=None):
+        seen['names'] = list(names)
+        if progress is not None:
+            progress['running'] = False
+        done.set()
+
+    monkeypatch.setattr(emb, 'embed_videos', rec)
+    post_form(srv, '/embed', [('path', ''), ('video', 'a.mp4')])
+    assert done.wait(5)
+    assert seen['names'] == ['a.mp4']
+
+
+def test_embed_ignores_already_embedded(srv, media_root, monkeypatch):
+    import simpleparty.embeddings as emb
+    _embed_video(media_root, '', 'a.mp4')  # already done
+    seen = {}
+    done = threading.Event()
+
+    def rec(directory, names, max_frames=8, progress=None):
+        seen['names'] = list(names)
+        if progress is not None:
+            progress['running'] = False
+        done.set()
+
+    monkeypatch.setattr(emb, 'embed_videos', rec)
+    post_form(srv, '/embed', [('path', ''), ('video', 'a.mp4'), ('video', 'b.mp4')])
+    assert done.wait(5)
+    assert seen['names'] == ['b.mp4']  # a.mp4 already embedded -> filtered out
+
+
+def test_suggest_one_409_on_unembedded_video(srv):
+    # Suggest must never embed: an un-embedded video is refused, not computed.
+    status, _, _ = post_form(srv, '/suggest-one', {'path': '', 'video': 'b.mp4'})
+    assert status == 409
+
+
+def test_play_page_offers_embed_when_unembedded(srv):
+    sp_server._config['has_ffmpeg'] = True
+    status, _, body = request(srv, 'GET', '/play?path=&idx=1&sort=name&dir=asc')
+    text = body.decode()
+    assert status == 200
+    assert 'video-title">b.mp4' in text
+    assert 'Embed this video' in text
+    assert 'Suggest' not in text
 
 
 # --- Video serving ---

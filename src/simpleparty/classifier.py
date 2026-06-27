@@ -357,9 +357,10 @@ def load_suspects(directory):
 # --- Build embeddings for the training set ---
 
 def build_training_embeddings(directory, tags_data, max_frames=DEFAULT_EMBED_FRAMES, progress=None):
-    """Embed every training video (cache hits are instant). Returns manifest of
-    (video_name, embedding_np, tags, rejected). Videos with no usable frames are
-    skipped."""
+    """Collect cached embeddings for the training videos. Training is a pure
+    *consumer*: it reads the cache (compute=False) and skips any video that has
+    not been embedded yet — embedding is the separate, explicit Embed step.
+    Returns a manifest of (video_name, embedding_np, tags, rejected)."""
     t0 = time.monotonic()
     entries = training_entries(tags_data)
     items = [(name, e) for name, e in entries.items()
@@ -367,7 +368,7 @@ def build_training_embeddings(directory, tags_data, max_frames=DEFAULT_EMBED_FRA
              and (e.get('tags') or e.get('rejected_tags'))]
 
     if progress is not None:
-        progress['phase'] = 'embedding videos'
+        progress['phase'] = 'loading embeddings'
         progress['total'] = len(items)
         progress['done'] = 0
 
@@ -376,14 +377,15 @@ def build_training_embeddings(directory, tags_data, max_frames=DEFAULT_EMBED_FRA
         if progress is not None:
             progress['done'] = i
             progress['current'] = name
-        emb = get_video_embedding(directory, name, max_frames=max_frames, progress=progress)
+        emb = get_video_embedding(directory, name, max_frames=max_frames,
+                                  progress=progress, compute=False)
         if emb is None:
-            continue
+            continue  # un-embedded; run Embed first
         manifest.append((name, emb, entry.get('tags', []), entry.get('rejected_tags', [])))
 
     if progress is not None:
         progress['done'] = len(items)
-    logger.debug('built %d/%d training embeddings (%.1fs)',
+    logger.debug('loaded %d/%d training embeddings (%.1fs)',
                  len(manifest), len(items), time.monotonic() - t0)
     return manifest
 
@@ -419,7 +421,9 @@ def _train_inner(directory, max_frames, min_tag_count, progress):
     prune_stale_embeddings(directory)
     manifest = build_training_embeddings(directory, tags_data, max_frames=max_frames, progress=progress)
     if len(manifest) < 8:
-        progress['error'] = f'Only {len(manifest)} videos embedded, need at least 8'
+        progress['error'] = (
+            f'Only {len(manifest)} tagged videos are embedded, need at least 8 — '
+            'run Embed first')
         progress['running'] = False
         return
 
