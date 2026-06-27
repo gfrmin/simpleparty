@@ -232,3 +232,29 @@ def test_render_marks_suspect_confirmed_tags():
     assert 'suspect-badge' in html
     # dog pill is not flagged
     assert html.count('video-tag-pill suspect') == 1
+
+
+def test_render_suggested_shows_source_and_scores():
+    from simpleparty.render import render_video_tags_inline
+    html = render_video_tags_inline(
+        'dir', 'v.mp4', ['cat', 'dog'], status='suggested',
+        scores={'cat': 0.91, 'dog': 0.42}, source='model')
+    assert '0.91' in html and '0.42' in html   # per-pill scores
+    assert 'model' in html                      # source surfaced once
+
+
+def test_render_suggested_marks_zero_shot_source():
+    from simpleparty.render import render_video_tags_inline
+    html = render_video_tags_inline(
+        'dir', 'v.mp4', ['cat'], status='suggested',
+        scores={'cat': 0.22}, source='zero-shot')
+    assert 'zero-shot' in html
+    assert '0.22' in html
+
+
+def test_render_suggested_without_scores_still_renders():
+    # Back-compat: an older suggested entry with no stored scores/source.
+    from simpleparty.render import render_video_tags_inline
+    html = render_video_tags_inline('dir', 'v.mp4', ['cat'], status='suggested')
+    assert 'cat' in html
+    assert 'btn-confirm' in html  # Accept button still present

@@ -189,33 +189,13 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
         tag_html = ''
         if data['videos'] and _config['allow_tag'] and _config['has_ffmpeg']:
             path_param = esc(data['path'])
-            # Check if model exists for this directory
-            from simpleparty.tagger import model_path as _model_path
             resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
-            has_model = _model_path(resolved_dir).exists() if resolved_dir.is_dir() else False
-            resolved_str = str(resolved_dir)
-            job = jobs.get_tag_job(resolved_str)
+            job = jobs.get_tag_job(str(resolved_dir))
             is_busy = bool(job and job.get('running'))
+            # Training is the only directory-wide action. Suggesting and
+            # accepting tags happen per-video on the play page, so a whole-folder
+            # pass can't silently bulk-write (or bulk-confirm) tags you never saw.
             tag_html = _render_train_btn(path_param, is_busy)
-            if has_model:
-                tag_html += (
-                    f'<form hx-post="/suggest" style="display:inline">'
-                    f'<input type="hidden" name="path" value="{path_param}">'
-                    f'<button class="btn">\U0001F3F7 Suggest tags</button>'
-                    f'</form>'
-                )
-            # Show "Confirm all" if there are suggested tags
-            if tags_map:
-                has_suggested = any(
-                    e.get('status') == 'suggested' for e in tags_map.values()
-                )
-                if has_suggested:
-                    tag_html += (
-                        f'<form hx-post="/confirm-all" style="display:inline">'
-                        f'<input type="hidden" name="path" value="{path_param}">'
-                        f'<button class="btn btn-confirm">\u2714 Confirm all</button>'
-                        f'</form>'
-                    )
             status_url = f'/tag-status?{urllib.parse.urlencode({"path": data["path"]})}'
             poll = 'every 2s' if is_busy else 'every 10s'
             tag_html += (
@@ -636,18 +616,28 @@ def render_error_page(path, error):
 
 
 def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed',
-                             suspect_tags=()):
+                             suspect_tags=(), scores=None, source=None):
     """Render tag pills with inline add/remove for the video play page.
 
     `suspect_tags` is a set of lowercased confirmed tags the classifier flagged
     as likely mislabeled; they get a visual badge. The existing remove button is
     the one-click fix.
+
+    For suggested tags, `source` ('model' or 'zero-shot') and `scores`
+    (tag -> confidence) are surfaced so the reviewer can judge each suggestion:
+    a sharp model hit reads very differently from a weak zero-shot cosine match.
     """
     is_suggested = status == 'suggested'
     suspect_set = {t.lower() for t in suspect_tags}
+    scores = scores or {}
+    src_icon = '\U0001F52E' if source == 'zero-shot' else '\U0001F3F7'  # 🔮 / 🏷
     pieces = ['<div class="video-tag-pills">']
 
     if is_suggested:
+        if source:
+            pieces.append(
+                f'<span class="suggest-source" title="how these were generated">'
+                f'{src_icon} via {esc(source)}</span> ')
         pieces.append(
             '<span class="visually-hidden">Suggested (unconfirmed) tags — accept or reject:</span> '
             f'<form hx-post="/confirm-tags" hx-target="#video-meta" hx-swap="innerHTML" '
@@ -667,8 +657,11 @@ def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'
     pill_class = 'video-tag-pill suggested' if is_suggested else 'video-tag-pill'
     for i, tag in enumerate(tags_list):
         if is_suggested:
+            score = scores.get(tag)
+            score_html = (f'<span class="tag-score" aria-hidden="true">{score:.2f}</span>'
+                          if isinstance(score, (int, float)) else '')
             pieces.append(
-                f'<span class="{pill_class}">{esc(tag)}'
+                f'<span class="{pill_class}">{esc(tag)}{score_html}'
                 f'<form hx-post="/reject-tag" hx-target="#video-meta" hx-swap="innerHTML" '
                 f'style="display:inline;margin:0;padding:0">'
                 f'<input type="hidden" name="path" value="{esc(rel_path)}">'
@@ -797,12 +790,16 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
             resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
             flagged = load_suspects(str(resolved_dir)).get(v['name'], [])
             suspect_tags = [s['tag'] for s in flagged if s.get('given') == 1]
-        meta_html = render_video_tags_inline(data['path'], v['name'], video_tags,
-                                             status=video_status, suspect_tags=suspect_tags)
+        meta_html = render_video_tags_inline(
+            data['path'], v['name'], video_tags, status=video_status,
+            suspect_tags=suspect_tags,
+            scores=video_entry.get('suggest_scores'),
+            source=video_entry.get('suggest_source'))
         if not video_tags or video_status in ('suggested', 'rejected'):
             # Show the button only when something can actually produce a
             # suggestion: a trained head, or — for the zero-shot fallback — at
-            # least one confirmed tag in this directory to use as a label.
+            # least one confirmed tag in this directory to use as a label. The
+            # label names which path will run so the result isn't a surprise.
             from simpleparty.tagger import model_path as _model_path
             resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
             has_model = _model_path(resolved_dir).exists()
@@ -810,12 +807,13 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
                 e.get('tags') and e.get('status', 'confirmed') != 'suggested'
                 for e in tags_map.values())
             if has_model or has_vocab:
+                mode = 'model' if has_model else 'zero-shot'
                 meta_html += (
                     f'<form hx-post="/suggest-one" hx-target="#video-meta" '
                     f'hx-swap="innerHTML" style="display:inline">'
                     f'<input type="hidden" name="path" value="{esc(data["path"])}">'
                     f'<input type="hidden" name="video" value="{esc(v["name"])}">'
-                    f'<button class="btn">\U0001F3F7 Suggest tags</button>'
+                    f'<button class="btn">\U0001F3F7 Suggest ({mode})</button>'
                     f'</form>'
                 )
         body += f'<div class="video-meta" id="video-meta">{meta_html}</div>'

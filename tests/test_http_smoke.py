@@ -195,12 +195,58 @@ def test_play_page_flags_suspect_tags(srv, media_root):
 
 def test_suggest_button_hidden_without_model_or_vocab(srv):
     # 'sub' has an untagged c.mp4, no model, and no confirmed tags -> nothing can
-    # produce a suggestion, so the 'Suggest tags' button must not be shown.
+    # produce a suggestion, so the 'Suggest' button must not be shown.
     status, _, body = request(srv, 'GET', '/play?path=sub&idx=0')
     text = body.decode()
     assert status == 200
     assert 'video-title">c.mp4' in text
-    assert 'Suggest tags' not in text
+    assert 'Suggest' not in text
+
+
+def test_suggest_button_labels_zero_shot_when_only_vocab(srv):
+    # b.mp4 is untagged; the directory has a confirmed tag ('cat') but no model,
+    # so the per-video button must advertise the zero-shot path.
+    status, _, body = request(srv, 'GET', '/play?path=&idx=1&sort=name&dir=asc')
+    text = body.decode()
+    assert status == 200
+    assert 'video-title">b.mp4' in text
+    assert 'zero-shot' in text
+    assert 'model)' not in text
+
+
+def test_suggest_button_labels_model_when_model_present(srv, media_root):
+    # A model checkpoint existing flips the button to the supervised label.
+    (media_root / '.simpleparty' / 'model.pt').write_bytes(b'stub')
+    status, _, body = request(srv, 'GET', '/play?path=&idx=1&sort=name&dir=asc')
+    text = body.decode()
+    assert status == 200
+    assert 'video-title">b.mp4' in text
+    assert 'Suggest (model)' in text
+
+
+def test_browse_has_no_mass_tagging_affordances(srv, media_root):
+    # Per-video review only: the directory bar must not offer whole-directory
+    # suggest or one-click confirm-all. The tag bar requires ffmpeg + a model,
+    # so force both so the assertion isn't vacuous.
+    sp_server._config['has_ffmpeg'] = True
+    (media_root / '.simpleparty' / 'model.pt').write_bytes(b'stub')
+    (media_root / '.simpleparty' / 'tags.json').write_text(json.dumps({
+        'a.mp4': {'tags': ['cat'], 'status': 'confirmed'},
+        'b.mp4': {'tags': ['dog'], 'status': 'suggested'},
+    }))
+    status, _, body = request(srv, 'GET', '/browse?path=')
+    text = body.decode()
+    assert status == 200
+    assert 'hx-post="/suggest"' not in text
+    assert '/confirm-all' not in text
+    assert 'Confirm all' not in text
+
+
+def test_dir_suggest_and_confirm_all_routes_removed(srv):
+    s1, _, _ = post_form(srv, '/suggest', {'path': ''})
+    s2, _, _ = post_form(srv, '/confirm-all', {'path': ''})
+    assert s1 == 404
+    assert s2 == 404
 
 
 # --- Video serving ---

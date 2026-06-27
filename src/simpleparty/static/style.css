@@ -183,6 +183,9 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .video-tag-pill.suggested{background:transparent;border:1px dashed #a78bfa;opacity:0.7}
 .video-tag-pill.suspect{background:#3a2a13;color:#fbbf24;border:1px solid #fbbf24}
 .suspect-badge{font-size:11px;line-height:1}
+.tag-score{font-size:10px;opacity:0.6;font-variant-numeric:tabular-nums;margin-left:2px}
+.suggest-source{font-size:11px;color:#a78bfa;opacity:0.8;margin-right:4px}
+.tag-done-hint{font-size:12px;color:#9ca3af;font-weight:400}
 .btn-confirm{color:#4ade80;border-color:#4ade80;font-size:12px;padding:2px 8px}
 .btn-confirm:hover{background:#166534}
 .btn-reject{color:#f87171;border-color:#f87171;font-size:12px;padding:2px 8px}
