@@ -337,6 +337,7 @@ def extract_keyframes(video_path, max_frames=3):
     tmpdir = tempfile.mkdtemp(prefix='simpleparty-frames-')
     duration = _get_duration(video_path)
     if duration <= 0:
+        shutil.rmtree(tmpdir, ignore_errors=True)
         return []
 
     positions = [duration * (i + 1) / (max_frames + 1) for i in range(max_frames)]
@@ -367,6 +368,9 @@ def extract_keyframes(video_path, max_frames=3):
     usable = [f for f in frames if not _is_dark_frame(f)]
     logger.debug('keyframes done for %s: %d usable of %d extracted (%.2fs)',
                  video_path, len(usable), len(frames), time.monotonic() - t0)
+    if not usable:
+        # Nothing for the caller to consume or clean up — drop the temp dir here.
+        shutil.rmtree(tmpdir, ignore_errors=True)
     return usable[:max_frames]
 
 

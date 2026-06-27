@@ -435,7 +435,6 @@ def handle_train(handler, root):
 
     form = read_form_body(handler)
     rel_path = form.get('path', '')
-    max_frames = int(form.get('frames', '1'))
     if not is_safe_rel_path(rel_path):
         handler.send_error(400, 'Invalid path')
         return
@@ -453,7 +452,7 @@ def handle_train(handler, root):
     t = threading.Thread(
         target=train,
         args=(resolved_str,),
-        kwargs={'max_frames': max_frames, 'progress': progress},
+        kwargs={'progress': progress},
         daemon=True,
     )
     t.start()
@@ -464,7 +463,8 @@ def handle_suggest(handler, root):
     if not _config['allow_tag']:
         handler.send_error(403, 'Tagging not enabled')
         return
-    from simpleparty.classifier import suggest_for_directory
+    from simpleparty.classifier import (
+        suggest_for_directory, zero_shot_suggest_for_directory)
     from simpleparty.tagger import model_path as _model_path
 
     form = read_form_body(handler)
@@ -478,20 +478,24 @@ def handle_suggest(handler, root):
         return
 
     mp = _model_path(resolved)
-    model_path = str(mp)
-    if not mp.exists():
-        handler.send_error(400, 'No trained model found. Train first.')
-        return
-
     resolved_str = str(resolved)
     progress = {'running': True, 'done': 0, 'total': 0, 'current': '', 'phase': 'suggesting'}
     if not jobs.claim_tag_job(resolved_str, progress):
         send_hx_redirect(handler, url_for_browse(rel_path))
         return
 
+    # With a trained head, run the supervised tagger; otherwise fall back to
+    # zero-shot (cold start) using the directory's confirmed-tag vocabulary.
+    if mp.exists():
+        target = suggest_for_directory
+        args = (resolved_str, str(mp))
+    else:
+        target = zero_shot_suggest_for_directory
+        args = (resolved_str,)
+
     t = threading.Thread(
-        target=suggest_for_directory,
-        args=(resolved_str, model_path),
+        target=target,
+        args=args,
         kwargs={'progress': progress, 'max_tags': _config['max_tags']},
         daemon=True,
     )
@@ -504,7 +508,8 @@ def handle_suggest_one(handler, root):
     if not _config['allow_tag']:
         handler.send_error(403, 'Tagging not enabled')
         return
-    from simpleparty.classifier import suggest_for_video
+    from simpleparty.classifier import (
+        RetrainRequired, suggest_for_video, zero_shot_suggest_for_video)
     from simpleparty.tagger import update_tags, model_path as _model_path
 
     form = read_form_body(handler)
@@ -519,11 +524,6 @@ def handle_suggest_one(handler, root):
         handler.send_error(400, 'Invalid request')
         return
 
-    mp = _model_path(resolved)
-    if not mp.exists():
-        handler.send_error(400, 'No trained model found. Train first.')
-        return
-
     if Path(video_name).name != video_name:
         handler.send_error(400, 'Invalid request')
         return
@@ -532,7 +532,16 @@ def handle_suggest_one(handler, root):
         handler.send_error(404, 'Video not found')
         return
 
-    results = suggest_for_video(str(video_path), str(mp), max_tags=_config['max_tags'])
+    # Use the trained head if present; otherwise zero-shot (cold start).
+    mp = _model_path(resolved)
+    try:
+        if mp.exists():
+            results = suggest_for_video(str(video_path), str(mp), max_tags=_config['max_tags'])
+        else:
+            results = zero_shot_suggest_for_video(str(video_path), max_tags=_config['max_tags'])
+    except RetrainRequired as e:
+        handler.send_error(409, str(e))
+        return
     if results:
         avg_conf = sum(c for _, c in results) / len(results)
         update_tags(resolved, lambda tags: {**tags, video_name: {

@@ -180,6 +180,29 @@ def test_play_empty_dir_redirects_to_browse(srv, media_root):
     assert headers['Location'] == '/browse?' + urllib.parse.urlencode({'path': 'empty'})
 
 
+def test_play_page_flags_suspect_tags(srv, media_root):
+    # a.mp4 has confirmed tag 'cat'; the classifier flagged it as likely wrong.
+    (media_root / '.simpleparty' / 'suspect_tags.json').write_text(json.dumps({
+        'a.mp4': [{'tag': 'cat', 'given': 1, 'prob': 0.01}],
+    }))
+    status, _, body = request(srv, 'GET', '/play?path=&idx=0&sort=name&dir=asc')
+    text = body.decode()
+    assert status == 200
+    assert 'video-title">a.mp4' in text  # confirm we're on a.mp4
+    assert 'video-tag-pill suspect' in text
+    assert 'suspect-badge' in text
+
+
+def test_suggest_button_hidden_without_model_or_vocab(srv):
+    # 'sub' has an untagged c.mp4, no model, and no confirmed tags -> nothing can
+    # produce a suggestion, so the 'Suggest tags' button must not be shown.
+    status, _, body = request(srv, 'GET', '/play?path=sub&idx=0')
+    text = body.decode()
+    assert status == 200
+    assert 'video-title">c.mp4' in text
+    assert 'Suggest tags' not in text
+
+
 # --- Video serving ---
 
 def test_video_full(srv):
