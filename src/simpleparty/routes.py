@@ -459,50 +459,6 @@ def handle_train(handler, root):
     send_hx_redirect(handler, url_for_browse(rel_path))
 
 
-def handle_suggest(handler, root):
-    if not _config['allow_tag']:
-        handler.send_error(403, 'Tagging not enabled')
-        return
-    from simpleparty.classifier import (
-        suggest_for_directory, zero_shot_suggest_for_directory)
-    from simpleparty.tagger import model_path as _model_path
-
-    form = read_form_body(handler)
-    rel_path = form.get('path', '')
-    if not is_safe_rel_path(rel_path):
-        handler.send_error(400, 'Invalid path')
-        return
-    resolved = resolve_path(root, rel_path)
-    if not resolved.is_dir():
-        handler.send_error(400, 'Not a directory')
-        return
-
-    mp = _model_path(resolved)
-    resolved_str = str(resolved)
-    progress = {'running': True, 'done': 0, 'total': 0, 'current': '', 'phase': 'suggesting'}
-    if not jobs.claim_tag_job(resolved_str, progress):
-        send_hx_redirect(handler, url_for_browse(rel_path))
-        return
-
-    # With a trained head, run the supervised tagger; otherwise fall back to
-    # zero-shot (cold start) using the directory's confirmed-tag vocabulary.
-    if mp.exists():
-        target = suggest_for_directory
-        args = (resolved_str, str(mp))
-    else:
-        target = zero_shot_suggest_for_directory
-        args = (resolved_str,)
-
-    t = threading.Thread(
-        target=target,
-        args=args,
-        kwargs={'progress': progress, 'max_tags': _config['max_tags']},
-        daemon=True,
-    )
-    t.start()
-    send_hx_redirect(handler, url_for_browse(rel_path))
-
-
 def handle_suggest_one(handler, root):
     """Suggest tags for a single video and return updated tag HTML."""
     if not _config['allow_tag']:
@@ -532,8 +488,10 @@ def handle_suggest_one(handler, root):
         handler.send_error(404, 'Video not found')
         return
 
-    # Use the trained head if present; otherwise zero-shot (cold start).
+    # Use the trained head if present; otherwise zero-shot (cold start). The
+    # source is persisted so the pills can advertise how they were produced.
     mp = _model_path(resolved)
+    source = 'model' if mp.exists() else 'zero-shot'
     try:
         if mp.exists():
             results = suggest_for_video(str(video_path), str(mp), max_tags=_config['max_tags'])
@@ -544,16 +502,19 @@ def handle_suggest_one(handler, root):
         return
     if results:
         avg_conf = sum(c for _, c in results) / len(results)
+        scores = {tag: round(float(c), 3) for tag, c in results}
         update_tags(resolved, lambda tags: {**tags, video_name: {
             **tags.get(video_name, {}),
             'tags': [tag for tag, _ in results],
             'status': 'suggested',
             'confidence': round(avg_conf, 3),
+            'suggest_source': source,
+            'suggest_scores': scores,
         }})
         send_html(handler, render_video_tags_inline(
             rel_path, video_name,
             [tag for tag, _ in results],
-            status='suggested',
+            status='suggested', scores=scores, source=source,
         ))
     else:
         send_html(handler, render_video_tags_inline(rel_path, video_name, []))
@@ -585,37 +546,6 @@ def handle_confirm_tags(handler, root):
 
     tags_list = updated.get(video_name, {}).get('tags', [])
     send_html(handler, render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'))
-
-
-def handle_confirm_all(handler, root):
-    if not _config['allow_tag']:
-        handler.send_error(403, 'Tagging not enabled')
-        return
-    from simpleparty.tagger import update_tags
-
-    form = read_form_body(handler)
-    rel_path = form.get('path', '')
-    if not is_safe_rel_path(rel_path):
-        handler.send_error(400, 'Invalid path')
-        return
-    resolved = resolve_path(root, rel_path)
-
-    if not resolved.is_dir():
-        handler.send_error(400, 'Invalid request')
-        return
-
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-
-    def _confirm_all(tags):
-        for entry in tags.values():
-            if entry.get('status') == 'suggested':
-                entry['status'] = 'confirmed'
-                entry['confirmed_at'] = now
-        return tags
-
-    update_tags(resolved, _confirm_all)
-    send_hx_redirect(handler, url_for_browse(rel_path))
 
 
 def handle_reject_tags(handler, root):
@@ -731,14 +661,11 @@ def handle_tag_status(handler, root):
     if not progress.get('running'):
         if progress.get('phase') == 'done':
             msg = esc(progress.get('current', 'Done'))
-            suggest = (
-                f'<form hx-post="/suggest" style="display:inline">'
-                f'<input type="hidden" name="path" value="{path_param}">'
-                f'<button class="btn">\U0001F3F7 Suggest tags</button>'
-                f'</form>'
-            )
+            # Suggesting is per-video now: open a video and use its Suggest button.
+            hint = ('<span class="tag-done-hint">Open a video to suggest tags '
+                    '(model).</span>')
             send_html(handler,
-                wrap(f'<span class="tag-done">\u2705 {msg} {suggest}</span>')
+                wrap(f'<span class="tag-done">\u2705 {msg} {hint}</span>')
                 + train_btn_oob(False))
         else:
             send_html(handler, wrap('', poll='every 10s'))
@@ -1014,10 +941,8 @@ POST_ROUTES = {
     '/unlock': handle_unlock,
     '/lock': handle_lock,
     '/train': handle_train,
-    '/suggest': handle_suggest,
     '/suggest-one': handle_suggest_one,
     '/confirm-tags': handle_confirm_tags,
-    '/confirm-all': handle_confirm_all,
     '/reject-tags': handle_reject_tags,
     '/reject-tag': handle_reject_tag,
     '/save-tags': handle_save_tags,
