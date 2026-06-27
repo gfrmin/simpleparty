@@ -93,6 +93,45 @@ def _render_train_btn(path_param, is_busy):
     )
 
 
+def render_coverage_controls(rel_path, coverage, is_busy):
+    """The tag-bar controls: a coverage badge plus the two coverage-gated
+    actions. Embed (only when videos are un-embedded) is the sole thing that
+    runs CLIP; Train (only when embeddings exist) consumes them. Rendered both
+    at page load and OOB-swapped by /tag-status on every poll, so finishing a
+    job live-updates the badge and which actions are offered."""
+    path_param = esc(rel_path)
+    total = coverage['total']
+    embedded = coverage['embedded']
+    missing = coverage['missing']
+    badge = (
+        f'<span class="coverage-badge" title="videos with CLIP embeddings">'
+        f'\U0001F9E0 {embedded}/{total} embedded'
+        + (f' · {missing} missing' if missing else '')
+        + '</span>'
+    )
+    embed_html = ''
+    if missing and not is_busy:
+        # "Embed selected" gathers checked per-row boxes; the hidden #embed-path
+        # rides along so the handler knows the directory. "Embed all missing"
+        # is the no-selection shortcut.
+        embed_html = (
+            f'<form hx-post="/embed" style="display:inline" id="embed-form">'
+            f'<input type="hidden" name="path" value="{path_param}">'
+            f'<button class="btn btn-embed" hx-disabled-elt="this">'
+            f'\U0001F9E0 Embed all missing ({missing})</button>'
+            f'</form>'
+            f'<input type="hidden" id="embed-path" name="path" value="{path_param}">'
+            f'<button class="btn btn-embed-selected" hx-post="/embed" '
+            f'hx-include=".embed-check:checked, #embed-path" hx-disabled-elt="this">'
+            f'\U0001F9E0 Embed selected</button>'
+        )
+    train_html = _render_train_btn(path_param, is_busy) if embedded else ''
+    return (
+        f'<span id="tag-controls" class="tag-controls">'
+        f'{badge}{embed_html}{train_html}</span>'
+    )
+
+
 PAGE_SIZE = 100        # browse grid items per chunk
 PLAYLIST_PAGE = 50     # play-page playlist items per chunk
 
@@ -115,12 +154,21 @@ def _browse_frag_url(path, view, offset):
     return '/browse?' + urllib.parse.urlencode(params)
 
 
-def render_video_item(v, i, data_path, view, *, current_idx=-1, tags_map=None, thumbs=frozenset()):
+def render_video_item(v, i, data_path, view, *, current_idx=-1, tags_map=None,
+                      thumbs=frozenset(), embed_missing=frozenset()):
     """One video card. `i` is the video's index in the full filtered+sorted
     list (play URLs are index-based)."""
     cls = ' playing' if i == current_idx else ''
     play_url = url_for_play(data_path, i, view, video=v['name'])
     pieces = [f'<div class="item item-video{cls}">']
+    if v['name'] in embed_missing:
+        # Un-embedded: a checkbox so this row can join an "Embed selected" batch.
+        pieces.append(
+            f'<label class="embed-check-label" title="select to embed">'
+            f'<input type="checkbox" class="embed-check" name="video" '
+            f'value="{esc(v["name"])}" aria-label="Select {esc(v["name"])} to embed">'
+            f'</label>'
+        )
     thumb_url = f'/thumb/{urllib.parse.quote(v["path"])}'
     if v['name'] in thumbs:
         thumb_html = f'<img src="{thumb_url}" loading="lazy" class="item-thumb" alt="">'
@@ -161,12 +209,14 @@ def render_video_item(v, i, data_path, view, *, current_idx=-1, tags_map=None, t
     return ''.join(pieces)
 
 
-def render_video_items(data, view, offset, *, current_idx=-1, tags_map=None, thumbs=frozenset()):
+def render_video_items(data, view, offset, *, current_idx=-1, tags_map=None,
+                       thumbs=frozenset(), embed_missing=frozenset()):
     """A chunk of video cards plus, when more remain, a lazy-load sentinel."""
     videos = data['videos']
     pieces = [
         render_video_item(v, offset + j, data['path'], view,
-                          current_idx=current_idx, tags_map=tags_map, thumbs=thumbs)
+                          current_idx=current_idx, tags_map=tags_map, thumbs=thumbs,
+                          embed_missing=embed_missing)
         for j, v in enumerate(videos[offset:offset + PAGE_SIZE])
     ]
     if offset + PAGE_SIZE < len(videos):
@@ -185,17 +235,20 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
     want_action_bar = bool(shuffle_btn) or (
         _config.get('allow_download') and (data['videos'] or data['dirs'])
     )
+    embed_missing = frozenset()
     if want_action_bar:
         tag_html = ''
         if data['videos'] and _config['allow_tag'] and _config['has_ffmpeg']:
-            path_param = esc(data['path'])
+            from simpleparty.embeddings import embedding_coverage
             resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
             job = jobs.get_tag_job(str(resolved_dir))
             is_busy = bool(job and job.get('running'))
-            # Training is the only directory-wide action. Suggesting and
-            # accepting tags happen per-video on the play page, so a whole-folder
-            # pass can't silently bulk-write (or bulk-confirm) tags you never saw.
-            tag_html = _render_train_btn(path_param, is_busy)
+            coverage = embedding_coverage(str(resolved_dir))
+            embed_missing = frozenset(coverage['missing_names'])
+            # Embed (produce) and Train (consume) are split, coverage-gated, and
+            # explicit. Suggesting/accepting tags stay per-video on the play page
+            # so a whole-folder pass can't silently bulk-write tags you never saw.
+            tag_html = render_coverage_controls(data['path'], coverage, is_busy)
             status_url = f'/tag-status?{urllib.parse.urlencode({"path": data["path"]})}'
             poll = 'every 2s' if is_busy else 'every 10s'
             tag_html += (
@@ -248,6 +301,7 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
     pieces.append(render_video_items(
         data, view, 0,
         current_idx=current_idx, tags_map=tags_map, thumbs=thumbs,
+        embed_missing=embed_missing,
     ))
 
     if not data['dirs'] and not data['videos']:
@@ -795,25 +849,49 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
             suspect_tags=suspect_tags,
             scores=video_entry.get('suggest_scores'),
             source=video_entry.get('suggest_source'))
-        if not video_tags or video_status in ('suggested', 'rejected'):
-            # Show the button only when something can actually produce a
-            # suggestion: a trained head, or — for the zero-shot fallback — at
-            # least one confirmed tag in this directory to use as a label. The
-            # label names which path will run so the result isn't a surprise.
-            from simpleparty.tagger import model_path as _model_path
-            resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
-            has_model = _model_path(resolved_dir).exists()
-            has_vocab = bool(tags_map) and any(
-                e.get('tags') and e.get('status', 'confirmed') != 'suggested'
-                for e in tags_map.values())
-            if has_model or has_vocab:
-                mode = 'model' if has_model else 'zero-shot'
+        from simpleparty.embeddings import video_is_embedded
+        resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
+        if video_is_embedded(str(resolved_dir), v['name']):
+            if not video_tags or video_status in ('suggested', 'rejected'):
+                # Show the button only when something can actually produce a
+                # suggestion: a trained head, or — for the zero-shot fallback — at
+                # least one confirmed tag in this directory to use as a label. The
+                # label names which path will run so the result isn't a surprise.
+                from simpleparty.tagger import model_path as _model_path
+                has_model = _model_path(resolved_dir).exists()
+                has_vocab = bool(tags_map) and any(
+                    e.get('tags') and e.get('status', 'confirmed') != 'suggested'
+                    for e in tags_map.values())
+                if has_model or has_vocab:
+                    mode = 'model' if has_model else 'zero-shot'
+                    meta_html += (
+                        f'<form hx-post="/suggest-one" hx-target="#video-meta" '
+                        f'hx-swap="innerHTML" style="display:inline">'
+                        f'<input type="hidden" name="path" value="{esc(data["path"])}">'
+                        f'<input type="hidden" name="video" value="{esc(v["name"])}">'
+                        f'<button class="btn">\U0001F3F7 Suggest ({mode})</button>'
+                        f'</form>'
+                    )
+        elif _config['has_ffmpeg']:
+            # Suggest needs an embedding first; embedding is the explicit step.
+            self_url = url_for_play(data['path'], idx, view, video=v['name'])
+            job = jobs.get_tag_job(str(resolved_dir))
+            if job and job.get('running'):
+                # Poll this page's #video-meta until the embedding lands, then
+                # the re-fetched fragment (now Suggest, no poller) self-terminates.
                 meta_html += (
-                    f'<form hx-post="/suggest-one" hx-target="#video-meta" '
-                    f'hx-swap="innerHTML" style="display:inline">'
+                    f'<span class="embed-pending">\U0001F9E0 Embedding this video…</span>'
+                    f'<span hx-get="{esc(self_url)}" hx-trigger="every 2s" '
+                    f'hx-select="#video-meta" hx-target="#video-meta" '
+                    f'hx-swap="outerHTML" style="display:none"></span>'
+                )
+            else:
+                meta_html += (
+                    f'<form hx-post="/embed" hx-swap="none" style="display:inline">'
                     f'<input type="hidden" name="path" value="{esc(data["path"])}">'
                     f'<input type="hidden" name="video" value="{esc(v["name"])}">'
-                    f'<button class="btn">\U0001F3F7 Suggest ({mode})</button>'
+                    f'<input type="hidden" name="redirect" value="{esc(self_url)}">'
+                    f'<button class="btn btn-embed">\U0001F9E0 Embed this video</button>'
                     f'</form>'
                 )
         body += f'<div class="video-meta" id="video-meta">{meta_html}</div>'

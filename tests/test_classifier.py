@@ -208,7 +208,7 @@ def test_train_flags_and_cleans_a_mislabeled_video(tmp_path, monkeypatch):
 
     save_tags(str(tmp_path), tags)
 
-    def fake_embed(directory, name, max_frames=8, progress=None):
+    def fake_embed(directory, name, max_frames=8, progress=None, compute=True):
         return vectors[name].copy()
 
     monkeypatch.setattr(clf, 'get_video_embedding', fake_embed)
@@ -222,6 +222,28 @@ def test_train_flags_and_cleans_a_mislabeled_video(tmp_path, monkeypatch):
     assert 'wrong.mp4' in suspects
     assert any(s['tag'] == 'blue' for s in suspects['wrong.mp4'])
     assert progress['cleaned_count'] >= 1
+
+
+def test_build_training_embeddings_is_cache_only(tmp_path, monkeypatch):
+    """Training must consume embeddings, never produce them: it reads the cache
+    with compute=False and silently skips un-embedded videos."""
+    import simpleparty.classifier as clf
+
+    for name in ('a.mp4', 'b.mp4'):
+        (tmp_path / name).write_bytes(b'')
+    tags = {
+        'a.mp4': {'tags': ['x'], 'status': 'confirmed'},
+        'b.mp4': {'tags': ['x'], 'status': 'confirmed'},
+    }
+
+    def cache_only(directory, name, max_frames=8, progress=None, compute=True):
+        assert compute is False, 'training must not compute embeddings'
+        return np.ones(4, dtype='float32') if name == 'a.mp4' else None
+
+    monkeypatch.setattr(clf, 'get_video_embedding', cache_only)
+    manifest = clf.build_training_embeddings(str(tmp_path), tags)
+    names = [m[0] for m in manifest]
+    assert names == ['a.mp4']  # b.mp4 un-embedded -> skipped, not computed
 
 
 def test_render_marks_suspect_confirmed_tags():

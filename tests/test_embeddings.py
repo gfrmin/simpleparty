@@ -15,6 +15,9 @@ from simpleparty.embeddings import (
     cached_embedding_path,
     fail_marker_path,
     prune_stale_embeddings,
+    embedding_coverage,
+    video_is_embedded,
+    get_video_embedding,
 )
 from simpleparty.tagger import SIMPLEPARTY_DIR
 
@@ -22,6 +25,22 @@ from simpleparty.tagger import SIMPLEPARTY_DIR
 def _make_video(path, content=b'data'):
     path.write_bytes(content)
     return path
+
+
+def _write_fresh_npy(directory, name):
+    """Write a valid cached embedding for `name` at its current stat key."""
+    import numpy as np
+    npy, _fail = cached_embedding_path(directory, name)
+    npy.parent.mkdir(parents=True, exist_ok=True)
+    np.save(npy, np.ones(4, dtype='float32'))
+    return npy
+
+
+def _write_fresh_fail(directory, name):
+    _npy, fail = cached_embedding_path(directory, name)
+    fail.parent.mkdir(parents=True, exist_ok=True)
+    fail.write_bytes(b'')
+    return fail
 
 
 def test_embeddings_dir_namespaced_by_model(tmp_path):
@@ -92,6 +111,70 @@ def test_prune_keeps_fresh_fail_marker(tmp_path):
 def test_prune_noop_when_no_cache_dir(tmp_path):
     # Should not raise when the embeddings dir was never created.
     prune_stale_embeddings(str(tmp_path))
+
+
+def test_coverage_classifies_embedded_missing_failed(tmp_path):
+    _make_video(tmp_path / 'embedded.mp4')
+    _make_video(tmp_path / 'missing.mp4')
+    _make_video(tmp_path / 'broken.mp4')
+    _write_fresh_npy(str(tmp_path), 'embedded.mp4')
+    _write_fresh_fail(str(tmp_path), 'broken.mp4')
+
+    cov = embedding_coverage(str(tmp_path))
+    assert cov['total'] == 3
+    assert cov['embedded'] == 1
+    assert cov['failed'] == 1
+    assert cov['missing'] == 1
+    # A permanently-failed video is NOT something Embed should retry.
+    assert cov['missing_names'] == ['missing.mp4']
+
+
+def test_coverage_counts_stale_embedding_as_missing(tmp_path):
+    video = _make_video(tmp_path / 'clip.mp4', b'one')
+    edir = embeddings_dir(str(tmp_path))
+    edir.mkdir(parents=True)
+    # An embedding from a previous encode (wrong stat key) is stale.
+    (edir / 'clip.mp4__123_456.npy').write_bytes(b'x')
+
+    cov = embedding_coverage(str(tmp_path))
+    assert cov['embedded'] == 0
+    assert cov['missing'] == 1
+    assert cov['missing_names'] == ['clip.mp4']
+
+
+def test_coverage_empty_dir(tmp_path):
+    cov = embedding_coverage(str(tmp_path))
+    assert cov == {'total': 0, 'embedded': 0, 'failed': 0,
+                   'missing': 0, 'missing_names': []}
+
+
+def test_video_is_embedded(tmp_path):
+    _make_video(tmp_path / 'yes.mp4')
+    _make_video(tmp_path / 'no.mp4')
+    _write_fresh_npy(str(tmp_path), 'yes.mp4')
+    assert video_is_embedded(str(tmp_path), 'yes.mp4') is True
+    assert video_is_embedded(str(tmp_path), 'no.mp4') is False
+    assert video_is_embedded(str(tmp_path), 'gone.mp4') is False
+
+
+def test_get_embedding_compute_false_returns_cache_hit(tmp_path):
+    import numpy as np
+    _make_video(tmp_path / 'clip.mp4')
+    _write_fresh_npy(str(tmp_path), 'clip.mp4')
+    emb = get_video_embedding(str(tmp_path), 'clip.mp4', compute=False)
+    assert emb is not None
+    assert np.allclose(emb, np.ones(4, dtype='float32'))
+
+
+def test_get_embedding_compute_false_does_not_compute_on_miss(tmp_path, monkeypatch):
+    _make_video(tmp_path / 'clip.mp4')
+
+    def _boom(*a, **k):
+        raise AssertionError('must not extract/encode when compute=False')
+
+    monkeypatch.setattr('simpleparty.embeddings.extract_keyframes', _boom)
+    monkeypatch.setattr('simpleparty.embeddings._get_duration', _boom)
+    assert get_video_embedding(str(tmp_path), 'clip.mp4', compute=False) is None
 
 
 def test_prune_leaves_inflight_temp_files_alone(tmp_path):
