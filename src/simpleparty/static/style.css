@@ -181,6 +181,8 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .video-tag-pills{display:flex;flex-wrap:wrap;gap:6px;align-items:center;width:100%}
 .video-tag-pill{display:inline-flex;align-items:center;background:#2d2d44;color:#a78bfa;padding:4px 10px;border-radius:12px;font-size:12px;white-space:nowrap;gap:4px}
 .video-tag-pill.suggested{background:transparent;border:1px dashed #a78bfa;opacity:0.7}
+.video-tag-pill.suspect{background:#3a2a13;color:#fbbf24;border:1px solid #fbbf24}
+.suspect-badge{font-size:11px;line-height:1}
 .btn-confirm{color:#4ade80;border-color:#4ade80;font-size:12px;padding:2px 8px}
 .btn-confirm:hover{background:#166534}
 .btn-reject{color:#f87171;border-color:#f87171;font-size:12px;padding:2px 8px}

@@ -1,33 +1,58 @@
-"""Train and run a multi-label image classifier for video tagging.
+"""Train and run a multi-label tagger from frozen CLIP embeddings.
 
-Trains an EfficientNet-B0 on confirmed tags, then suggests tags for
-untagged videos. Generic — works with any tag vocabulary.
+Each video is reduced once to a cached CLIP image embedding (see
+``embeddings.py``); training then fits a tiny multi-label ``nn.Linear`` head on
+those cached vectors. Because the embedding is the expensive, stable artifact and
+the head is disposable, retraining — and the label-cleanup loop below — is cheap.
+
+Robustness to noisy ground-truth labels is built in: k-fold out-of-fold (OOF)
+predictions flag confirmed tags the model strongly disagrees with (persisted for
+UI review) and auto-clean the most egregious ones out of the final fit. Frozen
+features + weight decay + label smoothing keep the head from memorizing noise.
 """
 
 import json
 import logging
-import os
-import shutil
-import tempfile
+import threading
 import time
+from collections import Counter
 from pathlib import Path
 
 logger = logging.getLogger('simpleparty.classifier')
 
 from simpleparty.tagger import (
-    SIMPLEPARTY_DIR, FRAMES_DIR, MODEL_FILENAME,
-    _get_duration, _downscale_frame,
-    confirmed_entries, extract_frame, load_tags, model_path,
-    training_entries,
-    thumb_path,
+    SIMPLEPARTY_DIR, MODEL_FILENAME,
+    load_tags, training_entries,
 )
+from simpleparty.embeddings import (
+    CLIP_MODEL_ID, DEFAULT_EMBED_FRAMES,
+    embed_texts, get_video_embedding, prune_stale_embeddings,
+)
+
+# Templates averaged per tag for zero-shot text prompts.
+ZERO_SHOT_TEMPLATES = ('{}', 'a photo of {}', 'a video of {}')
+ZERO_SHOT_MIN_SIM = 0.20
+
+SUSPECT_FILENAME = 'suspect_tags.json'
+
+# Noise thresholds. A label whose leak-free OOF prediction confidently
+# contradicts its given value is both surfaced for review (suspect badge) and
+# excluded from the training signal (auto-clean). We only ever touch the
+# training mask — never tags.json — so the user still sees and decides on every
+# flagged label. The positive floor stops auto-clean from erasing a rare tag.
+NOISE_FLAG_LOW = 0.10
+NOISE_FLAG_HIGH = 0.90
+MIN_POSITIVES_FLOOR = 2   # never auto-drop a tag below this many positives
+
+
+class RetrainRequired(RuntimeError):
+    """Raised when a saved model is incompatible and must be retrained."""
 
 
 def _require_torch():
-    """Import and return torch + torchvision, raising a clear error if missing."""
     try:
         import torch
-        import torchvision
+        import torchvision  # kept in the extra; harmless to require
         return torch, torchvision
     except ImportError:
         from simpleparty import __version__
@@ -37,14 +62,10 @@ def _require_torch():
         )
 
 
-# --- Vocabulary ---
+# --- Vocabulary (unchanged behavior) ---
 
 def build_vocabulary(tags_data, min_count=5):
-    """Build tag vocabulary from confirmed tag entries.
-
-    Returns sorted list of tags appearing >= min_count times.
-    """
-    from collections import Counter
+    """Sorted list of confirmed tags appearing >= min_count times."""
     counts = Counter()
     for entry in tags_data.values():
         if entry.get('status', 'confirmed') == 'suggested':
@@ -53,276 +74,337 @@ def build_vocabulary(tags_data, min_count=5):
             key = tag.lower().strip()
             if key:
                 counts[key] += 1
-
-    vocab = sorted(tag for tag, count in counts.items() if count >= min_count)
-    return vocab
+    return sorted(tag for tag, count in counts.items() if count >= min_count)
 
 
 def _encode_tags(tags, vocab, tag_to_idx, rejected_tags=()):
-    """Encode tags as (target, mask) tensors.
+    """(target, mask) tensors for one confirmed video.
 
-    target[i] = 1.0 for confirmed tags, 0.0 otherwise.
-    mask[i] = 1.0 for confirmed AND rejected tags (known positions), 0.0 for unknown.
-    Only masked positions contribute to loss during training.
-    """
+    Assume-absent: every vocab tag is a known label (mask=1). Confirmed tags are
+    positives (target=1); everything else — including explicitly rejected tags —
+    is a negative (target=0). This is the standard fixed-vocabulary multi-label
+    setup; the auto-clean pass removes confident false-negatives so genuinely
+    under-tagged videos don't poison training. `rejected_tags` is accepted for
+    signature stability (already negatives by default)."""
     import torch
     target = torch.zeros(len(vocab))
-    mask = torch.zeros(len(vocab))
+    mask = torch.ones(len(vocab))
     for tag in tags:
         key = tag.lower().strip()
         if key in tag_to_idx:
             target[tag_to_idx[key]] = 1.0
-            mask[tag_to_idx[key]] = 1.0
-    for tag in rejected_tags:
-        key = tag.lower().strip()
-        if key in tag_to_idx:
-            mask[tag_to_idx[key]] = 1.0
     return target, mask
 
 
-# --- Frame extraction ---
+def _pos_weights_from_tensors(Y, M, cap=10.0):
+    """Per-tag positive class weights (neg/pos) over known (masked) positions."""
+    pos = (Y * M).sum(dim=0)
+    known = M.sum(dim=0)
+    neg = known - pos
+    return (neg.clamp(min=1) / pos.clamp(min=1)).clamp(max=cap)
 
 
-def extract_training_frames(directory, tags_data, max_frames=1, progress=None):
-    """Extract frames for all training videos. Returns manifest list.
+# --- Model: tiny linear head ---
 
-    Each manifest entry: (frame_path, tags_list, rejected_tags_list).
-    Frames saved to {directory}/.simpleparty/frames/.
-    Also creates thumbnails as a side effect for videos that lack them.
+def _build_head(dim, num_classes):
+    """Multi-label linear probe head over frozen CLIP features."""
+    torch, _ = _require_torch()
+    return torch.nn.Sequential(
+        torch.nn.Dropout(0.1),
+        torch.nn.Linear(dim, num_classes),
+    )
+
+
+def save_model(path, head, vocab, thresholds, embed_dim):
+    """Persist a v2 checkpoint (head weights + metadata)."""
+    torch, _ = _require_torch()
+    torch.save({
+        'head_state_dict': head.state_dict(),
+        'vocab': list(vocab),
+        'thresholds': list(thresholds),
+        'clip_model_id': CLIP_MODEL_ID,
+        'embed_dim': int(embed_dim),
+        'num_classes': len(vocab),
+        'format_version': 2,
+    }, str(path))
+
+
+_loaded_model = None
+_load_lock = threading.Lock()
+
+
+def load_model(model_path):
+    """Load a v2 checkpoint for inference (cached singleton).
+
+    Raises RetrainRequired for legacy EfficientNet checkpoints or a backbone
+    mismatch — the embedding feature space would otherwise be incompatible.
     """
+    global _loaded_model
+    torch, _ = _require_torch()
+    with _load_lock:
+        if _loaded_model and _loaded_model.get('path') == model_path:
+            return _loaded_model
+
+        ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+        if 'clip_model_id' not in ckpt or ckpt.get('format_version', 1) < 2:
+            raise RetrainRequired(
+                'This model was trained by an older version (image backbone). '
+                'Retrain it — training is now fast.')
+        if ckpt['clip_model_id'] != CLIP_MODEL_ID:
+            raise RetrainRequired(
+                f"Model was trained with {ckpt['clip_model_id']} but the current "
+                f"backbone is {CLIP_MODEL_ID}. Retrain to use the new backbone.")
+
+        dim = ckpt['embed_dim']
+        vocab = ckpt['vocab']
+        head = _build_head(dim, len(vocab))
+        head.load_state_dict(ckpt['head_state_dict'])
+        head.eval()
+
+        _loaded_model = {
+            'path': model_path, 'head': head, 'vocab': vocab,
+            'thresholds': ckpt['thresholds'], 'clip_model_id': ckpt['clip_model_id'],
+            'embed_dim': dim,
+        }
+        return _loaded_model
+
+
+# --- Splits ---
+
+def _per_video_split(names, frac=0.8, seed=42):
+    """Deterministic per-video index split. Returns (train_idx, val_idx)."""
+    import random
+    idx = list(range(len(names)))
+    random.Random(seed).shuffle(idx)
+    split = int(len(idx) * frac)
+    return sorted(idx[:split]), sorted(idx[split:])
+
+
+def _kfold_indices(n, k, seed=42):
+    """List of k validation-index lists covering 0..n-1 disjointly."""
+    import random
+    idx = list(range(n))
+    random.Random(seed).shuffle(idx)
+    k = max(2, min(k, n))
+    return [sorted(idx[f::k]) for f in range(k)]
+
+
+# --- Loss / fitting ---
+
+def _bce_masked(logits, targets, masks, pos_weight, smoothing=0.05):
+    import torch
+    t = targets * (1.0 - smoothing) + 0.5 * smoothing
+    raw = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits, t, pos_weight=pos_weight, reduction='none')
+    return (raw * masks).sum() / masks.sum().clamp(min=1)
+
+
+def _fit_head(X, Y, M, dim, num_classes, pos_weight, *, epochs=500, lr=3e-3,
+              weight_decay=1e-2, smoothing=0.05, val=None):
+    """Full-batch train a linear head; if val=(Xv,Yv,Mv), keep best-on-val."""
+    import torch
+    head = _build_head(dim, num_classes).to(X.device)
+    opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=weight_decay)
+    best_state, best_val = None, float('inf')
+    for _ in range(epochs):
+        head.train()
+        opt.zero_grad()
+        loss = _bce_masked(head(X), Y, M, pos_weight, smoothing)
+        loss.backward()
+        opt.step()
+        if val is not None:
+            Xv, Yv, Mv = val
+            head.eval()
+            with torch.no_grad():
+                vl = _bce_masked(head(Xv), Yv, Mv, pos_weight, smoothing=0.0).item()
+            if vl < best_val:
+                best_val, best_state = vl, {k: v.clone() for k, v in head.state_dict().items()}
+    if best_state is not None:
+        head.load_state_dict(best_state)
+    head.eval()
+    return head
+
+
+def _kfold_oof_probs(X, Y, M, dim, num_classes, pos_weight, k=5, seed=42):
+    """Out-of-fold sigmoid probabilities (N, C) — leak-free predictions."""
+    import torch
+    n = X.shape[0]
+    probs = torch.zeros(n, num_classes, device=X.device)
+    for val_idx in _kfold_indices(n, k, seed):
+        val_set = set(val_idx)
+        train_idx = [i for i in range(n) if i not in val_set]
+        if not train_idx or not val_idx:
+            continue
+        ti = torch.tensor(train_idx, device=X.device)
+        vi = torch.tensor(val_idx, device=X.device)
+        # These heads are only used to *detect* noise, never deployed, so they
+        # run sharp: no label smoothing and light weight decay. Smoothing/strong
+        # decay would floor the probabilities and mask confident disagreements.
+        head = _fit_head(X[ti], Y[ti], M[ti], dim, num_classes, pos_weight,
+                         epochs=400, smoothing=0.0, weight_decay=1e-3)
+        with torch.no_grad():
+            probs[vi] = torch.sigmoid(head(X[vi]))
+    return probs
+
+
+# --- Thresholds ---
+
+def _best_f1_threshold(probs_i, labels_i):
+    """Sweep thresholds for one tag; return (best_threshold)."""
+    best_f1, best_t = 0.0, 0.5
+    for t in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9):
+        pred = (probs_i >= t).astype('float32')
+        tp = float((pred * labels_i).sum())
+        fp = float((pred * (1 - labels_i)).sum())
+        fn = float(((1 - pred) * labels_i).sum())
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+        if f1 > best_f1:
+            best_f1, best_t = f1, t
+    return best_t
+
+
+def _thresholds_from_probs(probs, targets, masks, vocab):
+    """Per-tag F1-optimal thresholds from (leak-free OOF) probabilities."""
+    import numpy as np
+    probs = np.asarray(probs)
+    targets = np.asarray(targets)
+    masks = np.asarray(masks)
+    thresholds = []
+    for c in range(len(vocab)):
+        m = masks[:, c] > 0.5
+        if not m.any():
+            thresholds.append(0.5)
+            continue
+        thresholds.append(_best_f1_threshold(probs[m, c], targets[m, c]))
+    return thresholds
+
+
+# --- Label-noise scoring (pure) ---
+
+def score_label_noise(probs, targets, masks, vocab, names,
+                      low=NOISE_FLAG_LOW, high=NOISE_FLAG_HIGH):
+    """Suspect labels: confirmed positives the model thinks absent, or
+    rejected/negatives it thinks present. Returns {video_name: [{tag,given,prob}]}."""
+    import numpy as np
+    probs = np.asarray(probs)
+    targets = np.asarray(targets)
+    masks = np.asarray(masks)
+    out = {}
+    for i in range(probs.shape[0]):
+        items = []
+        for c in range(probs.shape[1]):
+            if masks[i, c] <= 0.5:
+                continue
+            given = int(round(float(targets[i, c])))
+            p = float(probs[i, c])
+            if given == 1 and p < low:
+                items.append({'tag': vocab[c], 'given': 1, 'prob': p})
+            elif given == 0 and p > high:
+                items.append({'tag': vocab[c], 'given': 0, 'prob': p})
+        if items:
+            out[names[i]] = items
+    return out
+
+
+def _auto_clean_mask(M, probs, targets, vocab):
+    """Zero the mask at flagged (confidently-disagreeing) positions so they don't
+    train the head. Positives are protected by a per-tag floor; bad negatives
+    drop freely. Mutates and returns M (a tensor). Returns (M, dropped_count)."""
+    pos_per_tag = (targets * (M > 0.5).float()).sum(dim=0)
+    dropped = 0
+    n, c = probs.shape
+    for i in range(n):
+        for j in range(c):
+            if M[i, j] <= 0.5:
+                continue
+            given = int(round(float(targets[i, j])))
+            p = float(probs[i, j])
+            if given == 1 and p < NOISE_FLAG_LOW:
+                if pos_per_tag[j] > MIN_POSITIVES_FLOOR:
+                    M[i, j] = 0.0
+                    pos_per_tag[j] -= 1
+                    dropped += 1
+            elif given == 0 and p > NOISE_FLAG_HIGH:
+                M[i, j] = 0.0
+                dropped += 1
+    return M, dropped
+
+
+def _save_suspects(directory, suspects):
+    sp = Path(directory) / SIMPLEPARTY_DIR
+    sp.mkdir(exist_ok=True)
+    path = sp / SUSPECT_FILENAME
+    import os
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=str(sp), prefix='.suspect-', suffix='.tmp')
+    with os.fdopen(fd, 'w') as f:
+        json.dump(suspects, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, str(path))
+
+
+def load_suspects(directory):
+    """Saved suspect-label map for a directory, or {}."""
+    path = Path(directory) / SIMPLEPARTY_DIR / SUSPECT_FILENAME
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+# --- Build embeddings for the training set ---
+
+def build_training_embeddings(directory, tags_data, max_frames=DEFAULT_EMBED_FRAMES, progress=None):
+    """Embed every training video (cache hits are instant). Returns manifest of
+    (video_name, embedding_np, tags, rejected). Videos with no usable frames are
+    skipped."""
     t0 = time.monotonic()
-    frames_dir = Path(directory) / FRAMES_DIR
-    frames_dir.mkdir(parents=True, exist_ok=True)
-
     entries = training_entries(tags_data)
-    manifest = []
-    mid_idx = (max_frames - 1) // 2
+    items = [(name, e) for name, e in entries.items()
+             if (Path(directory) / name).exists()
+             and (e.get('tags') or e.get('rejected_tags'))]
 
-    # Pre-scan: classify videos into need-extraction vs already-have-frames
-    need_extract = []
-    have_frames = []
-    for video_name, entry in entries.items():
-        video_path = Path(directory) / video_name
-        if not video_path.exists():
-            continue
-        if not entry.get('tags') and not entry.get('rejected_tags'):
-            continue
-        frame_paths = [frames_dir / f'{video_name}.f{j}.jpg' for j in range(max_frames)]
-        if all(fp.exists() for fp in frame_paths):
-            have_frames.append(video_name)
-        else:
-            missing = [str(fp) for fp in frame_paths if not fp.exists()]
-            need_extract.append((video_name, missing))
-
-    logger.debug('training frames: %d entries, %d already have frames, %d need extraction',
-                 len(entries), len(have_frames), len(need_extract))
-    for name in have_frames:
-        logger.debug('  skip (frames exist): %s', name)
-    for name, missing in need_extract:
-        logger.debug('  need extraction: %s (missing: %s)', name, missing)
-
-    def _add_to_manifest(video_name, entry):
-        tags = entry.get('tags', [])
-        rejected = entry.get('rejected_tags', [])
-        for frame_idx in range(max_frames):
-            frame_path = frames_dir / f'{video_name}.f{frame_idx}.jpg'
-            if frame_path.exists():
-                manifest.append((str(frame_path), tags, rejected))
-
-    def _make_thumbnail(video_name):
-        tp = thumb_path(directory, video_name)
-        mid_frame = frames_dir / f'{video_name}.f{mid_idx}.jpg'
-        if not tp.exists() and mid_frame.exists():
-            _downscale_frame(str(mid_frame), str(tp))
-
-    # Build manifest from cached frames (instant, no progress needed)
-    for video_name in have_frames:
-        entry = entries[video_name]
-        _add_to_manifest(video_name, entry)
-        _make_thumbnail(video_name)
-
-    # Extract only what's missing
-    if need_extract and progress:
-        progress['phase'] = 'extracting frames'
-        progress['total'] = len(need_extract)
+    if progress is not None:
+        progress['phase'] = 'embedding videos'
+        progress['total'] = len(items)
         progress['done'] = 0
 
-    for i, (video_name, _missing) in enumerate(need_extract):
-        if progress:
+    manifest = []
+    for i, (name, entry) in enumerate(items):
+        if progress is not None:
             progress['done'] = i
-            progress['current'] = video_name
-
-        entry = entries[video_name]
-        video_path = Path(directory) / video_name
-        duration = _get_duration(video_path)
-        if duration <= 0:
+            progress['current'] = name
+        emb = get_video_embedding(directory, name, max_frames=max_frames, progress=progress)
+        if emb is None:
             continue
+        manifest.append((name, emb, entry.get('tags', []), entry.get('rejected_tags', [])))
 
-        timeout = max(30, int(duration / 10))
-        positions = [duration * (j + 1) / (max_frames + 1) for j in range(max_frames)]
-        for frame_idx, pos in enumerate(positions):
-            frame_name = f'{video_name}.f{frame_idx}.jpg'
-            frame_path = frames_dir / frame_name
-            if not frame_path.exists():
-                extract_frame(str(video_path), pos, str(frame_path), timeout=timeout)
-
-        _add_to_manifest(video_name, entry)
-        _make_thumbnail(video_name)
-
-    if need_extract and progress:
-        progress['done'] = len(need_extract)
-
-    logger.debug('training frame extraction done: %d manifest entries (%.1fs)',
-                 len(manifest), time.monotonic() - t0)
-
+    if progress is not None:
+        progress['done'] = len(items)
+    logger.debug('built %d/%d training embeddings (%.1fs)',
+                 len(manifest), len(items), time.monotonic() - t0)
     return manifest
-
-
-# --- Dataset ---
-
-def _build_dataset(manifest, vocab, tag_to_idx, train=True):
-    """Build a PyTorch Dataset from the manifest."""
-    torch, torchvision = _require_torch()
-    from torchvision import transforms
-
-    if train:
-        transform = transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
-    else:
-        transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
-
-    class FrameDataset(torch.utils.data.Dataset):
-        def __init__(self, items, tf):
-            self.items = items
-            self.tf = tf
-
-        def __len__(self):
-            return len(self.items)
-
-        def __getitem__(self, idx):
-            from PIL import Image
-            path, tags, rejected = self.items[idx]
-            img = Image.open(path).convert('RGB')
-            img = self.tf(img)
-            target, mask = _encode_tags(tags, vocab, tag_to_idx, rejected_tags=rejected)
-            return img, target, mask
-
-    return FrameDataset(manifest, transform)
-
-
-# --- Model ---
-
-def _build_model(num_classes, freeze_backbone=True):
-    """Build EfficientNet-B0 with a multi-label head."""
-    torch, torchvision = _require_torch()
-    from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
-
-    model = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
-    if freeze_backbone:
-        for param in model.features.parameters():
-            param.requires_grad = False
-
-    in_features = model.classifier[1].in_features
-    model.classifier = torch.nn.Sequential(
-        torch.nn.Dropout(0.3),
-        torch.nn.Linear(in_features, num_classes),
-    )
-    return model
-
-
-def _compute_pos_weights(manifest, vocab, tag_to_idx, cap=10.0):
-    """Compute positive class weights from known (masked) positions only."""
-    torch, _ = _require_torch()
-    pos_counts = torch.zeros(len(vocab))
-    known_counts = torch.zeros(len(vocab))
-    for _, tags, rejected in manifest:
-        for tag in tags:
-            key = tag.lower().strip()
-            if key in tag_to_idx:
-                pos_counts[tag_to_idx[key]] += 1
-                known_counts[tag_to_idx[key]] += 1
-        for tag in rejected:
-            key = tag.lower().strip()
-            if key in tag_to_idx:
-                known_counts[tag_to_idx[key]] += 1
-    neg_counts = known_counts - pos_counts
-    weights = neg_counts.clamp(min=1) / pos_counts.clamp(min=1)
-    return weights.clamp(max=cap)
-
-
-def _find_thresholds(model, val_loader, vocab, device):
-    """Find per-tag optimal thresholds on validation set."""
-    torch, _ = _require_torch()
-    model.eval()
-    all_probs = []
-    all_targets = []
-    all_masks = []
-    with torch.no_grad():
-        for imgs, targets, masks in val_loader:
-            imgs = imgs.to(device)
-            logits = model(imgs)
-            probs = torch.sigmoid(logits).cpu()
-            all_probs.append(probs)
-            all_targets.append(targets)
-            all_masks.append(masks)
-
-    all_probs = torch.cat(all_probs)
-    all_targets = torch.cat(all_targets)
-    all_masks = torch.cat(all_masks)
-
-    thresholds = []
-    for i in range(len(vocab)):
-        m = all_masks[:, i].bool()
-        best_f1, best_t = 0.0, 0.5
-        if not m.any():
-            thresholds.append(best_t)
-            continue
-        probs_i = all_probs[:, i][m]
-        labels_i = all_targets[:, i][m]
-        for t in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
-            pred = (probs_i >= t).float()
-            tp = (pred * labels_i).sum()
-            fp = (pred * (1 - labels_i)).sum()
-            fn = ((1 - pred) * labels_i).sum()
-            precision = tp / (tp + fp + 1e-8)
-            recall = tp / (tp + fn + 1e-8)
-            f1 = 2 * precision * recall / (precision + recall + 1e-8)
-            if f1 > best_f1:
-                best_f1, best_t = f1.item(), t
-        thresholds.append(best_t)
-
-    return thresholds
 
 
 # --- Training ---
 
-def train(directory, max_frames=1, min_tag_count=5, progress=None):
-    """Train a classifier from confirmed tags in a directory.
-
-    Saves model to {directory}/.simpleparty-model.pt.
-    Progress dict is mutated with phase/done/total/current updates.
-    """
+def train(directory, max_frames=DEFAULT_EMBED_FRAMES, min_tag_count=5, progress=None):
+    """Train a linear-probe tagger from confirmed tags in a directory."""
     if progress is None:
         progress = {}
     try:
         _train_inner(directory, max_frames, min_tag_count, progress)
     except Exception as e:
+        logger.exception('training failed')
         progress['error'] = str(e)
         progress['running'] = False
 
 
 def _train_inner(directory, max_frames, min_tag_count, progress):
-    progress['phase'] = 'loading PyTorch'
+    import numpy as np
+    progress['phase'] = 'loading'
     torch, _ = _require_torch()
 
     tags_data = load_tags(directory)
@@ -331,218 +413,104 @@ def _train_inner(directory, max_frames, min_tag_count, progress):
         progress['error'] = f'Need at least 2 tags with >= {min_tag_count} occurrences'
         progress['running'] = False
         return
-
     tag_to_idx = {tag: i for i, tag in enumerate(vocab)}
-    progress['phase'] = 'building vocabulary'
     progress['vocab_size'] = len(vocab)
 
-    # Extract frames
-    manifest = extract_training_frames(directory, tags_data, max_frames=max_frames, progress=progress)
-    if len(manifest) < 10:
-        progress['error'] = f'Only {len(manifest)} frames extracted, need at least 10'
+    prune_stale_embeddings(directory)
+    manifest = build_training_embeddings(directory, tags_data, max_frames=max_frames, progress=progress)
+    if len(manifest) < 8:
+        progress['error'] = f'Only {len(manifest)} videos embedded, need at least 8'
         progress['running'] = False
         return
 
-    # Train/val split (80/20 by video)
-    import random
-    random.seed(42)
-    shuffled = list(manifest)
-    random.shuffle(shuffled)
-    split = int(len(shuffled) * 0.8)
-    train_items, val_items = shuffled[:split], shuffled[split:]
-
-    train_ds = _build_dataset(train_items, vocab, tag_to_idx, train=True)
-    val_ds = _build_dataset(val_items, vocab, tag_to_idx, train=False)
-    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=2)
-    val_loader = torch.utils.data.DataLoader(val_ds, batch_size=64, shuffle=False, num_workers=2)
-
+    progress['phase'] = 'fitting head'
+    names = [m[0] for m in manifest]
+    dim = int(manifest[0][1].shape[0])
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    pos_weights = _compute_pos_weights(train_items, vocab, tag_to_idx).to(device)
-    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weights, reduction='none')
 
-    def masked_loss(logits, targets, masks):
-        raw = criterion(logits, targets)
-        return (raw * masks).sum() / masks.sum().clamp(min=1)
+    X = torch.from_numpy(np.stack([m[1] for m in manifest])).float().to(device)
+    Y = torch.zeros(len(manifest), len(vocab), device=device)
+    M = torch.zeros(len(manifest), len(vocab), device=device)
+    for i, (_, _, tags, rejected) in enumerate(manifest):
+        target, mask = _encode_tags(tags, vocab, tag_to_idx, rejected)
+        Y[i] = target.to(device)
+        M[i] = mask.to(device)
 
-    # Phase 1: frozen backbone
-    model = _build_model(len(vocab), freeze_backbone=True).to(device)
-    optimizer = torch.optim.Adam(
-        (p for p in model.parameters() if p.requires_grad), lr=1e-3,
-    )
+    pos_weight = _pos_weights_from_tensors(Y, M).to(device)
 
-    progress['phase'] = 'training (frozen backbone)'
-    for epoch in range(10):
-        model.train()
-        total_loss = 0
-        for imgs, targets, masks in train_loader:
-            imgs, targets, masks = imgs.to(device), targets.to(device), masks.to(device)
-            optimizer.zero_grad()
-            loss = masked_loss(model(imgs), targets, masks)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        progress['done'] = epoch + 1
-        progress['total'] = 20
-        progress['current'] = f'phase1 epoch {epoch+1}/10 loss={total_loss/len(train_loader):.4f}'
+    # Leak-free OOF predictions drive both noise detection and thresholds.
+    progress['phase'] = 'detecting label noise'
+    oof = _kfold_oof_probs(X, Y, M, dim, len(vocab), pos_weight)
+    oof_np = oof.cpu().numpy()
+    Y_np, M_np = Y.cpu().numpy(), M.cpu().numpy()
 
-    # Phase 2: unfreeze last 2 blocks
-    progress['phase'] = 'training (fine-tuning)'
-    for param in model.features[-2:].parameters():
-        param.requires_grad = True
-    optimizer = torch.optim.Adam(
-        (p for p in model.parameters() if p.requires_grad), lr=1e-4,
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3)
+    suspects = score_label_noise(oof_np, Y_np, M_np, vocab, names)
+    _save_suspects(directory, suspects)
+    progress['suspect_count'] = sum(len(v) for v in suspects.values())
 
-    best_val_loss = float('inf')
-    patience_counter = 0
+    # Auto-clean the most egregious labels out of the final fit.
+    M_clean, dropped = _auto_clean_mask(M.clone(), oof, Y, vocab)
+    progress['cleaned_count'] = dropped
 
-    for epoch in range(10):
-        model.train()
-        total_loss = 0
-        for imgs, targets, masks in train_loader:
-            imgs, targets, masks = imgs.to(device), targets.to(device), masks.to(device)
-            optimizer.zero_grad()
-            loss = masked_loss(model(imgs), targets, masks)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+    # Final head on all (cleaned) data, with a per-video holdout for early stop.
+    progress['phase'] = 'fitting head'
+    train_idx, val_idx = _per_video_split(names)
+    ti = torch.tensor(train_idx, device=device)
+    vi = torch.tensor(val_idx, device=device)
+    val = (X[vi], Y[vi], M_clean[vi]) if len(val_idx) else None
+    head = _fit_head(X[ti] if val else X, Y[ti] if val else Y,
+                     M_clean[ti] if val else M_clean,
+                     dim, len(vocab), pos_weight, val=val)
 
-        # Validate
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for imgs, targets, masks in val_loader:
-                imgs, targets, masks = imgs.to(device), targets.to(device), masks.to(device)
-                val_loss += masked_loss(model(imgs), targets, masks).item()
-        val_loss /= max(len(val_loader), 1)
-        scheduler.step(val_loss)
-
-        progress['done'] = 10 + epoch + 1
-        progress['current'] = f'phase2 epoch {epoch+1}/10 val_loss={val_loss:.4f}'
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= 5:
-                break
-
-    # Find per-tag thresholds
     progress['phase'] = 'tuning thresholds'
-    thresholds = _find_thresholds(model, val_loader, vocab, device)
+    thresholds = _thresholds_from_probs(oof_np, Y_np, M_np, vocab)
 
-    # Save model
     sp_dir = Path(directory) / SIMPLEPARTY_DIR
     sp_dir.mkdir(exist_ok=True)
     save_path = sp_dir / MODEL_FILENAME
-    torch.save({
-        'model_state_dict': model.cpu().state_dict(),
-        'vocab': vocab,
-        'thresholds': thresholds,
-        'num_classes': len(vocab),
-    }, str(save_path))
+    save_model(str(save_path), head.cpu(), vocab, thresholds, dim)
+
+    global _loaded_model
+    with _load_lock:
+        _loaded_model = None  # invalidate inference cache
 
     progress['phase'] = 'done'
     progress['running'] = False
     progress['model_path'] = str(save_path)
-    progress['current'] = f'Saved model with {len(vocab)} tags'
+    progress['current'] = (
+        f'Saved model with {len(vocab)} tags; '
+        f'{progress.get("suspect_count", 0)} suspect labels, {dropped} auto-cleaned')
 
 
 # --- Inference ---
 
-_loaded_model = None
-
-
-def load_model(model_path):
-    """Load a trained model for inference. Cached as singleton."""
-    global _loaded_model
-    torch, torchvision = _require_torch()
-    from torchvision import transforms
-
-    if _loaded_model and _loaded_model.get('path') == model_path:
-        return _loaded_model
-
-    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
-    vocab = checkpoint['vocab']
-    model = _build_model(len(vocab), freeze_backbone=False)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
-
-    transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-
-    _loaded_model = {
-        'path': model_path,
-        'model': model,
-        'vocab': vocab,
-        'thresholds': checkpoint['thresholds'],
-        'transform': transform,
-        'device': device,
-    }
-    return _loaded_model
-
-
-def classify_frame(image_path, model_info):
-    """Classify a single frame. Returns list of (tag, confidence) tuples."""
-    torch, _ = _require_torch()
-    from PIL import Image
-
-    img = Image.open(image_path).convert('RGB')
-    tensor = model_info['transform'](img).unsqueeze(0).to(model_info['device'])
-
-    with torch.no_grad():
-        logits = model_info['model'](tensor)[0]
-        probs = torch.sigmoid(logits)
-
-    results = []
-    for i, (prob, thresh) in enumerate(zip(probs, model_info['thresholds'])):
-        if prob.item() >= thresh:
-            results.append((model_info['vocab'][i], prob.item()))
-
-    return sorted(results, key=lambda x: -x[1])
-
-
-def suggest_for_video(video_path, model_path, max_frames=1, max_tags=10):
+def suggest_for_video(video_path, model_path, max_tags=10):
     """Suggest tags for a single video. Returns list of (tag, confidence)."""
-    from simpleparty.tagger import extract_keyframes
-
-    model_info = load_model(model_path)
-    frames = extract_keyframes(video_path, max_frames=max_frames)
-    if not frames:
+    import torch
+    info = load_model(model_path)
+    directory = str(Path(video_path).parent)
+    name = Path(video_path).name
+    emb = get_video_embedding(directory, name)
+    if emb is None:
         return []
-
-    tmpdir = frames[0].parent
-
-    try:
-        all_results = {}
-        for frame in frames:
-            for tag, conf in classify_frame(str(frame), model_info):
-                if tag not in all_results or conf > all_results[tag]:
-                    all_results[tag] = conf
-        return sorted(all_results.items(), key=lambda x: -x[1])[:max_tags]
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    x = torch.from_numpy(emb).float().unsqueeze(0)
+    with torch.no_grad():
+        probs = torch.sigmoid(info['head'](x))[0]
+    results = []
+    for i, (prob, thresh) in enumerate(zip(probs.tolist(), info['thresholds'])):
+        if prob >= thresh:
+            results.append((info['vocab'][i], prob))
+    return sorted(results, key=lambda x: -x[1])[:max_tags]
 
 
-def suggest_for_directory(directory, model_path, progress=None, max_frames=1, max_tags=10):
-    """Suggest tags for all untagged videos in a directory.
-
-    Saves suggestions with status='suggested' to the tags file.
-    """
+def suggest_for_directory(directory, model_path, progress=None, max_tags=10):
+    """Suggest tags for all untagged videos in a directory."""
     if progress is None:
         progress = {}
     try:
-        _suggest_inner(directory, model_path, progress, max_frames, max_tags)
+        _suggest_inner(directory, model_path, progress, max_tags)
     except Exception as e:
+        logger.exception('suggestion failed')
         progress['error'] = str(e)
         progress['running'] = False
 
@@ -552,9 +520,8 @@ _SUGGEST_FLUSH_SECONDS = 60
 
 
 def _merge_suggestions(pending):
-    """Transform that writes only its own suggestion entries. Edits to other
-    videos always survive; a video the user manually tagged (confirmed)
-    while the job was running keeps their tags instead of the model's."""
+    """Transform that writes only its own suggestion entries; never clobbers a
+    video the user confirmed while the job ran."""
     def _apply(tags):
         for name, fields in pending.items():
             current = tags.get(name, {})
@@ -565,7 +532,15 @@ def _merge_suggestions(pending):
     return _apply
 
 
-def _suggest_inner(directory, model_path, progress, max_frames, max_tags):
+def _suggest_inner(directory, model_path, progress, max_tags):
+    def suggest_fn(video_path):
+        return suggest_for_video(video_path, model_path, max_tags=max_tags)
+    _run_suggest_pass(directory, suggest_fn, progress)
+
+
+def _run_suggest_pass(directory, suggest_fn, progress):
+    """Tag every untagged video via suggest_fn(video_path)->[(tag,conf)], writing
+    status='suggested' entries in batches. Shared by supervised and zero-shot."""
     from simpleparty.tagger import untagged_videos, update_tags
 
     tags_data = load_tags(directory)
@@ -576,7 +551,6 @@ def _suggest_inner(directory, model_path, progress, max_frames, max_tags):
     progress['done'] = 0
     progress['running'] = True
 
-    # Batch suggestions instead of rewriting the whole tags file per video.
     pending = {}
     last_flush = time.monotonic()
 
@@ -591,9 +565,7 @@ def _suggest_inner(directory, model_path, progress, max_frames, max_tags):
         for video_name in videos:
             progress['current'] = video_name
             video_path = Path(directory) / video_name
-
-            results = suggest_for_video(str(video_path), model_path, max_frames=max_frames, max_tags=max_tags)
-
+            results = suggest_fn(str(video_path))
             if results:
                 avg_conf = sum(c for _, c in results) / len(results)
                 pending[video_name] = {
@@ -603,10 +575,89 @@ def _suggest_inner(directory, model_path, progress, max_frames, max_tags):
                 }
             if len(pending) >= _SUGGEST_FLUSH_COUNT or time.monotonic() - last_flush > _SUGGEST_FLUSH_SECONDS:
                 flush()
-
             progress['done'] += 1
     finally:
         flush()
 
     progress['running'] = False
     progress['current'] = ''
+
+
+# --- Zero-shot (no trained head) ---
+
+def candidate_vocabulary(tags_data):
+    """All confirmed tags (any count) — the label space for zero-shot."""
+    return build_vocabulary(tags_data, min_count=1)
+
+
+def _zero_shot_rank(image_emb, text_embs, vocab, max_tags=10, min_sim=ZERO_SHOT_MIN_SIM):
+    """Rank vocab tags by cosine similarity of their text prompt to the video
+    embedding. Inputs are L2-normalized; cosine = dot product."""
+    import numpy as np
+    sims = np.asarray(text_embs) @ np.asarray(image_emb)
+    out = []
+    for idx in np.argsort(-sims):
+        s = float(sims[idx])
+        if s < min_sim:
+            break
+        out.append((vocab[idx], s))
+        if len(out) >= max_tags:
+            break
+    return out
+
+
+def zero_shot_text_matrix(vocab, templates=ZERO_SHOT_TEMPLATES, progress=None):
+    """(C, D) matrix: per tag, mean of its template prompt embeddings, normalized."""
+    import numpy as np
+    rows = []
+    for tag in vocab:
+        embs = embed_texts([t.format(tag) for t in templates], progress=progress)
+        v = embs.mean(0)
+        v = v / (np.linalg.norm(v) + 1e-8)
+        rows.append(v)
+    return np.stack(rows).astype('float32')
+
+
+def zero_shot_suggest_for_video(video_path, vocab=None, max_tags=10, min_sim=ZERO_SHOT_MIN_SIM):
+    """Suggest tags for a single video with no trained head."""
+    directory = str(Path(video_path).parent)
+    name = Path(video_path).name
+    if vocab is None:
+        vocab = candidate_vocabulary(load_tags(directory))
+    if not vocab:
+        return []
+    emb = get_video_embedding(directory, name)
+    if emb is None:
+        return []
+    text = zero_shot_text_matrix(vocab)
+    return _zero_shot_rank(emb, text, vocab, max_tags=max_tags, min_sim=min_sim)
+
+
+def zero_shot_suggest_for_directory(directory, progress=None, max_tags=10, min_sim=ZERO_SHOT_MIN_SIM):
+    """Cold-start: zero-shot tag every untagged video using the directory's
+    confirmed-tag vocabulary. No trained model needed."""
+    if progress is None:
+        progress = {}
+    try:
+        import numpy as np
+        vocab = candidate_vocabulary(load_tags(directory))
+        if len(vocab) < 1:
+            progress['error'] = 'No confirmed tags to use as zero-shot labels'
+            progress['running'] = False
+            return
+        progress['phase'] = 'embedding tag prompts'
+        text = zero_shot_text_matrix(vocab, progress=progress)
+
+        def suggest_fn(video_path):
+            d = str(Path(video_path).parent)
+            n = Path(video_path).name
+            emb = get_video_embedding(d, n)
+            if emb is None:
+                return []
+            return _zero_shot_rank(emb, text, vocab, max_tags=max_tags, min_sim=min_sim)
+
+        _run_suggest_pass(directory, suggest_fn, progress)
+    except Exception as e:
+        logger.exception('zero-shot suggestion failed')
+        progress['error'] = str(e)
+        progress['running'] = False
