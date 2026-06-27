@@ -193,6 +193,16 @@ def test_play_page_flags_suspect_tags(srv, media_root):
     assert 'suspect-badge' in text
 
 
+def test_suggest_button_hidden_without_model_or_vocab(srv):
+    # 'sub' has an untagged c.mp4, no model, and no confirmed tags -> nothing can
+    # produce a suggestion, so the 'Suggest tags' button must not be shown.
+    status, _, body = request(srv, 'GET', '/play?path=sub&idx=0')
+    text = body.decode()
+    assert status == 200
+    assert 'video-title">c.mp4' in text
+    assert 'Suggest tags' not in text
+
+
 # --- Video serving ---
 
 def test_video_full(srv):

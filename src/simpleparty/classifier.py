@@ -13,6 +13,7 @@ features + weight decay + label smoothing keep the head from memorizing noise.
 
 import json
 import logging
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -129,6 +130,7 @@ def save_model(path, head, vocab, thresholds, embed_dim):
 
 
 _loaded_model = None
+_load_lock = threading.Lock()
 
 
 def load_model(model_path):
@@ -139,31 +141,32 @@ def load_model(model_path):
     """
     global _loaded_model
     torch, _ = _require_torch()
-    if _loaded_model and _loaded_model.get('path') == model_path:
+    with _load_lock:
+        if _loaded_model and _loaded_model.get('path') == model_path:
+            return _loaded_model
+
+        ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+        if 'clip_model_id' not in ckpt or ckpt.get('format_version', 1) < 2:
+            raise RetrainRequired(
+                'This model was trained by an older version (image backbone). '
+                'Retrain it — training is now fast.')
+        if ckpt['clip_model_id'] != CLIP_MODEL_ID:
+            raise RetrainRequired(
+                f"Model was trained with {ckpt['clip_model_id']} but the current "
+                f"backbone is {CLIP_MODEL_ID}. Retrain to use the new backbone.")
+
+        dim = ckpt['embed_dim']
+        vocab = ckpt['vocab']
+        head = _build_head(dim, len(vocab))
+        head.load_state_dict(ckpt['head_state_dict'])
+        head.eval()
+
+        _loaded_model = {
+            'path': model_path, 'head': head, 'vocab': vocab,
+            'thresholds': ckpt['thresholds'], 'clip_model_id': ckpt['clip_model_id'],
+            'embed_dim': dim,
+        }
         return _loaded_model
-
-    ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
-    if 'clip_model_id' not in ckpt or ckpt.get('format_version', 1) < 2:
-        raise RetrainRequired(
-            'This model was trained by an older version (image backbone). '
-            'Retrain it — training is now fast.')
-    if ckpt['clip_model_id'] != CLIP_MODEL_ID:
-        raise RetrainRequired(
-            f"Model was trained with {ckpt['clip_model_id']} but the current "
-            f"backbone is {CLIP_MODEL_ID}. Retrain to use the new backbone.")
-
-    dim = ckpt['embed_dim']
-    vocab = ckpt['vocab']
-    head = _build_head(dim, len(vocab))
-    head.load_state_dict(ckpt['head_state_dict'])
-    head.eval()
-
-    _loaded_model = {
-        'path': model_path, 'head': head, 'vocab': vocab,
-        'thresholds': ckpt['thresholds'], 'clip_model_id': ckpt['clip_model_id'],
-        'embed_dim': dim,
-    }
-    return _loaded_model
 
 
 # --- Splits ---
@@ -468,7 +471,8 @@ def _train_inner(directory, max_frames, min_tag_count, progress):
     save_model(str(save_path), head.cpu(), vocab, thresholds, dim)
 
     global _loaded_model
-    _loaded_model = None  # invalidate inference cache
+    with _load_lock:
+        _loaded_model = None  # invalidate inference cache
 
     progress['phase'] = 'done'
     progress['running'] = False
