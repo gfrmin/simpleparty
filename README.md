@@ -12,7 +12,7 @@ Easily enjoy your private video collection. Browse and play local video files fr
 - **Mobile friendly** - responsive layout with large tap targets
 - **Auto-transcoding** - MKV/AVI/MOV files are automatically transcoded via ffmpeg or VLC (if installed)
 - **URL download** - paste a URL from the browse page or `/download` and yt-dlp fetches it into that directory (opt-in extra)
-- **AI video tagging** - automatically tag videos using a local Ollama vision model (opt-in, requires `--tag` flag)
+- **AI video tagging** - learns from your own tags using a local OpenCLIP model: train a classifier, suggest tags for untagged videos (with zero-shot fallback), and flag likely-mislabeled tags (opt-in `[classifier]` extra)
 - **Manual tagging** - add or edit tags on any video from the player page
 - **Star favourites** - star videos from the player page and filter the browse view to starred only
 - **Tag summary** - see all tags in a directory at a glance, with counts
@@ -55,8 +55,7 @@ simpleparty [/path/to/videos] [options]
   --no-tag              Disable all tagging features
   --no-download         Disable URL download feature
   --yt-dlp-format FMT   yt-dlp format selector
-  --tag-model MODEL     Ollama vision model (default: huihui_ai/qwen3-vl-abliterated:8b)
-  --ollama-url URL      Ollama API URL (default: http://localhost:11434)
+  --max-tags N          Max tags per video when suggesting (default: 10)
 ```
 
 ## Keyboard shortcuts
@@ -101,27 +100,36 @@ Any install of yt-dlp visible to Python will do; the feature is auto-detected at
 
 ## AI tagging
 
-Tagging is always available — you can manually add or edit tags from the video player page, no setup required. Tags are stored in a `.simpleparty-tags.json` file per directory.
+Tagging is always available — you can manually add or edit tags from the video player page, no setup required. Tags are stored in a `.simpleparty/tags.json` file per directory.
 
-For **AI-powered automatic tagging**, SimpleParty uses a local vision language model via [Ollama](https://ollama.com). This runs entirely on your machine — no data leaves your network. If Ollama and ffmpeg are available, a "Tag" button appears in the directory browser. Click it to tag all untagged videos in that directory. Tagging runs in the background — you can close the browser and it will keep going as long as the server is running.
+For **AI-powered automatic tagging**, SimpleParty learns from *your* tags. It runs a local [OpenCLIP](https://github.com/mlfoundations/open_clip) image encoder over a handful of frames per video, caches that embedding once, then trains a tiny classifier on top of the videos you've already tagged. Everything runs entirely on your machine — no data leaves your network, which matters for a private collection.
+
+How it works:
+
+- **Train** — once a directory has some confirmed tags, click **Train**. SimpleParty embeds each video (cached, so it only happens once) and fits a lightweight classifier. Because the embeddings are cached, re-training after editing tags takes *seconds*.
+- **Suggest** — click **Suggest tags** to tag untagged videos. Suggestions are unconfirmed until you accept them. If you haven't trained yet, it falls back to **zero-shot** tagging using your tag names directly, so you get useful suggestions with no training at all.
+- **Find mislabeled tags** — training also cross-checks your existing tags. Tags it strongly disagrees with are flagged with a ⚠ badge on the player page so you can fix them in one click. These flagged labels are also automatically excluded from training, so noisy tags don't degrade the model.
+
+Tagging runs in the background — you can close the browser and it keeps going while the server runs.
 
 ### AI tagging setup
 
-1. Install [Ollama](https://ollama.com)
-2. Pull a vision model: `ollama pull huihui_ai/qwen3-vl-abliterated:8b`
-3. Start SimpleParty — AI tagging is auto-detected:
+Install the optional classifier dependencies (pulls in PyTorch + OpenCLIP):
 
 ```sh
-simpleparty /path/to/videos
+uvx simpleparty[classifier] /path/to/videos
+# or, if installed: pip install 'simpleparty[classifier]'
 ```
+
+The first training run downloads the CLIP model weights (~3.9GB for the default `ViT-H-14`) once, then caches them.
 
 ### AI tagging requirements
 
-- **Ollama** running locally (or specify `--ollama-url`)
-- **ffmpeg** for extracting video keyframes
-- A GPU with ~8GB VRAM for the default 8B model (NVIDIA recommended)
+- **A CUDA GPU** (NVIDIA, ~6GB+ VRAM) — the encoder runs in fp16 and an RTX 4060 (8GB) is comfortable. It will fall back to CPU but embedding a large library that way is very slow.
+- **ffmpeg** for extracting video frames.
+- Tune suggestions per video with `--max-tags N` (default 10); disable all tagging with `--no-tag`.
 
-If these aren't available, SimpleParty still works — you just won't see the AI "Tag" button. Manual tagging always works.
+If these aren't available, SimpleParty still works — manual tagging always does.
 
 ## Why not Jellyfin/Plex?
 
