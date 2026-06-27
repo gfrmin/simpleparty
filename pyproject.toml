@@ -26,7 +26,11 @@ Homepage = "https://github.com/gfrmin/simpleparty"
 Repository = "https://github.com/gfrmin/simpleparty"
 
 [project.optional-dependencies]
-classifier = ["torch", "torchvision"]
+classifier = [
+    "open-clip-torch>=3.3.0",
+    "torch",
+    "torchvision",
+]
 download = ["yt-dlp"]
 
 [project.scripts]

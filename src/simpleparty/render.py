@@ -635,9 +635,16 @@ def render_error_page(path, error):
     return render_page('SimpleParty \u2014 Error', body)
 
 
-def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'):
-    """Render tag pills with inline add/remove for the video play page."""
+def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed',
+                             suspect_tags=()):
+    """Render tag pills with inline add/remove for the video play page.
+
+    `suspect_tags` is a set of lowercased confirmed tags the classifier flagged
+    as likely mislabeled; they get a visual badge. The existing remove button is
+    the one-click fix.
+    """
     is_suggested = status == 'suggested'
+    suspect_set = {t.lower() for t in suspect_tags}
     pieces = ['<div class="video-tag-pills">']
 
     if is_suggested:
@@ -674,8 +681,15 @@ def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'
             )
         else:
             remaining = ', '.join(t for j, t in enumerate(tags_list) if j != i)
+            is_suspect = tag.lower() in suspect_set
+            if is_suspect:
+                span_open = (f'<span class="{pill_class} suspect" '
+                             f'title="Likely mislabeled — remove if wrong">'
+                             f'<span class="suspect-badge" aria-hidden="true">⚠</span>')
+            else:
+                span_open = f'<span class="{pill_class}">'
             pieces.append(
-                f'<span class="{pill_class}">{esc(tag)}'
+                f'{span_open}{esc(tag)}'
                 f'<form hx-post="/save-tags" hx-target="#video-meta" hx-swap="innerHTML" '
                 f'style="display:inline;margin:0;padding:0">'
                 f'<input type="hidden" name="path" value="{esc(rel_path)}">'
@@ -777,19 +791,25 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         video_entry = tags_map.get(v['name'], {}) if tags_map else {}
         video_tags = video_entry.get('tags', [])
         video_status = video_entry.get('status', 'confirmed')
-        meta_html = render_video_tags_inline(data['path'], v['name'], video_tags, status=video_status)
-        if not video_tags or video_status in ('suggested', 'rejected'):
-            from simpleparty.tagger import model_path as _model_path
+        suspect_tags = ()
+        if video_status not in ('suggested', 'rejected'):
+            from simpleparty.classifier import load_suspects
             resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
-            if _model_path(resolved_dir).exists():
-                meta_html += (
-                    f'<form hx-post="/suggest-one" hx-target="#video-meta" '
-                    f'hx-swap="innerHTML" style="display:inline">'
-                    f'<input type="hidden" name="path" value="{esc(data["path"])}">'
-                    f'<input type="hidden" name="video" value="{esc(v["name"])}">'
-                    f'<button class="btn">\U0001F3F7 Suggest tags</button>'
-                    f'</form>'
-                )
+            flagged = load_suspects(str(resolved_dir)).get(v['name'], [])
+            suspect_tags = [s['tag'] for s in flagged if s.get('given') == 1]
+        meta_html = render_video_tags_inline(data['path'], v['name'], video_tags,
+                                             status=video_status, suspect_tags=suspect_tags)
+        if not video_tags or video_status in ('suggested', 'rejected'):
+            # Offered whether or not a head is trained: /suggest-one falls back
+            # to zero-shot when there's no model.
+            meta_html += (
+                f'<form hx-post="/suggest-one" hx-target="#video-meta" '
+                f'hx-swap="innerHTML" style="display:inline">'
+                f'<input type="hidden" name="path" value="{esc(data["path"])}">'
+                f'<input type="hidden" name="video" value="{esc(v["name"])}">'
+                f'<button class="btn">\U0001F3F7 Suggest tags</button>'
+                f'</form>'
+            )
         body += f'<div class="video-meta" id="video-meta">{meta_html}</div>'
 
     if tags_map:
