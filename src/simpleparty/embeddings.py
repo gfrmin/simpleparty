@@ -83,6 +83,48 @@ def _valid_cache_names(directory):
     return valid
 
 
+def embedding_coverage(directory):
+    """Per-video embedding state for a directory (pure filesystem, no GPU).
+
+    Returns ``{total, embedded, failed, missing, missing_names}`` where each
+    video is classified by the *current* stat key: a fresh ``.npy`` is
+    embedded, a fresh ``.fail`` is failed (permanently unreadable), anything
+    else (never embedded, or only a stale entry from a previous encode) is
+    missing. ``missing_names`` is sorted and excludes failed videos so Embed
+    never retries a file that cannot be read."""
+    total = embedded = failed = 0
+    missing_names = []
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        entries = []
+    for e in entries:
+        if e.name.startswith('.') or Path(e.name).suffix.lower() not in VIDEO_EXTENSIONS:
+            continue
+        stat_key = _stat_key(e.path)
+        if stat_key is None:
+            continue
+        total += 1
+        npy, fail = embed_cache_paths(directory, e.name, stat_key)
+        if npy.exists():
+            embedded += 1
+        elif fail.exists():
+            failed += 1
+        else:
+            missing_names.append(e.name)
+    missing_names.sort()
+    return {
+        'total': total, 'embedded': embedded, 'failed': failed,
+        'missing': len(missing_names), 'missing_names': missing_names,
+    }
+
+
+def video_is_embedded(directory, video_name):
+    """True if the video has a fresh cached embedding (cheap, no GPU)."""
+    paths = cached_embedding_path(directory, video_name)
+    return bool(paths and paths[0].exists())
+
+
 def prune_stale_embeddings(directory):
     """Delete cached embeddings/markers that are orphaned (video gone) or stale
     (video changed). Cheap; run at the start of training."""
@@ -240,9 +282,14 @@ def embed_texts(prompts, progress=None):
     return feats.float().cpu().numpy()
 
 
-def get_video_embedding(directory, video_name, max_frames=DEFAULT_EMBED_FRAMES, progress=None):
+def get_video_embedding(directory, video_name, max_frames=DEFAULT_EMBED_FRAMES,
+                        progress=None, compute=True):
     """Return the cached (or freshly computed) embedding for a video, or None
-    if it has no usable frames. Computing one writes the cache atomically."""
+    if it has no usable frames. Computing one writes the cache atomically.
+
+    With ``compute=False`` this is a pure cache read: a fresh ``.npy`` is
+    returned, but a miss returns None without ever running ffmpeg/CLIP. Used by
+    training, which must consume embeddings rather than produce them."""
     import numpy as np
     paths = cached_embedding_path(directory, video_name)
     if paths is None:
@@ -254,6 +301,8 @@ def get_video_embedding(directory, video_name, max_frames=DEFAULT_EMBED_FRAMES, 
         except (OSError, ValueError):
             pass  # corrupt cache file; recompute
     if fail.exists():
+        return None
+    if not compute:
         return None
 
     video_path = str(Path(directory) / video_name)
@@ -275,3 +324,30 @@ def get_video_embedding(directory, video_name, max_frames=DEFAULT_EMBED_FRAMES, 
     finally:
         if frames:
             shutil.rmtree(frames[0].parent, ignore_errors=True)
+
+
+def embed_videos(directory, names, max_frames=DEFAULT_EMBED_FRAMES, progress=None):
+    """Explicitly compute (and cache) embeddings for the named videos.
+
+    The slow, GPU-bound step, run as a background job. Drives the same
+    ``progress`` keys as training's embedding pass so ``/tag-status`` renders it
+    unchanged. Cache hits are instant, so this is resumable: embed, drop in new
+    videos, embed again — only the new ones do work."""
+    if progress is None:
+        progress = {}
+    try:
+        prune_stale_embeddings(directory)
+        progress['phase'] = 'embedding videos'
+        progress['total'] = len(names)
+        progress['done'] = 0
+        for i, name in enumerate(names):
+            progress['done'] = i
+            progress['current'] = name
+            get_video_embedding(directory, name, max_frames=max_frames, progress=progress)
+        progress['done'] = len(names)
+        progress['phase'] = 'done'
+    except Exception as e:
+        logger.exception('embedding failed')
+        progress['error'] = str(e)
+    finally:
+        progress['running'] = False

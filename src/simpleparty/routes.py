@@ -39,7 +39,7 @@ from simpleparty.media import (
     _transcode_plan,
 )
 from simpleparty.render import (
-    _render_train_btn,
+    render_coverage_controls,
     render_browse_page,
     render_playlist,
     render_video_items,
@@ -94,6 +94,14 @@ def read_form_body(handler):
     body = handler.rfile.read(length).decode('utf-8')
     params = urllib.parse.parse_qs(body)
     return {k: v[0] for k, v in params.items()}
+
+
+def read_form_multi(handler):
+    """Like read_form_body but preserves repeated fields as lists, for
+    multi-select posts (e.g. several `video=` from checked Embed checkboxes)."""
+    length = int(handler.headers.get('Content-Length', 0))
+    body = handler.rfile.read(length).decode('utf-8')
+    return urllib.parse.parse_qs(body)
 
 
 
@@ -152,9 +160,13 @@ def handle_browse(handler, root):
     # chunk requests as durations land; the 4s poller re-renders the whole
     # list anyway, so any duplicated/skipped row self-heals within a refresh.
     if params.get('frag') == 'list':
+        embed_missing = frozenset()
+        if _config['allow_tag'] and _config['has_ffmpeg']:
+            from simpleparty.embeddings import embedding_coverage
+            embed_missing = frozenset(embedding_coverage(str(resolved))['missing_names'])
         send_html(handler, render_video_items(
             data, view, max(0, safe_int(params.get('offset'))),
-            tags_map=tags_map, thumbs=ctx['thumbs'],
+            tags_map=tags_map, thumbs=ctx['thumbs'], embed_missing=embed_missing,
         ))
         return
     _maybe_start_thumbs(resolved, data['videos'], thumbs=ctx['thumbs'])
@@ -459,6 +471,52 @@ def handle_train(handler, root):
     send_hx_redirect(handler, url_for_browse(rel_path))
 
 
+def handle_embed(handler, root):
+    """Explicitly compute embeddings for a directory's missing videos (all, or a
+    selected subset). The only action that runs CLIP; Train consumes the result."""
+    if not _config['allow_tag']:
+        handler.send_error(403, 'Tagging not enabled')
+        return
+    from simpleparty import embeddings
+
+    form = read_form_multi(handler)
+    rel_path = (form.get('path') or [''])[0]
+    redirect = (form.get('redirect') or [''])[0]
+    requested = form.get('video', [])
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return
+    resolved = resolve_path(root, rel_path)
+    if not resolved.is_dir():
+        handler.send_error(400, 'Not a directory')
+        return
+
+    resolved_str = str(resolved)
+    target = redirect or url_for_browse(rel_path)
+    # Only ever embed videos that are actually missing; an empty selection means
+    # "all missing". This makes Embed idempotent and skips already-cached videos.
+    missing = set(embeddings.embedding_coverage(resolved_str)['missing_names'])
+    names = [n for n in requested if n in missing] if requested else sorted(missing)
+    if not names:
+        send_hx_redirect(handler, target)
+        return
+
+    progress = {'running': True, 'done': 0, 'total': len(names),
+                'current': '', 'phase': 'preparing'}
+    if not jobs.claim_tag_job(resolved_str, progress):
+        send_hx_redirect(handler, target)
+        return
+
+    t = threading.Thread(
+        target=embeddings.embed_videos,
+        args=(resolved_str, names),
+        kwargs={'progress': progress},
+        daemon=True,
+    )
+    t.start()
+    send_hx_redirect(handler, target)
+
+
 def handle_suggest_one(handler, root):
     """Suggest tags for a single video and return updated tag HTML."""
     if not _config['allow_tag']:
@@ -486,6 +544,13 @@ def handle_suggest_one(handler, root):
     video_path = resolved / video_name
     if not video_path.exists():
         handler.send_error(404, 'Video not found')
+        return
+
+    # Suggest is inference only — it must never embed. An un-embedded video is
+    # refused so the user runs the explicit Embed step first.
+    from simpleparty.embeddings import video_is_embedded
+    if not video_is_embedded(str(resolved), video_name):
+        handler.send_error(409, 'Video not embedded - run Embed first')
         return
 
     # Use the trained head if present; otherwise zero-shot (cold start). The
@@ -629,14 +694,16 @@ def handle_tag_status(handler, root):
         return
     resolved = str(resolve_path(root, rel_path))
     status_url = f'/tag-status?{urllib.parse.urlencode({"path": rel_path})}'
-    path_param = esc(rel_path)
 
     progress = jobs.get_tag_job(resolved)
 
-    # OOB swap to keep train button in sync
-    def train_btn_oob(busy):
-        btn = _render_train_btn(path_param, busy)
-        return btn.replace('id="train-form"', 'id="train-form" hx-swap-oob="true"', 1)
+    # OOB swap the whole coverage-controls span so finishing a job live-updates
+    # the badge and which actions (Embed/Train) are offered — without a reload.
+    def controls_oob(busy):
+        from simpleparty.embeddings import embedding_coverage
+        cov = embedding_coverage(resolved)
+        html = render_coverage_controls(rel_path, cov, busy)
+        return html.replace('id="tag-controls"', 'id="tag-controls" hx-swap-oob="true"', 1)
 
     def wrap(inner, poll=None, active=False):
         if poll:
@@ -655,7 +722,7 @@ def handle_tag_status(handler, root):
     if progress.get('error'):
         send_html(handler,
             wrap(f'<span class="tag-error">\u274C {esc(progress["error"])}</span>')
-            + train_btn_oob(False))
+            + controls_oob(False))
         return
 
     if not progress.get('running'):
@@ -666,7 +733,7 @@ def handle_tag_status(handler, root):
                     '(model).</span>')
             send_html(handler,
                 wrap(f'<span class="tag-done">\u2705 {msg} {hint}</span>')
-                + train_btn_oob(False))
+                + controls_oob(False))
         else:
             send_html(handler, wrap('', poll='every 10s'))
         return
@@ -696,7 +763,7 @@ def handle_tag_status(handler, root):
     )
     send_html(handler,
         wrap(inner, poll='every 2s', active=True)
-        + train_btn_oob(True))
+        + controls_oob(True))
 
 
 def handle_save_tags(handler, root):
@@ -941,6 +1008,7 @@ POST_ROUTES = {
     '/unlock': handle_unlock,
     '/lock': handle_lock,
     '/train': handle_train,
+    '/embed': handle_embed,
     '/suggest-one': handle_suggest_one,
     '/confirm-tags': handle_confirm_tags,
     '/reject-tags': handle_reject_tags,
