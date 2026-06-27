@@ -433,11 +433,8 @@ def handle_train(handler, root):
         return
     from simpleparty.classifier import train
 
-    from simpleparty.embeddings import DEFAULT_EMBED_FRAMES
-
     form = read_form_body(handler)
     rel_path = form.get('path', '')
-    max_frames = int(form.get('frames', str(DEFAULT_EMBED_FRAMES)))
     if not is_safe_rel_path(rel_path):
         handler.send_error(400, 'Invalid path')
         return
@@ -455,7 +452,7 @@ def handle_train(handler, root):
     t = threading.Thread(
         target=train,
         args=(resolved_str,),
-        kwargs={'max_frames': max_frames, 'progress': progress},
+        kwargs={'progress': progress},
         daemon=True,
     )
     t.start()

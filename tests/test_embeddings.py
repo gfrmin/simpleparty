@@ -92,3 +92,19 @@ def test_prune_keeps_fresh_fail_marker(tmp_path):
 def test_prune_noop_when_no_cache_dir(tmp_path):
     # Should not raise when the embeddings dir was never created.
     prune_stale_embeddings(str(tmp_path))
+
+
+def test_prune_leaves_inflight_temp_files_alone(tmp_path):
+    # A concurrent _atomic_write writes .emb-*.tmp then os.replace()s it; prune
+    # must not delete it out from under that write.
+    edir = embeddings_dir(str(tmp_path))
+    edir.mkdir(parents=True)
+    tmp = edir / '.emb-abc123.tmp'
+    tmp.write_bytes(b'partial')
+    orphan = edir / 'gone.mp4__1_2.npy'
+    orphan.write_bytes(b'x')
+
+    prune_stale_embeddings(str(tmp_path))
+
+    assert tmp.exists()       # in-flight temp untouched
+    assert not orphan.exists()  # orphan cache entry still pruned

@@ -19,7 +19,7 @@ import threading
 from pathlib import Path
 
 from simpleparty.tagger import (
-    SIMPLEPARTY_DIR, VIDEO_EXTENSIONS, _stat_key, extract_keyframes,
+    SIMPLEPARTY_DIR, VIDEO_EXTENSIONS, _get_duration, _stat_key, extract_keyframes,
 )
 
 logger = logging.getLogger('simpleparty.embeddings')
@@ -92,6 +92,10 @@ def prune_stale_embeddings(directory):
     valid = _valid_cache_names(directory)
     removed = 0
     for f in edir.iterdir():
+        # Only ever delete finished cache entries; never an in-flight
+        # `.emb-*.tmp` that a concurrent _atomic_write is about to os.replace.
+        if not (f.name.endswith('.npy') or f.name.endswith('.fail')):
+            continue
         if f.name not in valid:
             try:
                 f.unlink()
@@ -122,6 +126,10 @@ def _atomic_write(path, write_fn):
 
 _clip = None
 _clip_lock = threading.Lock()
+# Serializes forward passes: a single shared CUDA module is not safe to drive
+# from multiple threads at once (a job thread embedding while an HTTP handler
+# suggests). The GPU serializes compute anyway, so this costs almost nothing.
+_infer_lock = threading.Lock()
 
 
 def _require_clip():
@@ -207,7 +215,7 @@ def embed_images(pil_images, progress=None):
     batch = torch.stack([c['preprocess'](im) for im in pil_images]).to(c['device'])
     if c['half']:
         batch = batch.half()
-    with torch.no_grad():
+    with _infer_lock, torch.no_grad():
         feats = c['model'].encode_image(batch)
         feats = feats / feats.norm(dim=-1, keepdim=True)
     pooled = feats.mean(0)
@@ -226,7 +234,7 @@ def embed_texts(prompts, progress=None):
     import torch
     c = clip_model(progress)
     tokens = c['tokenizer'](list(prompts)).to(c['device'])
-    with torch.no_grad():
+    with _infer_lock, torch.no_grad():
         feats = c['model'].encode_text(tokens)
         feats = feats / feats.norm(dim=-1, keepdim=True)
     return feats.float().cpu().numpy()
@@ -249,10 +257,17 @@ def get_video_embedding(directory, video_name, max_frames=DEFAULT_EMBED_FRAMES, 
         return None
 
     video_path = str(Path(directory) / video_name)
+    # Persist a sentinel only for genuinely unreadable files (no probeable
+    # duration) so we don't re-probe them every pass. An empty frame list with a
+    # valid duration is treated as transient (ffmpeg timeout / all-dark) and
+    # retried on the next run rather than permanently excluded.
+    if _get_duration(video_path) <= 0:
+        _atomic_write(fail, lambda f: None)
+        return None
+
     frames = extract_keyframes(video_path, max_frames=max_frames)
     try:
         if not frames:
-            _atomic_write(fail, lambda f: None)
             return None
         emb = embed_paths([str(p) for p in frames], progress=progress).astype('float32')
         _atomic_write(npy, lambda f: np.save(f, emb))
