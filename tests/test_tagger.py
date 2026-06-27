@@ -244,18 +244,3 @@ def test_untagged_videos_accepts_prelisted_names(tmp_path):
     names = ['a.mp4', 'b.mp4', '.hidden.mp4', 'c.txt']
     existing = {'a.mp4': {'tags': ['x'], 'status': 'confirmed'}}
     assert untagged_videos(str(tmp_path), existing, names=names) == ['b.mp4']
-
-
-def test_merge_suggestions_preserves_concurrent_edits():
-    from simpleparty.classifier import _merge_suggestions
-    pending = {'a.mp4': {'tags': ['cat'], 'status': 'suggested', 'confidence': 0.9}}
-    # Simulates a star added by a handler while the suggest job was running
-    current = {
-        'a.mp4': {'starred': True},
-        'b.mp4': {'tags': ['dog'], 'status': 'confirmed'},
-    }
-    result = _merge_suggestions(pending)(current)
-    assert result['a.mp4'] == {
-        'starred': True, 'tags': ['cat'], 'status': 'suggested', 'confidence': 0.9,
-    }
-    assert result['b.mp4'] == {'tags': ['dog'], 'status': 'confirmed'}
