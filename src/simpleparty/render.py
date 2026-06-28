@@ -232,9 +232,10 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
     if show_shuffle and data['videos']:
         shuffle_url = url_for_shuffle(data['path'], view)
         shuffle_btn = f'<a class="btn" href="{esc(shuffle_url)}">\u21C5 Shuffle Play</a>'
+    has_tags = bool(tags_map) and any(e.get('tags') for e in tags_map.values())
     want_action_bar = bool(shuffle_btn) or (
         _config.get('allow_download') and (data['videos'] or data['dirs'])
-    )
+    ) or (_config['allow_tag'] and has_tags)
     embed_missing = frozenset()
     if want_action_bar:
         tag_html = ''
@@ -257,6 +258,15 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
                 f'class="tag-progress-panel{" active" if is_busy else ""}" '
                 f'role="status" aria-live="polite" id="tag-progress"></div>'
             )
+        manage_html = ''
+        if _config['allow_tag'] and has_tags:
+            manage_html = (
+                f'<details class="tag-manager-details">'
+                f'<summary class="btn">\U0001F3F7 Manage tags</summary>'
+                f'<div style="flex-basis:100%">'
+                f'{render_tag_manager(data["path"], tags_map)}</div>'
+                f'</details>'
+            )
         download_html = ''
         if _config['allow_download']:
             path_q = urllib.parse.urlencode({'path': data['path']})
@@ -277,6 +287,7 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
             f'{shuffle_btn}'
             f'{sort_html}'
             f'{tag_html}'
+            f'{manage_html}'
             f'{download_html}'
             f'</div>'
         )
@@ -456,6 +467,65 @@ def render_sort_pills(path, view):
         cls = 'sort-pill' + (' active' if active else '')
         aria = ' aria-current="true"' if active else ''
         pieces.append(f'<a class="{cls}" href="{esc(href)}" {_hx_browse(href)}{aria}>{label}{arrow}</a>')
+    pieces.append('</div>')
+    return ''.join(pieces)
+
+
+def render_tag_manager(rel_path, tags_map):
+    """Directory tag-management panel: every tag (by lowercased key) with its
+    video count, an inline Rename form, and a Remove button. Returns the
+    swappable `<div id="tag-manager">` fragment; the rename/remove routes
+    re-render it after each edit. Renaming onto an existing tag merges them;
+    Remove drops the tag from every video but KEEPS the videos (unlike
+    delete-by-tag)."""
+    counts = {}
+    for entry in tags_map.values():
+        for tag in entry.get('tags', []):
+            key = tag.lower().strip()
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+
+    pieces = ['<div id="tag-manager" class="tag-manager">']
+    if not counts:
+        pieces.append('<p class="tag-manager-empty">No tags in this directory yet.</p>')
+        pieces.append('</div>')
+        return ''.join(pieces)
+
+    pieces.append(
+        '<p class="tag-manager-hint">Rename merges onto an existing tag; '
+        'Remove drops a tag from every video but keeps the videos. '
+        'Large edits may warrant re-Training the classifier.</p>'
+    )
+    path_attr = esc(rel_path)
+    for tag, count in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
+        tag_attr = esc(tag)
+        confirm = esc(
+            f"Remove tag '{tag}' from {count} "
+            f"video{'' if count == 1 else 's'}? The videos are kept."
+        )
+        pieces.append(
+            f'<div class="tag-manager-row">'
+            f'<span class="tag-manager-name">{tag_attr} '
+            f'<span class="cnt">({count})</span></span>'
+            f'<form class="tag-manager-rename" hx-post="/rename-tag" '
+            f'hx-target="#tag-manager" hx-swap="outerHTML">'
+            f'<input type="hidden" name="path" value="{path_attr}">'
+            f'<input type="hidden" name="old" value="{tag_attr}">'
+            f'<input type="text" name="new" value="{tag_attr}" '
+            f'aria-label="Rename tag {tag_attr}" required>'
+            f'<button type="submit" class="btn">Rename</button>'
+            f'</form>'
+            f'<form class="tag-manager-remove" hx-post="/remove-tag" '
+            f'hx-target="#tag-manager" hx-swap="outerHTML" '
+            f'hx-confirm="{confirm}">'
+            f'<input type="hidden" name="path" value="{path_attr}">'
+            f'<input type="hidden" name="tag" value="{tag_attr}">'
+            f'<button type="submit" class="btn-del" '
+            f'title="Remove tag from all videos (keeps videos)">'
+            f'<span aria-hidden="true">\U0001F5D1</span> Remove</button>'
+            f'</form>'
+            f'</div>'
+        )
     pieces.append('</div>')
     return ''.join(pieces)
 
