@@ -283,6 +283,63 @@ def training_entries(tags):
     }
 
 
+def rewrite_tags(tags_map, mapping):
+    """Pure directory-level tag rewrite: rename/merge/remove across all entries.
+
+    `mapping` maps a *lowercased* source tag to either a target string
+    (rename — renaming onto an existing tag merges them) or None (remove). For
+    each video entry a new entry is produced where:
+      - each tag whose lowercased form is a mapping key is replaced by the
+        target (or dropped if None); order is preserved and duplicates are
+        removed case-insensitively (so a merge yields a single tag);
+      - `suggest_scores` keys are rewritten the same way; on a collision the
+        higher score wins, and dropped tags' scores are removed;
+      - `status`, `starred`, and every other field are preserved untouched;
+      - entries are kept even if their `tags` list becomes empty.
+
+    The input is not mutated. Tags not named in `mapping` pass through, so an
+    unknown key is a no-op.
+    """
+    def map_target(tag):
+        """Return (keep, target): keep=False means drop this tag."""
+        key = tag.lower()
+        if key in mapping:
+            target = mapping[key]
+            return (target is not None, target)
+        return (True, tag)
+
+    result = {}
+    for name, entry in tags_map.items():
+        new_entry = dict(entry)
+        if 'tags' in entry:
+            new_tags = []
+            seen = set()
+            for tag in entry['tags']:
+                keep, target = map_target(tag)
+                if not keep:
+                    continue
+                dedup_key = target.lower()
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                new_tags.append(target)
+            new_entry['tags'] = new_tags
+        scores = entry.get('suggest_scores')
+        if isinstance(scores, dict):
+            new_scores = {}
+            for tag, score in scores.items():
+                keep, target = map_target(tag)
+                if not keep:
+                    continue
+                if target in new_scores:
+                    new_scores[target] = max(new_scores[target], score)
+                else:
+                    new_scores[target] = score
+            new_entry['suggest_scores'] = new_scores
+        result[name] = new_entry
+    return result
+
+
 # --- Keyframe extraction ---
 
 def _is_dark_frame(jpeg_path, threshold=20):
@@ -307,23 +364,48 @@ def _is_dark_frame(jpeg_path, threshold=20):
         return True
 
 
-def _get_duration(video_path):
-    """Get video duration in seconds via ffprobe."""
-    cmd = [
-        'ffprobe', '-v', 'error',
-        '-show_entries', 'format=duration',
-        '-of', 'csv=p=0',
-        str(video_path),
-    ]
+def _ffprobe_duration(video_path, entries_args):
+    """Run one ffprobe duration query (`entries_args` selects format/stream),
+    returning seconds or 0.0. Logs the specific failure reason at DEBUG."""
+    cmd = ['ffprobe', '-v', 'error', *entries_args, '-of', 'csv=p=0', str(video_path)]
     try:
-        t0 = time.monotonic()
         result = subprocess.run(cmd, capture_output=True, timeout=10, text=True)
-        dur = float(result.stdout.strip())
-        logger.debug('duration %.1fs for %s (%.2fs)', dur, video_path, time.monotonic() - t0)
-        return dur
-    except (subprocess.TimeoutExpired, ValueError, OSError):
-        logger.debug('duration failed for %s', video_path)
+    except subprocess.TimeoutExpired:
+        logger.debug('duration: ffprobe TIMEOUT (>10s) for %s %s', video_path, entries_args)
         return 0.0
+    except OSError as e:
+        logger.debug('duration: ffprobe not runnable (%s) for %s', e, video_path)
+        return 0.0
+    out = (result.stdout or '').strip()
+    if not out:
+        logger.debug('duration: empty ffprobe output for %s %s (rc=%s, stderr=%r)',
+                     video_path, entries_args, result.returncode,
+                     (result.stderr or '').strip()[:300])
+        return 0.0
+    try:
+        return float(out.splitlines()[0])
+    except ValueError:
+        logger.debug('duration: unparseable ffprobe output %r for %s', out[:80], video_path)
+        return 0.0
+
+
+def _get_duration(video_path):
+    """Get video duration in seconds via ffprobe, or 0.0 if unreadable.
+
+    Tries the container's format-level duration first, then falls back to the
+    video stream's own duration: remuxed/streamed containers (some .mkv/.ts/
+    .webm, partial downloads) carry no `format=duration` but do carry
+    `stream=duration`. Without this fallback such files probe as 0 and get
+    written off as permanently un-embeddable. Failures are logged at DEBUG with
+    the specific reason so they're diagnosable from one `--debug` run."""
+    t0 = time.monotonic()
+    dur = _ffprobe_duration(video_path, ['-show_entries', 'format=duration'])
+    if dur <= 0:
+        dur = _ffprobe_duration(
+            video_path, ['-select_streams', 'v:0', '-show_entries', 'stream=duration'])
+    if dur > 0:
+        logger.debug('duration %.1fs for %s (%.2fs)', dur, video_path, time.monotonic() - t0)
+    return dur
 
 
 def extract_keyframes(video_path, max_frames=3):
@@ -345,26 +427,29 @@ def extract_keyframes(video_path, max_frames=3):
     logger.debug('extracting %d keyframes from %s at positions %s',
                  max_frames, video_path, ['%.1fs' % p for p in positions])
 
-    for idx, pos in enumerate(positions):
-        out_path = os.path.join(tmpdir, f'frame_{idx:02d}.jpg')
-        cmd = [
-            'ffmpeg', '-ss', f'{pos:.2f}',
-            '-t', '30',
-            '-skip_frame', 'nokey',
-            '-i', str(video_path),
-            '-frames:v', '1',
-            '-q:v', '4',
-            out_path,
-        ]
-        try:
-            subprocess.run(
-                cmd, capture_output=True, timeout=timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            pass
+    def _run_pass(keyframes_only):
+        for idx, pos in enumerate(positions):
+            out_path = os.path.join(tmpdir, f'frame_{idx:02d}.jpg')
+            cmd = ['ffmpeg', '-ss', f'{pos:.2f}', '-t', '30']
+            if keyframes_only:
+                cmd += ['-skip_frame', 'nokey']
+            cmd += ['-i', str(video_path), '-frames:v', '1', '-q:v', '4', out_path]
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+            except subprocess.TimeoutExpired:
+                pass
+        return sorted(Path(tmpdir).glob('frame_*.jpg'))
 
-    frames = sorted(Path(tmpdir).glob('frame_*.jpg'))
+    # Fast path: decode only keyframes. But a video with sparse keyframes (e.g.
+    # a short clip whose single keyframe is at t=0) yields NOTHING at any later
+    # seek position, which previously left it permanently "missing". Fall back
+    # to a normal decode (no -skip_frame) so such files still get frames.
+    frames = _run_pass(keyframes_only=True)
+    if not frames:
+        logger.debug('no keyframes near seek positions for %s; '
+                     'retrying without -skip_frame nokey', video_path)
+        frames = _run_pass(keyframes_only=False)
+
     usable = [f for f in frames if not _is_dark_frame(f)]
     logger.debug('keyframes done for %s: %d usable of %d extracted (%.2fs)',
                  video_path, len(usable), len(frames), time.monotonic() - t0)
@@ -390,18 +475,20 @@ def thumb_path(directory_path, video_name):
 
 def extract_frame(video_path, position, out_path, timeout=30):
     """Extract a single full-res frame at *position* seconds. Returns True on success."""
-    cmd = [
-        'ffmpeg', '-y', '-ss', f'{position:.2f}',
-        '-t', '10',
-        '-skip_frame', 'nokey',
-        '-i', str(video_path),
-        '-frames:v', '1',
-        '-q:v', '4',
-        str(out_path),
-    ]
+    def _cmd(keyframes_only):
+        c = ['ffmpeg', '-y', '-ss', f'{position:.2f}', '-t', '10']
+        if keyframes_only:
+            c += ['-skip_frame', 'nokey']
+        c += ['-i', str(video_path), '-frames:v', '1', '-q:v', '4', str(out_path)]
+        return c
+
     try:
         t0 = time.monotonic()
-        subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+        subprocess.run(_cmd(keyframes_only=True), capture_output=True, timeout=timeout, check=False)
+        # Sparse-keyframe videos (e.g. short clips with a single keyframe at t=0)
+        # produce nothing in keyframe-only mode; fall back to a normal decode.
+        if not Path(out_path).exists():
+            subprocess.run(_cmd(keyframes_only=False), capture_output=True, timeout=timeout, check=False)
         ok = Path(out_path).exists() and not _is_dark_frame(out_path)
         logger.debug('extract_frame %s @%.1fs -> %s (%s, %.2fs)',
                      video_path, position, out_path,

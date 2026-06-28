@@ -10,7 +10,7 @@ from simpleparty.tagger import (
     _LEGACY_TAGS, _LEGACY_MODEL,
     load_tags, save_tags, model_path, thumb_path,
     untagged_videos, confirmed_entries,
-    is_starred, set_starred,
+    is_starred, set_starred, rewrite_tags,
 )
 
 
@@ -244,3 +244,189 @@ def test_untagged_videos_accepts_prelisted_names(tmp_path):
     names = ['a.mp4', 'b.mp4', '.hidden.mp4', 'c.txt']
     existing = {'a.mp4': {'tags': ['x'], 'status': 'confirmed'}}
     assert untagged_videos(str(tmp_path), existing, names=names) == ['b.mp4']
+
+
+def test_extract_keyframes_falls_back_when_no_keyframes(tmp_path, monkeypatch):
+    """A short clip whose only keyframe is at t=0: `-skip_frame nokey` extracts
+    nothing at later seek positions, so extraction must fall back to decoding
+    the actual frame (no -skip_frame) instead of returning an empty list (which
+    would leave the video permanently 'missing')."""
+    import shutil
+    import subprocess
+    from simpleparty import tagger
+
+    vid = tmp_path / 'clip.mp4'
+    vid.write_bytes(b'fake')
+    monkeypatch.setattr(tagger, '_get_duration', lambda p: 5.6)
+    monkeypatch.setattr(tagger, '_is_dark_frame', lambda p: False)
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        # Emulate a single-keyframe video: the keyframe-only pass writes nothing;
+        # only the fallback (no -skip_frame nokey) produces a frame.
+        if '-skip_frame' not in cmd:
+            Path(cmd[-1]).write_bytes(b'\xff\xd8\xff\xe0fakejpg')
+
+        class _R:
+            returncode = 0
+            stdout = ''
+            stderr = ''
+        return _R()
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+
+    frames = tagger.extract_keyframes(str(vid), max_frames=8)
+    try:
+        assert frames, 'fallback decode should yield frames when no keyframes exist'
+        assert any('-skip_frame' in c for c in calls), 'first pass tries keyframes'
+        assert any('-skip_frame' not in c for c in calls), 'fallback drops -skip_frame'
+    finally:
+        if frames:
+            shutil.rmtree(Path(frames[0]).parent, ignore_errors=True)
+
+
+def test_extract_frame_falls_back_when_no_keyframes(tmp_path, monkeypatch):
+    """The thumbnail extractor shares the keyframe flaw: it must fall back to a
+    normal decode when -skip_frame nokey produces no output."""
+    import subprocess
+    from simpleparty import tagger
+
+    vid = tmp_path / 'clip.mp4'
+    vid.write_bytes(b'fake')
+    out = tmp_path / 'thumb.jpg'
+    monkeypatch.setattr(tagger, '_is_dark_frame', lambda p: False)
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if '-skip_frame' not in cmd:
+            Path(cmd[-1]).write_bytes(b'\xff\xd8\xff\xe0fakejpg')
+
+        class _R:
+            returncode = 0
+            stdout = ''
+            stderr = ''
+        return _R()
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+
+    assert tagger.extract_frame(str(vid), 2.5, str(out)) is True
+    assert out.exists()
+    assert any('-skip_frame' not in c for c in calls), 'fallback drops -skip_frame'
+
+
+def test_get_duration_falls_back_to_stream_duration(monkeypatch):
+    """Containers with no format-level duration (remuxed/streamed .mkv/.ts) must
+    fall back to the video stream's duration instead of probing as 0 (which got
+    them written off as permanently un-embeddable)."""
+    import subprocess
+    from simpleparty import tagger
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        on_stream = 'stream=duration' in cmd
+
+        class _R:
+            returncode = 0
+            stdout = '12.34\n' if on_stream else ''  # format query empty, stream has it
+            stderr = ''
+        return _R()
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+
+    assert tagger._get_duration('/some/clip.mkv') == 12.34
+    assert any('format=duration' in c for c in calls), 'format duration tried first'
+    assert any('stream=duration' in c for c in calls), 'falls back to stream duration'
+
+
+# --- rewrite_tags: directory-level rename/merge/remove ---
+
+def test_rewrite_tags_rename():
+    tags = {'v.mp4': {'tags': ['scifi', 'action'], 'status': 'confirmed'}}
+    out = rewrite_tags(tags, {'scifi': 'science fiction'})
+    assert out['v.mp4']['tags'] == ['science fiction', 'action']
+
+
+def test_rewrite_tags_rename_uses_entered_casing_across_variants():
+    tags = {'v.mp4': {'tags': ['Scifi', 'scifi'], 'status': 'confirmed'}}
+    out = rewrite_tags(tags, {'scifi': 'Science Fiction'})
+    # both case variants collapse to the single entered-casing target
+    assert out['v.mp4']['tags'] == ['Science Fiction']
+
+
+def test_rewrite_tags_merge_dedups():
+    # video already has both the source and the target tag -> one survives
+    tags = {'v.mp4': {'tags': ['action', 'fight'], 'status': 'confirmed'}}
+    out = rewrite_tags(tags, {'fight': 'action'})
+    assert out['v.mp4']['tags'] == ['action']
+
+
+def test_rewrite_tags_remove():
+    tags = {'v.mp4': {'tags': ['generic', 'action'], 'status': 'confirmed'}}
+    out = rewrite_tags(tags, {'generic': None})
+    assert out['v.mp4']['tags'] == ['action']
+
+
+def test_rewrite_tags_case_insensitive_match():
+    tags = {
+        'a.mp4': {'tags': ['Scifi'], 'status': 'confirmed'},
+        'b.mp4': {'tags': ['scifi'], 'status': 'suggested'},
+    }
+    out = rewrite_tags(tags, {'scifi': 'SF'})
+    assert out['a.mp4']['tags'] == ['SF']
+    assert out['b.mp4']['tags'] == ['SF']
+
+
+def test_rewrite_tags_suggest_scores_rename():
+    tags = {'v.mp4': {'tags': ['scifi'], 'status': 'suggested',
+                      'suggest_scores': {'scifi': 0.7}}}
+    out = rewrite_tags(tags, {'scifi': 'SF'})
+    assert out['v.mp4']['suggest_scores'] == {'SF': 0.7}
+
+
+def test_rewrite_tags_suggest_scores_collision_keeps_higher():
+    tags = {'v.mp4': {'tags': ['action', 'fight'], 'status': 'suggested',
+                      'suggest_scores': {'action': 0.5, 'fight': 0.9}}}
+    out = rewrite_tags(tags, {'fight': 'action'})
+    assert out['v.mp4']['suggest_scores'] == {'action': 0.9}
+
+
+def test_rewrite_tags_suggest_scores_drop():
+    tags = {'v.mp4': {'tags': ['generic'], 'status': 'suggested',
+                      'suggest_scores': {'generic': 0.4, 'keep': 0.6}}}
+    out = rewrite_tags(tags, {'generic': None})
+    assert out['v.mp4']['suggest_scores'] == {'keep': 0.6}
+
+
+def test_rewrite_tags_preserves_status_and_starred():
+    tags = {'v.mp4': {'tags': ['scifi'], 'status': 'suggested',
+                      'starred': True, 'suggest_source': 'model'}}
+    out = rewrite_tags(tags, {'scifi': 'SF'})
+    assert out['v.mp4']['status'] == 'suggested'
+    assert out['v.mp4']['starred'] is True
+    assert out['v.mp4']['suggest_source'] == 'model'
+
+
+def test_rewrite_tags_keeps_entry_when_tags_become_empty():
+    tags = {'v.mp4': {'tags': ['generic'], 'status': 'confirmed', 'starred': True}}
+    out = rewrite_tags(tags, {'generic': None})
+    assert 'v.mp4' in out
+    assert out['v.mp4']['tags'] == []
+    assert out['v.mp4']['starred'] is True
+
+
+def test_rewrite_tags_unknown_key_is_noop():
+    tags = {'v.mp4': {'tags': ['scifi'], 'status': 'confirmed'}}
+    out = rewrite_tags(tags, {'nonexistent': 'x'})
+    assert out['v.mp4']['tags'] == ['scifi']
+
+
+def test_rewrite_tags_does_not_mutate_input():
+    tags = {'v.mp4': {'tags': ['scifi', 'action'], 'status': 'confirmed'}}
+    rewrite_tags(tags, {'scifi': 'SF'})
+    assert tags['v.mp4']['tags'] == ['scifi', 'action']
