@@ -538,8 +538,9 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .unlock-box h1{margin-bottom:var(--space-4);font-size:var(--text-lg);font-weight:600;display:flex;align-items:center;gap:var(--space-2)}
 .unlock-box input[type="password"]{
   width:100%;padding:var(--space-3);background:var(--bg);border:1px solid var(--border);
-  border-radius:var(--radius-md);color:var(--text);font-size:var(--text-base);outline:none;
+  border-radius:var(--radius-md);color:var(--text);font-size:16px;outline:none;
 }
+/* 16px (not --text-base=15px): <16px makes iOS Safari auto-zoom on focus — see mobile audit P/no-zoom */
 .unlock-box input:focus{border-color:var(--accent)}
 .unlock-actions{display:flex;gap:var(--space-2);justify-content:flex-end;margin-top:var(--space-4)}
 .unlock-error{color:var(--danger);font-size:var(--text-sm);margin-top:10px;min-height:1.2em}
