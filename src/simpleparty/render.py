@@ -7,6 +7,7 @@ from html import escape as esc
 from pathlib import Path
 
 from simpleparty import __version__, jobs
+from simpleparty.icons import icon
 from simpleparty.library import _compute_related_videos, resolve_path
 from simpleparty.state import CONFIG as _config
 from simpleparty.urls import ViewState, url_for_browse, url_for_play, url_for_shuffle, url_for_video
@@ -45,7 +46,7 @@ def render_page(title, body):
 
 def render_nav(path, encrypted_dir=None):
     parts = path.split('/') if path else []
-    pieces = ['<a class="crumb" href="/">SimpleParty</a>']
+    pieces = ['<a class="crumb brand" href="/">SimpleParty</a>']
     # Build (label, href) for each segment, then collapse the middle on deep
     # paths so the sticky breadcrumb stays compact (and doesn't wrap on phones).
     segs = []
@@ -63,7 +64,7 @@ def render_nav(path, encrypted_dir=None):
         pieces.append(f'<a class="crumb" href="{esc(href)}"{cur}>{esc(label)}</a>')
     pieces.append('<span class="nav-spacer"></span>')
     if _config.get('allow_download'):
-        pieces.append('<a class="btn" href="/download">\u2B07 Downloads</a>')
+        pieces.append(f'<a class="btn" href="/download">{icon("download")} Downloads</a>')
     if encrypted_dir is not None:
         parent = str(Path(encrypted_dir).parent)
         if parent == '.':
@@ -81,7 +82,7 @@ def render_nav(path, encrypted_dir=None):
 def _render_train_btn(path_param, is_busy):
     cls = 'btn btn-train busy' if is_busy else 'btn btn-train'
     disabled = ' disabled' if is_busy else ''
-    label = '\U0001F9E0 Training\u2026' if is_busy else '\U0001F9E0 Train'
+    label = f'{icon("tag")} Training\u2026' if is_busy else f'{icon("tag")} Train'
     return (
         f'<form hx-post="/train" style="display:inline" id="train-form">'
         f'<input type="hidden" name="path" value="{path_param}">'
@@ -105,7 +106,7 @@ def render_coverage_controls(rel_path, coverage, is_busy):
     missing = coverage['missing']
     badge = (
         f'<span class="coverage-badge" title="videos with CLIP embeddings">'
-        f'\U0001F9E0 {embedded}/{total} embedded'
+        f'{icon("embed")} {embedded}/{total} embedded'
         + (f' · {missing} missing' if missing else '')
         + '</span>'
     )
@@ -118,12 +119,12 @@ def render_coverage_controls(rel_path, coverage, is_busy):
             f'<form hx-post="/embed" style="display:inline" id="embed-form">'
             f'<input type="hidden" name="path" value="{path_param}">'
             f'<button class="btn btn-embed" hx-disabled-elt="this">'
-            f'\U0001F9E0 Embed all missing ({missing})</button>'
+            f'{icon("embed")} Embed all missing ({missing})</button>'
             f'</form>'
             f'<input type="hidden" id="embed-path" name="path" value="{path_param}">'
             f'<button class="btn btn-embed-selected" hx-post="/embed" '
             f'hx-include=".embed-check:checked, #embed-path" hx-disabled-elt="this">'
-            f'\U0001F9E0 Embed selected</button>'
+            f'{icon("embed")} Embed selected</button>'
         )
     train_html = _render_train_btn(path_param, is_busy) if embedded else ''
     return (
@@ -173,7 +174,7 @@ def render_video_item(v, i, data_path, view, *, current_idx=-1, tags_map=None,
     if v['name'] in thumbs:
         thumb_html = f'<img src="{thumb_url}" loading="lazy" class="item-thumb" alt="">'
     else:
-        thumb_html = '<div class="item-thumb item-thumb-placeholder" aria-hidden="true">\U0001F3AC</div>'
+        thumb_html = f'<div class="item-thumb item-thumb-placeholder" aria-hidden="true">{icon("film", cls="item-thumb-placeholder-icon")}</div>'
     pieces.append(
         f'<a class="item-link" href="{esc(play_url)}">'
         f'{thumb_html}'
@@ -188,9 +189,9 @@ def render_video_item(v, i, data_path, view, *, current_idx=-1, tags_map=None,
             f'<form hx-post="/delete" hx-target="closest .item" hx-swap="delete" '
             f'hx-confirm="Delete {esc(v["name"])}?">'
             f'<input type="hidden" name="path" value="{esc(v["path"])}">'
-            f'<button type="submit" class="btn-del" title="Delete" '
+            f'<button type="submit" class="btn-del" title="Delete {esc(v["name"])}" '
             f'aria-label="Delete {esc(v["name"])}">'
-            f'<span aria-hidden="true">\U0001F5D1</span></button>'
+            f'{icon("trash")}</button>'
             f'</form>'
         )
     if tags_map and v['name'] in tags_map:
@@ -202,7 +203,7 @@ def render_video_item(v, i, data_path, view, *, current_idx=-1, tags_map=None,
             tcls = ' suggested' if is_suggested else ''
             prefix = (
                 '<span class="visually-hidden">Suggested tags: </span>'
-                '<span aria-hidden="true">\u2753\u2009</span>'
+                '<span class="badge-suggested" aria-hidden="true">Suggested</span> '
             ) if is_suggested else ''
             pieces.append(f'<div class="item-tags{tcls}">{prefix}{tags_text}</div>')
     pieces.append('</div>')
@@ -231,14 +232,15 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
     shuffle_btn = ''
     if show_shuffle and data['videos']:
         shuffle_url = url_for_shuffle(data['path'], view)
-        shuffle_btn = f'<a class="btn" href="{esc(shuffle_url)}">\u21C5 Shuffle Play</a>'
+        shuffle_btn = f'<a class="btn btn-primary" href="{esc(shuffle_url)}">{icon("shuffle")} Shuffle Play</a>'
     has_tags = bool(tags_map) and any(e.get('tags') for e in tags_map.values())
     want_action_bar = bool(shuffle_btn) or (
         _config.get('allow_download') and (data['videos'] or data['dirs'])
     ) or (_config['allow_tag'] and has_tags)
     embed_missing = frozenset()
     if want_action_bar:
-        tag_html = ''
+        tag_controls_html = ''
+        tag_status_html = ''
         if data['videos'] and _config['allow_tag'] and _config['has_ffmpeg']:
             from simpleparty.embeddings import embedding_coverage
             resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
@@ -249,62 +251,73 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
             # Embed (produce) and Train (consume) are split, coverage-gated, and
             # explicit. Suggesting/accepting tags stay per-video on the play page
             # so a whole-folder pass can't silently bulk-write tags you never saw.
-            tag_html = render_coverage_controls(data['path'], coverage, is_busy)
+            tag_controls_html = render_coverage_controls(data['path'], coverage, is_busy)
             status_url = f'/tag-status?{urllib.parse.urlencode({"path": data["path"]})}'
             poll = 'every 2s' if is_busy else 'every 10s'
-            tag_html += (
+            tag_status_html = (
                 f'<div hx-get="{status_url}" '
                 f'hx-trigger="load,{poll}" hx-swap="outerHTML" '
                 f'class="tag-progress-panel{" active" if is_busy else ""}" '
                 f'role="status" aria-live="polite" id="tag-progress"></div>'
             )
+        download_inner_html = ''
+        download_status_html = ''
         manage_html = ''
         if _config['allow_tag'] and has_tags:
             manage_html = (
                 f'<details class="tag-manager-details">'
-                f'<summary class="btn">\U0001F3F7 Manage tags</summary>'
+                f'<summary class="btn">{icon("tag")} Manage tags</summary>'
                 f'<div style="flex-basis:100%">'
                 f'{render_tag_manager(data["path"], tags_map)}</div>'
                 f'</details>'
             )
-        download_html = ''
         if _config['allow_download']:
             path_q = urllib.parse.urlencode({'path': data['path']})
-            download_html = (
+            download_inner_html = (
                 f'<details class="download-details">'
-                f'<summary class="btn">\u2B07 Download URL</summary>'
+                f'<summary class="btn">{icon("download")} Download URL</summary>'
                 f'<div style="flex-basis:100%">{render_download_form(data["path"], autofocus=False)}</div>'
                 f'</details>'
                 f'<a class="btn" href="/download">Manage</a>'
+            )
+            download_status_html = (
                 f'<div hx-get="/download-status?{path_q}&inline=1" hx-trigger="load" '
                 f'hx-swap="outerHTML" class="download-progress-panel" '
                 f'role="status" aria-live="polite" '
                 f'id="download-progress"></div>'
             )
         sort_html = render_sort_pills(data['path'], view) if data['videos'] else ''
+        # Build toolbar-lib groups (coverage/embed/train | download/manage)
+        lib_groups = ''
+        if tag_controls_html:
+            lib_groups += f'<div class="lib-group">{tag_controls_html}</div>'
+        if download_inner_html:
+            lib_groups += f'<div class="lib-group">{download_inner_html}</div>'
+        if manage_html:
+            lib_groups += f'<div class="lib-group">{manage_html}</div>'
+        toolbar_view = f'<div class="toolbar-view">{shuffle_btn}{sort_html}</div>'
+        toolbar_lib = f'<div class="toolbar-lib">{lib_groups}</div>' if lib_groups else ''
         pieces.append(
             f'<div class="action-bar">'
-            f'{shuffle_btn}'
-            f'{sort_html}'
-            f'{tag_html}'
-            f'{manage_html}'
-            f'{download_html}'
+            f'<div class="toolbar">{toolbar_view}{toolbar_lib}</div>'
+            f'{tag_status_html}'
+            f'{download_status_html}'
             f'</div>'
         )
 
     for d in data['dirs']:
         if d['encrypted'] and not d['unlocked']:
-            icon = '\U0001F512'
+            dir_icon = icon('lock')
             state = ' <span class="visually-hidden">(encrypted, locked)</span>'
         elif d['encrypted']:
-            icon = '\U0001F513'
+            dir_icon = icon('lock-open')
             state = ' <span class="visually-hidden">(encrypted, unlocked)</span>'
         else:
-            icon = '\U0001F4C1'
+            dir_icon = icon('folder')
             state = ''
         pieces.append(
             f'<a class="item" href="{esc(url_for_browse(d["path"]))}">'
-            f'<span class="item-icon" aria-hidden="true">{icon}</span>'
+            f'<span class="item-icon" aria-hidden="true">{dir_icon}</span>'
             f'<span class="item-name">{esc(d["name"])}{state}</span>'
             f'</a>'
         )
@@ -340,7 +353,7 @@ def render_related_videos(data, idx, lower_index, view, thumbs=frozenset()):
         if has_thumb:
             thumb_html = f'<img src="{thumb_url}" loading="lazy" class="item-thumb" alt="">'
         else:
-            thumb_html = '<div class="item-thumb item-thumb-placeholder" aria-hidden="true">\U0001F3AC</div>'
+            thumb_html = f'<div class="item-thumb item-thumb-placeholder" aria-hidden="true">{icon("film", cls="item-thumb-placeholder-icon")}</div>'
         pieces.append(
             f'<div class="item item-video">'
             f'<a class="item-link" href="{esc(play_url)}">'
@@ -361,9 +374,9 @@ def render_playlist_item(v, play_url, position, thumbs):
     if v['name'] in thumbs:
         thumb_html = f'<img src="/thumb/{urllib.parse.quote(v["path"])}" loading="lazy" class="playlist-thumb" alt="">'
     else:
-        thumb_html = '<div class="playlist-thumb-placeholder" aria-hidden="true">\U0001F3AC</div>'
+        thumb_html = f'<div class="playlist-thumb-placeholder" aria-hidden="true">{icon("film", cls="item-thumb-placeholder-icon")}</div>'
     cls = ' playing' if is_current else ''
-    label = '\u25B6 Now' if is_current else str(position)
+    label = f'{icon("play")} Now' if is_current else str(position)
     return (
         f'<a class="playlist-item{cls}" href="{esc(play_url)}">'
         f'{thumb_html}'
@@ -522,7 +535,7 @@ def render_tag_manager(rel_path, tags_map):
             f'<input type="hidden" name="tag" value="{tag_attr}">'
             f'<button type="submit" class="btn-del" '
             f'title="Remove tag from all videos (keeps videos)">'
-            f'<span aria-hidden="true">\U0001F5D1</span> Remove</button>'
+            f'{icon("trash")} Remove</button>'
             f'</form>'
             f'</div>'
         )
@@ -559,13 +572,13 @@ def render_tag_filter(tags_map, view, path, filtered_count=None, lower_index=Non
                 f'<a class="tag-pill star-pill active" href="{esc(href)}" {_hx_browse(href)} '
                 f'aria-label="Showing starred only — show all videos" '
                 f'title="Show all videos">'
-                f'★ Starred only <span class="tag-pill-x" aria-hidden="true">×</span></a>'
+                f'{icon("star")} Starred only <span class="tag-pill-x" aria-hidden="true">×</span></a>'
             )
         else:
             href = url_for_browse(path, ViewState(tags=view.tags, starred=True))
             pieces.append(
                 f'<a class="tag-pill star-pill" href="{esc(href)}" {_hx_browse(href)} '
-                f'aria-label="Show only starred videos" title="Show only starred videos">★ Starred only</a>'
+                f'aria-label="Show only starred videos" title="Show only starred videos">{icon("star")} Starred only</a>'
             )
 
     # Selected tag pills
@@ -599,7 +612,7 @@ def render_tag_filter(tags_map, view, path, filtered_count=None, lower_index=Non
                 + ('<input type="hidden" name="starred" value="1">' if view.starred else '') +
                 f'<button type="submit" class="btn-del" '
                 f'title="Delete all videos with these tags">'
-                f'<span aria-hidden="true">\U0001F5D1</span> Delete all ({filtered_count})</button>'
+                f'{icon("trash")} Delete all ({filtered_count})</button>'
                 f'</form>'
             )
         pieces.append('</div>')
@@ -691,7 +704,7 @@ def render_browse_page(data, view, tags_map=None, lower_index=None, thumbs=froze
             f'<div class="notice" role="status" hx-get="{esc(poll_url)}" '
             f'hx-trigger="every 4s" hx-target="#browse-content" '
             f'hx-select="#browse-content" hx-swap="outerHTML">'
-            f'\u23F3 Calculating video lengths\u2026</div>'
+            f'{icon("clock")} Calculating video lengths\u2026</div>'
         )
     body += render_tag_filter(
         tags_map, view, data['path'],
@@ -712,7 +725,7 @@ def render_locked_page(path, encrypted_dir, redirect_path=None, error=None):
         parent = ''
     body += (
         f'<main id="main"><div class="unlock-box">'
-        f'<h1>Unlock {esc(dir_name)}</h1>'
+        f'<h1>{icon("lock")} Unlock {esc(dir_name)}</h1>'
         f'<form hx-post="/unlock" hx-target="#unlock-error" hx-swap="innerHTML">'
         f'<input type="hidden" name="path" value="{esc(encrypted_dir)}">'
         f'<input type="hidden" name="redirect" value="{esc(url_for_browse(redir))}">'
@@ -721,7 +734,7 @@ def render_locked_page(path, encrypted_dir, redirect_path=None, error=None):
         f'<div id="unlock-error" class="unlock-error" role="alert">{esc(error) if error else ""}</div>'
         f'<div class="unlock-actions">'
         f'<a class="btn" href="{esc(url_for_browse(parent))}">Cancel</a>'
-        f'<button class="btn active" type="submit">Unlock</button>'
+        f'<button class="btn btn-primary" type="submit">{icon("lock-open")} Unlock</button>'
         f'</div></form></div></main>'
     )
     return render_page('SimpleParty \u2014 Unlock', body)
@@ -730,9 +743,9 @@ def render_locked_page(path, encrypted_dir, redirect_path=None, error=None):
 def render_error_page(path, error):
     body = render_nav(path)
     body += (
-        f'<main id="main"><div class="unlock-box" style="text-align:center" role="alert">'
-        f'<h1>Something went wrong</h1>'
-        f'<p style="color:#f87171;margin-top:8px">{esc(error)}</p>'
+        f'<main id="main"><div class="unlock-box error-box" role="alert">'
+        f'<h1>{icon("warning")} Something went wrong</h1>'
+        f'<p class="error-msg">{esc(error)}</p>'
         f'<div class="error-back"><a class="btn" href="/">\u2190 Back to library</a></div>'
         f'</div></main>'
     )
@@ -754,7 +767,7 @@ def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'
     is_suggested = status == 'suggested'
     suspect_set = {t.lower() for t in suspect_tags}
     scores = scores or {}
-    src_icon = '\U0001F52E' if source == 'zero-shot' else '\U0001F3F7'  # 🔮 / 🏷
+    src_icon = icon('wand') if source == 'zero-shot' else icon('tag')
     pieces = ['<div class="video-tag-pills">']
 
     if is_suggested:
@@ -769,13 +782,13 @@ def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'
             f'<input type="hidden" name="path" value="{esc(rel_path)}">'
             f'<input type="hidden" name="video" value="{esc(video_name)}">'
             f'<button type="submit" class="btn btn-confirm" title="Accept suggested tags">'
-            f'\u2714 Accept</button></form> '
+            f'{icon("check")} Accept</button></form> '
             f'<form hx-post="/reject-tags" hx-target="#video-meta" hx-swap="innerHTML" '
             f'style="display:inline;margin:0;padding:0">'
             f'<input type="hidden" name="path" value="{esc(rel_path)}">'
             f'<input type="hidden" name="video" value="{esc(video_name)}">'
             f'<button type="submit" class="btn btn-reject" title="Reject suggested tags">'
-            f'\u2718 Reject</button></form> '
+            f'{icon("x")} Reject</button></form> '
         )
 
     pill_class = 'video-tag-pill suggested' if is_suggested else 'video-tag-pill'
@@ -802,7 +815,7 @@ def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'
             if is_suspect:
                 span_open = (f'<span class="{pill_class} suspect" '
                              f'title="Likely mislabeled — remove if wrong">'
-                             f'<span class="suspect-badge" aria-hidden="true">⚠</span>')
+                             + icon('warning', cls='suspect-badge'))
             else:
                 span_open = f'<span class="{pill_class}">'
             pieces.append(
@@ -846,7 +859,7 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
     if transcode_plan == 'reencode':
         body += (
             '<div id="transcode-notice" role="status">'
-            '<span>\u2699 Re-encoding this video in real time (source codec not '
+            f'<span>{icon("gear")} Re-encoding this video in real time (source codec not '
             'supported by your browser); start-up and seeking may be slower.</span>'
             '<button type="button" class="tn-close" aria-label="Dismiss notice" '
             'onclick="this.parentNode.remove()">\u00d7</button>'
@@ -859,15 +872,18 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         f'<h1 id="video-title">{esc(v["name"])}</h1>'
         f'</div>'
         f'<div id="controls">'
-        f'<a class="btn" href="{esc(prev_url)}" title="Previous (p)">\u25C0 Prev</a>'
+        f'<div class="tier tier-transport">'
+        f'<a class="btn" href="{esc(prev_url)}" title="Previous (p)">{icon("prev")} Prev</a>'
+        f'<a class="btn" href="{esc(next_url)}" title="Next (n)">Next {icon("next")}</a>'
+        f'</div>'
+        f'<div class="tier-sep"></div>'
+        f'<div class="tier">'
         f'<div class="skip-group">'
         f'<button class="btn btn-skip" onclick="skip(-30)" title="Back 30s (J)">-30s</button>'
         f'<button class="btn btn-skip" onclick="skip(-10)" title="Back 10s (j)">-10s</button>'
         f'<button class="btn btn-skip" onclick="skip(10)" title="Forward 10s (l)">+10s</button>'
         f'<button class="btn btn-skip" onclick="skip(30)" title="Forward 30s (L)">+30s</button>'
         f'</div>'
-        f'<span id="now-playing">{pos_info}</span>'
-        f'<a class="btn" href="{esc(next_url)}" title="Next (n)">Next \u25B6</a>'
         f'<select id="speed-select" class="speed-select" onchange="setSpeed(this.value)" aria-label="Playback speed" title="Speed (&lt; &gt;)">'
         f'<option value="0.5">0.5x</option>'
         f'<option value="0.75">0.75x</option>'
@@ -877,10 +893,14 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         f'<option value="2">2x</option>'
         f'<option value="3">3x</option>'
         f'</select>'
-        f'<a class="btn{" active" if is_shuffled else ""}" '
-        f'href="{esc(shuffle_url)}" title="Shuffle (s)">\u21C5 Shuffle</a>'
-        f'<button id="btn-autoplay" class="btn" title="Autoplay (a)" aria-pressed="false">Autoplay</button>'
-        f'<button id="btn-repeat" class="btn" title="Repeat (r)" aria-pressed="false">Repeat</button>'
+        f'</div>'
+        f'<span id="now-playing">{pos_info}</span>'
+        f'<div class="spacer"></div>'
+        f'<div class="tier">'
+        f'<a class="btn btn-toggle{" active" if is_shuffled else ""}" '
+        f'href="{esc(shuffle_url)}" title="Shuffle (s)">{icon("shuffle")} Shuffle</a>'
+        f'<button id="btn-autoplay" class="btn btn-toggle" title="Autoplay (a)" aria-pressed="false">Autoplay</button>'
+        f'<button id="btn-repeat" class="btn btn-toggle" title="Repeat (r)" aria-pressed="false">Repeat</button>'
     )
     if _config['allow_tag']:
         is_video_starred = bool(tags_map and tags_map.get(v['name'], {}).get('starred'))
@@ -891,18 +911,18 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
             f'aria-label="Star this video" '
             f'data-dir="{esc(data["path"])}" data-video="{esc(v["name"])}" '
             f'title="Star this video">'
-            f'<span class="star-icon" aria-hidden="true">{"★" if is_video_starred else "☆"}</span></button>'
+            f'<span class="star-icon" aria-hidden="true">{icon("star-outline")}</span></button>'
         )
     if _config['allow_delete']:
         body += (
             f'<form id="delete-form" hx-post="/delete" hx-confirm="Delete {esc(v["name"])}?">'
             f'<input type="hidden" name="path" value="{esc(v["path"])}">'
             f'<input type="hidden" name="redirect" value="{esc(browse_url)}">'
-            f'<button type="submit" class="btn btn-lock" title="Delete (d)" '
+            f'<button type="submit" class="btn btn-danger" title="Delete (d)" '
             f'aria-label="Delete {esc(v["name"])}">'
-            f'<span aria-hidden="true">\U0001F5D1</span></button></form>'
+            f'{icon("trash")}</button></form>'
         )
-    body += '</div>'
+    body += '</div></div>'
 
     if _config['allow_tag']:
         video_entry = tags_map.get(v['name'], {}) if tags_map else {}
@@ -939,7 +959,7 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
                         f'hx-swap="innerHTML" style="display:inline">'
                         f'<input type="hidden" name="path" value="{esc(data["path"])}">'
                         f'<input type="hidden" name="video" value="{esc(v["name"])}">'
-                        f'<button class="btn">\U0001F3F7 Suggest ({mode})</button>'
+                        f'<button class="btn">{icon("tag")} Suggest ({mode})</button>'
                         f'</form>'
                     )
         elif _config['has_ffmpeg']:
@@ -950,7 +970,7 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
                 # Poll this page's #video-meta until the embedding lands, then
                 # the re-fetched fragment (now Suggest, no poller) self-terminates.
                 meta_html += (
-                    f'<span class="embed-pending">\U0001F9E0 Embedding this video…</span>'
+                    f'<span class="embed-pending">{icon("embed")} Embedding this video…</span>'
                     f'<span hx-get="{esc(self_url)}" hx-trigger="every 2s" '
                     f'hx-select="#video-meta" hx-target="#video-meta" '
                     f'hx-swap="outerHTML" style="display:none"></span>'
@@ -961,7 +981,7 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
                     f'<input type="hidden" name="path" value="{esc(data["path"])}">'
                     f'<input type="hidden" name="video" value="{esc(v["name"])}">'
                     f'<input type="hidden" name="redirect" value="{esc(self_url)}">'
-                    f'<button class="btn btn-embed">\U0001F9E0 Embed this video</button>'
+                    f'<button class="btn btn-embed">{icon("embed")} Embed this video</button>'
                     f'</form>'
                 )
         body += f'<div class="video-meta" id="video-meta">{meta_html}</div>'
@@ -989,7 +1009,7 @@ def render_download_form(target_rel='', *, autofocus=False):
         f'<form hx-post="/download" class="download-form">'
         f'<input type="hidden" name="path" value="{rel}">'
         f'<input type="url" name="url" placeholder="https://… (paste a URL)" aria-label="Download URL" required{af}>'
-        f'<button type="submit" class="btn active">\u2B07 Queue</button>'
+        f'<button type="submit" class="btn btn-primary">{icon("download")} Queue</button>'
         f'</form>'
     )
 
@@ -1023,7 +1043,7 @@ def _render_download_job_card(job, *, full=True):
     title = job.get('title') or Path(job.get('filename') or '').name or job['url']
     err = ''
     if job.get('error'):
-        err = f'<div class="tag-error">\u274C {esc(job["error"])}</div>'
+        err = f'<div class="tag-error">{icon("x")} {esc(job["error"])}</div>'
     card_cls = 'download-card err' if state == 'error' else 'download-card'
 
     bar = ''
@@ -1061,11 +1081,11 @@ def _render_download_job_card(job, *, full=True):
         links = ''
         if job.get('play_dir') is not None and job.get('play_name'):
             play_url = url_for_play(job['play_dir'], 0, video=job['play_name'])
-            links += f' <a class="btn" href="{esc(play_url)}">\u25B6 Play</a>'
+            links += f' <a class="btn" href="{esc(play_url)}">{icon("play")} Play</a>'
             browse_url = url_for_browse(job['play_dir'])
-            links += f' <a class="btn" href="{esc(browse_url)}">\U0001F4C1 Folder</a>'
+            links += f' <a class="btn" href="{esc(browse_url)}">{icon("folder")} Folder</a>'
         meta = (
-            f'<div class="meta"><span class="tag-done">\u2705 '
+            f'<div class="meta"><span class="tag-done">{icon("check")} '
             f'{esc(" · ".join(meta_bits))}</span>{links}</div>'
         )
     elif state == 'cancelled':
@@ -1076,7 +1096,7 @@ def _render_download_job_card(job, *, full=True):
     cancel = ''
     if full and state in ('queued', 'running'):
         cancel = (
-            f'<form hx-post="/download-cancel" style="display:inline">'
+            f'<form hx-post="/download-cancel" class="dl-cancel-form">'
             f'<input type="hidden" name="id" value="{esc(job["id"])}">'
             f'<button class="btn">Cancel</button>'
             f'</form>'
@@ -1131,14 +1151,14 @@ def render_download_status(path_filter=None):
                     pct = j.get('percent', 0)
                     title = j.get('title') or Path(j.get('filename') or '').name or j['url']
                     parts.append(
-                        f'<span class="tag-progress-phase">\u2B07 {esc(title[:60])}</span>'
+                        f'<span class="tag-progress-phase">{icon("download")} {esc(title[:60])}</span>'
                         f'<div class="tag-progress-bar-wrap">'
                         f'<div class="tag-progress-bar" style="width:{pct}%"></div>'
                         f'</div>'
                         f'<span class="tag-progress-text">{pct}%</span>'
                     )
                 else:
-                    parts.append(f'<span class="tag-progress-text">\u2B07 queued</span>')
+                    parts.append(f'<span class="tag-progress-text">{icon("download")} queued</span>')
             inner = ''.join(parts) + ' <a class="btn" href="/download">Manage</a>'
         return (
             f'<div hx-get="/download-status?{urllib.parse.urlencode({"path": path_filter, "inline": "1"})}" '
@@ -1166,7 +1186,7 @@ def render_download_status(path_filter=None):
     if finished:
         pieces.append(
             '<div class="download-section-title">Recent '
-            '<form hx-post="/download-clear" style="display:inline;margin-left:8px">'
+            '<form hx-post="/download-clear" class="dl-section-form">'
             '<button class="btn">Clear completed</button></form></div>'
         )
         for j in finished:
@@ -1184,16 +1204,16 @@ def render_download_status(path_filter=None):
 def render_download_page(target_rel=''):
     nav = render_nav('')
     hint = (
-        '<div style="padding:16px 16px 0;color:#94a3b8;font-size:13px">'
+        '<div class="download-hint">'
         'Paste a URL. Downloads land in the chosen directory '
         '(default: server root). One at a time.'
         '</div>'
     )
     full_form = (
-        f'<form hx-post="/download" class="download-form" style="margin:8px 16px 0">'
-        f'<input type="url" name="url" placeholder="https://…" aria-label="Download URL" required autofocus style="flex:2">'
-        f'<input type="text" name="path" placeholder="subdir/ (blank = root)" aria-label="Target subdirectory" value="{esc(target_rel)}" style="flex:1">'
-        f'<button type="submit" class="btn active">\u2B07 Queue</button>'
+        f'<form hx-post="/download" class="download-form download-form-page">'
+        f'<input type="url" name="url" class="download-url-input" placeholder="https://…" aria-label="Download URL" required autofocus>'
+        f'<input type="text" name="path" class="download-path-input" placeholder="subdir/ (blank = root)" aria-label="Target subdirectory" value="{esc(target_rel)}">'
+        f'<button type="submit" class="btn btn-primary">{icon("download")} Queue</button>'
         f'</form>'
     )
     board = render_download_status(path_filter=None)
