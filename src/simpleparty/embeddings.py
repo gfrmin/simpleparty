@@ -311,12 +311,22 @@ def get_video_embedding(directory, video_name, max_frames=DEFAULT_EMBED_FRAMES,
     # valid duration is treated as transient (ffmpeg timeout / all-dark) and
     # retried on the next run rather than permanently excluded.
     if _get_duration(video_path) <= 0:
+        logger.debug('embed: %s -> FAILED, no probeable duration; wrote .fail', video_name)
         _atomic_write(fail, lambda f: None)
         return None
 
     frames = extract_keyframes(video_path, max_frames=max_frames)
     try:
         if not frames:
+            # No usable frames despite a valid duration. We write NO marker, so
+            # this video stays "missing" and is retried on the next Embed run.
+            # If it recurs every run, the cause is upstream (see the keyframe /
+            # duration debug lines above) — frame extraction is failing, not a
+            # transient blip.
+            logger.debug(
+                'embed: %s -> no usable frames; left UNMARKED (will retry next '
+                'Embed; if this repeats every run, extraction is failing for '
+                'this file)', video_name)
             return None
         emb = embed_paths([str(p) for p in frames], progress=progress).astype('float32')
         _atomic_write(npy, lambda f: np.save(f, emb))
@@ -340,12 +350,24 @@ def embed_videos(directory, names, max_frames=DEFAULT_EMBED_FRAMES, progress=Non
         progress['phase'] = 'embedding videos'
         progress['total'] = len(names)
         progress['done'] = 0
+        no_embedding = []
         for i, name in enumerate(names):
             progress['done'] = i
             progress['current'] = name
-            get_video_embedding(directory, name, max_frames=max_frames, progress=progress)
+            emb = get_video_embedding(directory, name, max_frames=max_frames, progress=progress)
+            if emb is None:
+                no_embedding.append(name)
         progress['done'] = len(names)
         progress['phase'] = 'done'
+        if no_embedding:
+            # Surfaced at WARNING (visible without --debug) because these videos
+            # will keep showing as "missing" every run — the per-file reason is
+            # in the DEBUG lines above (no duration / no usable frames).
+            logger.warning(
+                '%d of %d videos produced no embedding and remain "missing": %s'
+                '%s (run with --debug for the per-file reason)',
+                len(no_embedding), len(names), ', '.join(no_embedding[:10]),
+                '' if len(no_embedding) <= 10 else f', … (+{len(no_embedding) - 10} more)')
     except Exception as e:
         logger.exception('embedding failed')
         progress['error'] = str(e)
