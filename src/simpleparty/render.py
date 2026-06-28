@@ -191,7 +191,7 @@ def render_video_item(v, i, data_path, view, *, current_idx=-1, tags_map=None,
             f'<input type="hidden" name="path" value="{esc(v["path"])}">'
             f'<button type="submit" class="btn-del" title="Delete {esc(v["name"])}" '
             f'aria-label="Delete {esc(v["name"])}">'
-            f'{icon("trash", label="Delete " + v["name"])}</button>'
+            f'{icon("trash")}</button>'
             f'</form>'
         )
     if tags_map and v['name'] in tags_map:
@@ -376,7 +376,7 @@ def render_playlist_item(v, play_url, position, thumbs):
     else:
         thumb_html = f'<div class="playlist-thumb-placeholder" aria-hidden="true">{icon("film", cls="item-thumb-placeholder-icon")}</div>'
     cls = ' playing' if is_current else ''
-    label = '\u25B6 Now' if is_current else str(position)
+    label = f'{icon("play")} Now' if is_current else str(position)
     return (
         f'<a class="playlist-item{cls}" href="{esc(play_url)}">'
         f'{thumb_html}'
@@ -572,13 +572,13 @@ def render_tag_filter(tags_map, view, path, filtered_count=None, lower_index=Non
                 f'<a class="tag-pill star-pill active" href="{esc(href)}" {_hx_browse(href)} '
                 f'aria-label="Showing starred only — show all videos" '
                 f'title="Show all videos">'
-                f'★ Starred only <span class="tag-pill-x" aria-hidden="true">×</span></a>'
+                f'{icon("star")} Starred only <span class="tag-pill-x" aria-hidden="true">×</span></a>'
             )
         else:
             href = url_for_browse(path, ViewState(tags=view.tags, starred=True))
             pieces.append(
                 f'<a class="tag-pill star-pill" href="{esc(href)}" {_hx_browse(href)} '
-                f'aria-label="Show only starred videos" title="Show only starred videos">★ Starred only</a>'
+                f'aria-label="Show only starred videos" title="Show only starred videos">{icon("star")} Starred only</a>'
             )
 
     # Selected tag pills
@@ -612,7 +612,7 @@ def render_tag_filter(tags_map, view, path, filtered_count=None, lower_index=Non
                 + ('<input type="hidden" name="starred" value="1">' if view.starred else '') +
                 f'<button type="submit" class="btn-del" '
                 f'title="Delete all videos with these tags">'
-                f'<span aria-hidden="true">\U0001F5D1</span> Delete all ({filtered_count})</button>'
+                f'{icon("trash")} Delete all ({filtered_count})</button>'
                 f'</form>'
             )
         pieces.append('</div>')
@@ -704,7 +704,7 @@ def render_browse_page(data, view, tags_map=None, lower_index=None, thumbs=froze
             f'<div class="notice" role="status" hx-get="{esc(poll_url)}" '
             f'hx-trigger="every 4s" hx-target="#browse-content" '
             f'hx-select="#browse-content" hx-swap="outerHTML">'
-            f'\u23F3 Calculating video lengths\u2026</div>'
+            f'{icon("clock")} Calculating video lengths\u2026</div>'
         )
     body += render_tag_filter(
         tags_map, view, data['path'],
@@ -970,7 +970,7 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
                 # Poll this page's #video-meta until the embedding lands, then
                 # the re-fetched fragment (now Suggest, no poller) self-terminates.
                 meta_html += (
-                    f'<span class="embed-pending">\U0001F9E0 Embedding this video…</span>'
+                    f'<span class="embed-pending">{icon("embed")} Embedding this video…</span>'
                     f'<span hx-get="{esc(self_url)}" hx-trigger="every 2s" '
                     f'hx-select="#video-meta" hx-target="#video-meta" '
                     f'hx-swap="outerHTML" style="display:none"></span>'

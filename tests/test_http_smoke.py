@@ -698,9 +698,15 @@ def test_pages_have_no_emoji(srv):
     sp_server._config['has_ffmpeg'] = True
     banned = ['⬇','\U0001F5D1','\U0001F9E0','\U0001F3F7','\U0001F52E','⚙',
               '⇅','\U0001F4C1','\U0001F512','\U0001F513','\U0001F3AC','✅',
-              '❌','✔','✘','❓','⏳']
-    for url in ['/', '/browse?path=sub', '/play?path=&idx=0&sort=name&dir=asc']:
-        text = request(srv, 'GET', url)[2].decode()
+              '❌','✔','✘','❓','⏳','★','☆','▶']
+    # /browse?tags=cat exercises the active-filter "Delete all" button + manage
+    # panel; the play URL exercises the playlist "Now" marker and star pill —
+    # sub-states the bare / and /browse pages don't reach.
+    for url in ['/', '/browse?path=sub', '/browse?tags=cat',
+                '/play?path=&idx=0&sort=name&dir=asc']:
+        status, _, body = request(srv, 'GET', url)
+        assert status == 200, f'{url} returned {status}'
+        text = body.decode()
         for ch in banned:
             assert ch not in text, f'emoji {ch!r} still in {url}'
 
