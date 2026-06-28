@@ -767,7 +767,7 @@ def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'
     is_suggested = status == 'suggested'
     suspect_set = {t.lower() for t in suspect_tags}
     scores = scores or {}
-    src_icon = '\U0001F52E' if source == 'zero-shot' else '\U0001F3F7'  # 🔮 / 🏷
+    src_icon = icon('wand') if source == 'zero-shot' else icon('tag')
     pieces = ['<div class="video-tag-pills">']
 
     if is_suggested:
@@ -782,13 +782,13 @@ def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'
             f'<input type="hidden" name="path" value="{esc(rel_path)}">'
             f'<input type="hidden" name="video" value="{esc(video_name)}">'
             f'<button type="submit" class="btn btn-confirm" title="Accept suggested tags">'
-            f'\u2714 Accept</button></form> '
+            f'{icon("check")} Accept</button></form> '
             f'<form hx-post="/reject-tags" hx-target="#video-meta" hx-swap="innerHTML" '
             f'style="display:inline;margin:0;padding:0">'
             f'<input type="hidden" name="path" value="{esc(rel_path)}">'
             f'<input type="hidden" name="video" value="{esc(video_name)}">'
             f'<button type="submit" class="btn btn-reject" title="Reject suggested tags">'
-            f'\u2718 Reject</button></form> '
+            f'{icon("x")} Reject</button></form> '
         )
 
     pill_class = 'video-tag-pill suggested' if is_suggested else 'video-tag-pill'
@@ -815,7 +815,7 @@ def render_video_tags_inline(rel_path, video_name, tags_list, status='confirmed'
             if is_suspect:
                 span_open = (f'<span class="{pill_class} suspect" '
                              f'title="Likely mislabeled — remove if wrong">'
-                             f'<span class="suspect-badge" aria-hidden="true">⚠</span>')
+                             + icon('warning', cls='suspect-badge'))
             else:
                 span_open = f'<span class="{pill_class}">'
             pieces.append(
@@ -959,7 +959,7 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
                         f'hx-swap="innerHTML" style="display:inline">'
                         f'<input type="hidden" name="path" value="{esc(data["path"])}">'
                         f'<input type="hidden" name="video" value="{esc(v["name"])}">'
-                        f'<button class="btn">\U0001F3F7 Suggest ({mode})</button>'
+                        f'<button class="btn">{icon("tag")} Suggest ({mode})</button>'
                         f'</form>'
                     )
         elif _config['has_ffmpeg']:
@@ -981,7 +981,7 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
                     f'<input type="hidden" name="path" value="{esc(data["path"])}">'
                     f'<input type="hidden" name="video" value="{esc(v["name"])}">'
                     f'<input type="hidden" name="redirect" value="{esc(self_url)}">'
-                    f'<button class="btn btn-embed">\U0001F9E0 Embed this video</button>'
+                    f'<button class="btn btn-embed">{icon("embed")} Embed this video</button>'
                     f'</form>'
                 )
         body += f'<div class="video-meta" id="video-meta">{meta_html}</div>'
