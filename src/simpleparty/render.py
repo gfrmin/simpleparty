@@ -535,7 +535,7 @@ def render_tag_manager(rel_path, tags_map):
             f'<input type="hidden" name="tag" value="{tag_attr}">'
             f'<button type="submit" class="btn-del" '
             f'title="Remove tag from all videos (keeps videos)">'
-            f'<span aria-hidden="true">\U0001F5D1</span> Remove</button>'
+            f'{icon("trash")} Remove</button>'
             f'</form>'
             f'</div>'
         )

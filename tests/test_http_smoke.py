@@ -8,6 +8,7 @@ ThreadedServer bound to an ephemeral port on a tmp directory.
 
 import http.client
 import json
+import re
 import threading
 import urllib.parse
 from functools import partial
@@ -689,3 +690,24 @@ def test_delete_by_tag_honors_starred_filter(srv, media_root):
     assert status == 200
     assert not (media_root / 'a.mp4').exists()
     assert (media_root / 'b.mp4').exists()
+
+
+# --- Design-system guard tests ---
+
+def test_pages_have_no_emoji(srv):
+    sp_server._config['has_ffmpeg'] = True
+    banned = ['⬇','\U0001F5D1','\U0001F9E0','\U0001F3F7','\U0001F52E','⚙',
+              '⇅','\U0001F4C1','\U0001F512','\U0001F513','\U0001F3AC','✅',
+              '❌','✔','✘','❓','⏳']
+    for url in ['/', '/browse?path=sub', '/play?path=&idx=0&sort=name&dir=asc']:
+        text = request(srv, 'GET', url)[2].decode()
+        for ch in banned:
+            assert ch not in text, f'emoji {ch!r} still in {url}'
+
+
+def test_css_uses_tokens_not_raw_hex(srv):
+    text = request(srv, 'GET', '/static/style.css')[2].decode()
+    body = text.split('}', 1)[1] if ':root' in text else text  # drop the :root block
+    # allow #fff/#000 shorthands; flag 6-digit hex in component rules
+    leaks = re.findall(r'#[0-9a-fA-F]{6}', body)
+    assert not leaks, f'raw hex outside tokens: {set(leaks)}'
