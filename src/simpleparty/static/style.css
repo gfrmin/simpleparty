@@ -84,10 +84,12 @@ nav{
 .btn-ghost{background:transparent;border-color:transparent;color:var(--text-muted)}
 .btn-ghost:hover{background:var(--surface-2);color:var(--text)}
 /* Star */
-.btn-star{padding:6px 10px;line-height:1}
+.btn-star{padding:6px 10px;line-height:1;width:var(--ctl-h);justify-content:center}
 .btn-star .star-icon,.btn-star .icon{font-size:18px;color:var(--text-muted)}
+.btn-star .star-icon .icon{fill:none;stroke:var(--text-muted)}
 .btn-star.active{background:var(--accent-weak);border-color:var(--star-border)}
 .btn-star.active .star-icon,.btn-star.active .icon{color:var(--star)}
+.btn-star.active .star-icon .icon{fill:var(--star);stroke:var(--star)}
 .btn-star.active:hover{filter:brightness(1.1)}
 .btn-star[disabled]{opacity:0.6;cursor:wait}
 /* Embed controls */
@@ -338,6 +340,10 @@ video{width:100%;max-height:70vh;display:block;background:#000}
   display:flex;align-items:center;padding:var(--space-2) var(--space-4);gap:var(--space-2);
   background:var(--surface);border-bottom:1px solid var(--border);flex-wrap:wrap;
 }
+.tier{display:inline-flex;align-items:center;gap:var(--space-2)}
+.tier-transport .btn{height:42px;min-height:42px;font-size:var(--text-base);padding:0 var(--space-4)}
+.tier-sep{width:1px;align-self:stretch;background:var(--border);margin:0 var(--space-1)}
+#controls .spacer{flex:1}
 .skip-group{
   display:inline-flex;gap:2px;background:var(--surface-2);
   border:1px solid var(--border);border-radius:var(--radius-md);padding:2px;
@@ -574,7 +580,7 @@ a:focus-visible,button:focus-visible,select:focus-visible,input:focus-visible,su
   position:static;width:auto;height:auto;opacity:1;
 }
 .tag-delete-all .btn-del:hover{background:var(--danger-strong);color:#fff}
-#delete-form{margin-left:12px}
+#delete-form{margin-left:0}
 /* T1: real hit area for the suggested-tag remove control */
 .video-tag-remove{display:inline-flex;align-items:center;justify-content:center;min-width:24px;min-height:24px;padding:4px;margin:-2px -4px -2px 0;font-size:14px;opacity:.85}
 /* U3/U4/U5: state-page polish */

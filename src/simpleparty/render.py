@@ -859,7 +859,7 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
     if transcode_plan == 'reencode':
         body += (
             '<div id="transcode-notice" role="status">'
-            '<span>\u2699 Re-encoding this video in real time (source codec not '
+            f'<span>{icon("gear")} Re-encoding this video in real time (source codec not '
             'supported by your browser); start-up and seeking may be slower.</span>'
             '<button type="button" class="tn-close" aria-label="Dismiss notice" '
             'onclick="this.parentNode.remove()">\u00d7</button>'
@@ -872,15 +872,18 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         f'<h1 id="video-title">{esc(v["name"])}</h1>'
         f'</div>'
         f'<div id="controls">'
-        f'<a class="btn" href="{esc(prev_url)}" title="Previous (p)">\u25C0 Prev</a>'
+        f'<div class="tier tier-transport">'
+        f'<a class="btn" href="{esc(prev_url)}" title="Previous (p)">{icon("prev")} Prev</a>'
+        f'<a class="btn" href="{esc(next_url)}" title="Next (n)">Next {icon("next")}</a>'
+        f'</div>'
+        f'<div class="tier-sep"></div>'
+        f'<div class="tier">'
         f'<div class="skip-group">'
         f'<button class="btn btn-skip" onclick="skip(-30)" title="Back 30s (J)">-30s</button>'
         f'<button class="btn btn-skip" onclick="skip(-10)" title="Back 10s (j)">-10s</button>'
         f'<button class="btn btn-skip" onclick="skip(10)" title="Forward 10s (l)">+10s</button>'
         f'<button class="btn btn-skip" onclick="skip(30)" title="Forward 30s (L)">+30s</button>'
         f'</div>'
-        f'<span id="now-playing">{pos_info}</span>'
-        f'<a class="btn" href="{esc(next_url)}" title="Next (n)">Next \u25B6</a>'
         f'<select id="speed-select" class="speed-select" onchange="setSpeed(this.value)" aria-label="Playback speed" title="Speed (&lt; &gt;)">'
         f'<option value="0.5">0.5x</option>'
         f'<option value="0.75">0.75x</option>'
@@ -890,10 +893,14 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
         f'<option value="2">2x</option>'
         f'<option value="3">3x</option>'
         f'</select>'
-        f'<a class="btn{" active" if is_shuffled else ""}" '
-        f'href="{esc(shuffle_url)}" title="Shuffle (s)">\u21C5 Shuffle</a>'
-        f'<button id="btn-autoplay" class="btn" title="Autoplay (a)" aria-pressed="false">Autoplay</button>'
-        f'<button id="btn-repeat" class="btn" title="Repeat (r)" aria-pressed="false">Repeat</button>'
+        f'</div>'
+        f'<span id="now-playing">{pos_info}</span>'
+        f'<div class="spacer"></div>'
+        f'<div class="tier">'
+        f'<a class="btn btn-toggle{" active" if is_shuffled else ""}" '
+        f'href="{esc(shuffle_url)}" title="Shuffle (s)">{icon("shuffle")} Shuffle</a>'
+        f'<button id="btn-autoplay" class="btn btn-toggle" title="Autoplay (a)" aria-pressed="false">Autoplay</button>'
+        f'<button id="btn-repeat" class="btn btn-toggle" title="Repeat (r)" aria-pressed="false">Repeat</button>'
     )
     if _config['allow_tag']:
         is_video_starred = bool(tags_map and tags_map.get(v['name'], {}).get('starred'))
@@ -904,18 +911,18 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
             f'aria-label="Star this video" '
             f'data-dir="{esc(data["path"])}" data-video="{esc(v["name"])}" '
             f'title="Star this video">'
-            f'<span class="star-icon" aria-hidden="true">{"★" if is_video_starred else "☆"}</span></button>'
+            f'<span class="star-icon" aria-hidden="true">{icon("star-outline")}</span></button>'
         )
     if _config['allow_delete']:
         body += (
             f'<form id="delete-form" hx-post="/delete" hx-confirm="Delete {esc(v["name"])}?">'
             f'<input type="hidden" name="path" value="{esc(v["path"])}">'
             f'<input type="hidden" name="redirect" value="{esc(browse_url)}">'
-            f'<button type="submit" class="btn btn-lock" title="Delete (d)" '
+            f'<button type="submit" class="btn btn-danger" title="Delete (d)" '
             f'aria-label="Delete {esc(v["name"])}">'
-            f'<span aria-hidden="true">\U0001F5D1</span></button></form>'
+            f'{icon("trash")}</button></form>'
         )
-    body += '</div>'
+    body += '</div></div>'
 
     if _config['allow_tag']:
         video_entry = tags_map.get(v['name'], {}) if tags_map else {}

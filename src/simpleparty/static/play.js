@@ -29,7 +29,6 @@ if(btnStar){btnStar.addEventListener("click",async()=>{
     btnStar.dataset.starred=next?"1":"0";
     btnStar.classList.toggle("active",next);
     btnStar.setAttribute("aria-pressed",next?"true":"false");
-    btnStar.querySelector(".star-icon").textContent=next?"★":"☆";
     flash(next?"Starred":"Unstarred");
   }catch(e){flash("Star failed")}
   finally{btnStar.disabled=false}
