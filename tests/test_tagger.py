@@ -316,3 +316,29 @@ def test_extract_frame_falls_back_when_no_keyframes(tmp_path, monkeypatch):
     assert tagger.extract_frame(str(vid), 2.5, str(out)) is True
     assert out.exists()
     assert any('-skip_frame' not in c for c in calls), 'fallback drops -skip_frame'
+
+
+def test_get_duration_falls_back_to_stream_duration(monkeypatch):
+    """Containers with no format-level duration (remuxed/streamed .mkv/.ts) must
+    fall back to the video stream's duration instead of probing as 0 (which got
+    them written off as permanently un-embeddable)."""
+    import subprocess
+    from simpleparty import tagger
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        on_stream = 'stream=duration' in cmd
+
+        class _R:
+            returncode = 0
+            stdout = '12.34\n' if on_stream else ''  # format query empty, stream has it
+            stderr = ''
+        return _R()
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+
+    assert tagger._get_duration('/some/clip.mkv') == 12.34
+    assert any('format=duration' in c for c in calls), 'format duration tried first'
+    assert any('stream=duration' in c for c in calls), 'falls back to stream duration'

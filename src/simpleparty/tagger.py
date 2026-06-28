@@ -307,42 +307,47 @@ def _is_dark_frame(jpeg_path, threshold=20):
         return True
 
 
-def _get_duration(video_path):
-    """Get video duration in seconds via ffprobe, or 0.0 on any failure.
-
-    Failures are logged at DEBUG with the *specific* reason (timeout / missing
-    binary / empty or unparseable output, with ffprobe's stderr) so a video that
-    keeps coming back as "missing" because its duration can't be read is
-    diagnosable from a single `--debug` run."""
-    cmd = [
-        'ffprobe', '-v', 'error',
-        '-show_entries', 'format=duration',
-        '-of', 'csv=p=0',
-        str(video_path),
-    ]
-    t0 = time.monotonic()
+def _ffprobe_duration(video_path, entries_args):
+    """Run one ffprobe duration query (`entries_args` selects format/stream),
+    returning seconds or 0.0. Logs the specific failure reason at DEBUG."""
+    cmd = ['ffprobe', '-v', 'error', *entries_args, '-of', 'csv=p=0', str(video_path)]
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=10, text=True)
     except subprocess.TimeoutExpired:
-        logger.debug('duration: ffprobe TIMEOUT (>10s) for %s', video_path)
+        logger.debug('duration: ffprobe TIMEOUT (>10s) for %s %s', video_path, entries_args)
         return 0.0
     except OSError as e:
         logger.debug('duration: ffprobe not runnable (%s) for %s', e, video_path)
         return 0.0
     out = (result.stdout or '').strip()
     if not out:
-        # No duration in the container metadata, or ffprobe errored. stderr +
-        # return code say which (e.g. "Invalid data found", remuxed/streamed
-        # files with no format duration, a partial download, etc.).
-        logger.debug('duration: empty ffprobe output for %s (rc=%s, stderr=%r)',
-                     video_path, result.returncode, (result.stderr or '').strip()[:300])
+        logger.debug('duration: empty ffprobe output for %s %s (rc=%s, stderr=%r)',
+                     video_path, entries_args, result.returncode,
+                     (result.stderr or '').strip()[:300])
         return 0.0
     try:
-        dur = float(out.splitlines()[0])
+        return float(out.splitlines()[0])
     except ValueError:
         logger.debug('duration: unparseable ffprobe output %r for %s', out[:80], video_path)
         return 0.0
-    logger.debug('duration %.1fs for %s (%.2fs)', dur, video_path, time.monotonic() - t0)
+
+
+def _get_duration(video_path):
+    """Get video duration in seconds via ffprobe, or 0.0 if unreadable.
+
+    Tries the container's format-level duration first, then falls back to the
+    video stream's own duration: remuxed/streamed containers (some .mkv/.ts/
+    .webm, partial downloads) carry no `format=duration` but do carry
+    `stream=duration`. Without this fallback such files probe as 0 and get
+    written off as permanently un-embeddable. Failures are logged at DEBUG with
+    the specific reason so they're diagnosable from one `--debug` run."""
+    t0 = time.monotonic()
+    dur = _ffprobe_duration(video_path, ['-show_entries', 'format=duration'])
+    if dur <= 0:
+        dur = _ffprobe_duration(
+            video_path, ['-select_streams', 'v:0', '-show_entries', 'stream=duration'])
+    if dur > 0:
+        logger.debug('duration %.1fs for %s (%.2fs)', dur, video_path, time.monotonic() - t0)
     return dur
 
 
