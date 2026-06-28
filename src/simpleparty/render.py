@@ -725,7 +725,7 @@ def render_locked_page(path, encrypted_dir, redirect_path=None, error=None):
         parent = ''
     body += (
         f'<main id="main"><div class="unlock-box">'
-        f'<h1>Unlock {esc(dir_name)}</h1>'
+        f'<h1>{icon("lock")} Unlock {esc(dir_name)}</h1>'
         f'<form hx-post="/unlock" hx-target="#unlock-error" hx-swap="innerHTML">'
         f'<input type="hidden" name="path" value="{esc(encrypted_dir)}">'
         f'<input type="hidden" name="redirect" value="{esc(url_for_browse(redir))}">'
@@ -734,7 +734,7 @@ def render_locked_page(path, encrypted_dir, redirect_path=None, error=None):
         f'<div id="unlock-error" class="unlock-error" role="alert">{esc(error) if error else ""}</div>'
         f'<div class="unlock-actions">'
         f'<a class="btn" href="{esc(url_for_browse(parent))}">Cancel</a>'
-        f'<button class="btn active" type="submit">Unlock</button>'
+        f'<button class="btn btn-primary" type="submit">{icon("lock-open")} Unlock</button>'
         f'</div></form></div></main>'
     )
     return render_page('SimpleParty \u2014 Unlock', body)
@@ -743,9 +743,9 @@ def render_locked_page(path, encrypted_dir, redirect_path=None, error=None):
 def render_error_page(path, error):
     body = render_nav(path)
     body += (
-        f'<main id="main"><div class="unlock-box" style="text-align:center" role="alert">'
-        f'<h1>Something went wrong</h1>'
-        f'<p style="color:#f87171;margin-top:8px">{esc(error)}</p>'
+        f'<main id="main"><div class="unlock-box error-box" role="alert">'
+        f'<h1>{icon("warning")} Something went wrong</h1>'
+        f'<p class="error-msg">{esc(error)}</p>'
         f'<div class="error-back"><a class="btn" href="/">\u2190 Back to library</a></div>'
         f'</div></main>'
     )
@@ -1009,7 +1009,7 @@ def render_download_form(target_rel='', *, autofocus=False):
         f'<form hx-post="/download" class="download-form">'
         f'<input type="hidden" name="path" value="{rel}">'
         f'<input type="url" name="url" placeholder="https://… (paste a URL)" aria-label="Download URL" required{af}>'
-        f'<button type="submit" class="btn active">\u2B07 Queue</button>'
+        f'<button type="submit" class="btn btn-primary">{icon("download")} Queue</button>'
         f'</form>'
     )
 
@@ -1043,7 +1043,7 @@ def _render_download_job_card(job, *, full=True):
     title = job.get('title') or Path(job.get('filename') or '').name or job['url']
     err = ''
     if job.get('error'):
-        err = f'<div class="tag-error">\u274C {esc(job["error"])}</div>'
+        err = f'<div class="tag-error">{icon("x")} {esc(job["error"])}</div>'
     card_cls = 'download-card err' if state == 'error' else 'download-card'
 
     bar = ''
@@ -1081,11 +1081,11 @@ def _render_download_job_card(job, *, full=True):
         links = ''
         if job.get('play_dir') is not None and job.get('play_name'):
             play_url = url_for_play(job['play_dir'], 0, video=job['play_name'])
-            links += f' <a class="btn" href="{esc(play_url)}">\u25B6 Play</a>'
+            links += f' <a class="btn" href="{esc(play_url)}">{icon("play")} Play</a>'
             browse_url = url_for_browse(job['play_dir'])
-            links += f' <a class="btn" href="{esc(browse_url)}">\U0001F4C1 Folder</a>'
+            links += f' <a class="btn" href="{esc(browse_url)}">{icon("folder")} Folder</a>'
         meta = (
-            f'<div class="meta"><span class="tag-done">\u2705 '
+            f'<div class="meta"><span class="tag-done">{icon("check")} '
             f'{esc(" · ".join(meta_bits))}</span>{links}</div>'
         )
     elif state == 'cancelled':
@@ -1096,7 +1096,7 @@ def _render_download_job_card(job, *, full=True):
     cancel = ''
     if full and state in ('queued', 'running'):
         cancel = (
-            f'<form hx-post="/download-cancel" style="display:inline">'
+            f'<form hx-post="/download-cancel" class="dl-cancel-form">'
             f'<input type="hidden" name="id" value="{esc(job["id"])}">'
             f'<button class="btn">Cancel</button>'
             f'</form>'
@@ -1151,14 +1151,14 @@ def render_download_status(path_filter=None):
                     pct = j.get('percent', 0)
                     title = j.get('title') or Path(j.get('filename') or '').name or j['url']
                     parts.append(
-                        f'<span class="tag-progress-phase">\u2B07 {esc(title[:60])}</span>'
+                        f'<span class="tag-progress-phase">{icon("download")} {esc(title[:60])}</span>'
                         f'<div class="tag-progress-bar-wrap">'
                         f'<div class="tag-progress-bar" style="width:{pct}%"></div>'
                         f'</div>'
                         f'<span class="tag-progress-text">{pct}%</span>'
                     )
                 else:
-                    parts.append(f'<span class="tag-progress-text">\u2B07 queued</span>')
+                    parts.append(f'<span class="tag-progress-text">{icon("download")} queued</span>')
             inner = ''.join(parts) + ' <a class="btn" href="/download">Manage</a>'
         return (
             f'<div hx-get="/download-status?{urllib.parse.urlencode({"path": path_filter, "inline": "1"})}" '
@@ -1186,7 +1186,7 @@ def render_download_status(path_filter=None):
     if finished:
         pieces.append(
             '<div class="download-section-title">Recent '
-            '<form hx-post="/download-clear" style="display:inline;margin-left:8px">'
+            '<form hx-post="/download-clear" class="dl-section-form">'
             '<button class="btn">Clear completed</button></form></div>'
         )
         for j in finished:
@@ -1204,16 +1204,16 @@ def render_download_status(path_filter=None):
 def render_download_page(target_rel=''):
     nav = render_nav('')
     hint = (
-        '<div style="padding:16px 16px 0;color:#94a3b8;font-size:13px">'
+        '<div class="download-hint">'
         'Paste a URL. Downloads land in the chosen directory '
         '(default: server root). One at a time.'
         '</div>'
     )
     full_form = (
-        f'<form hx-post="/download" class="download-form" style="margin:8px 16px 0">'
-        f'<input type="url" name="url" placeholder="https://…" aria-label="Download URL" required autofocus style="flex:2">'
-        f'<input type="text" name="path" placeholder="subdir/ (blank = root)" aria-label="Target subdirectory" value="{esc(target_rel)}" style="flex:1">'
-        f'<button type="submit" class="btn active">\u2B07 Queue</button>'
+        f'<form hx-post="/download" class="download-form download-form-page">'
+        f'<input type="url" name="url" class="download-url-input" placeholder="https://…" aria-label="Download URL" required autofocus>'
+        f'<input type="text" name="path" class="download-path-input" placeholder="subdir/ (blank = root)" aria-label="Target subdirectory" value="{esc(target_rel)}">'
+        f'<button type="submit" class="btn btn-primary">{icon("download")} Queue</button>'
         f'</form>'
     )
     board = render_download_status(path_filter=None)
