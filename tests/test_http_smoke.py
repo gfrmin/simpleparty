@@ -474,10 +474,13 @@ def test_tag_status(srv):
 
 def test_static_css(srv):
     status, headers, body = request(srv, 'GET', '/static/style.css')
+    text = body.decode()
     assert status == 200
     assert headers['Content-Type'].startswith('text/css')
     assert headers['Cache-Control'] == 'public, max-age=3600'
-    assert b'#file-list' in body
+    assert '#file-list' in text
+    assert ':root' in text and '--accent:#6366f1' in text.replace(' ', '')
+    assert '--bg:#0a0c10' in text.replace(' ', '')
 
 
 def test_static_unknown_404(srv):

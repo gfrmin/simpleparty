@@ -1,3 +1,14 @@
+:root{
+  --bg:#0a0c10;--surface:#12151c;--surface-2:#1a1f29;--surface-hover:#222836;--border:#262c38;
+  --text:#e6e9ef;--text-muted:#9aa4b2;--text-faint:#7a8494;
+  --accent:#6366f1;--accent-hover:#818cf8;--accent-weak:rgba(99,102,241,0.14);--on-accent:#fff;
+  --danger:#ef4444;--danger-weak:rgba(239,68,68,0.16);--warn:#f59e0b;--success:#34d399;--star:#facc15;
+  --text-xs:12px;--text-sm:13px;--text-base:15px;--text-lg:18px;--text-xl:22px;--text-display:28px;
+  --lh-tight:1.2;--lh:1.45;
+  --space-1:4px;--space-2:8px;--space-3:12px;--space-4:16px;--space-5:24px;--space-6:32px;
+  --radius-sm:6px;--radius-md:8px;--radius-lg:12px;--radius-pill:999px;
+  --shadow:0 4px 16px rgba(0,0,0,0.4);
+}
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{height:100%}
 body{
