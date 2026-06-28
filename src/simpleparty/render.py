@@ -174,7 +174,7 @@ def render_video_item(v, i, data_path, view, *, current_idx=-1, tags_map=None,
     if v['name'] in thumbs:
         thumb_html = f'<img src="{thumb_url}" loading="lazy" class="item-thumb" alt="">'
     else:
-        thumb_html = '<div class="item-thumb item-thumb-placeholder" aria-hidden="true">\U0001F3AC</div>'
+        thumb_html = f'<div class="item-thumb item-thumb-placeholder" aria-hidden="true">{icon("film", cls="item-thumb-placeholder-icon")}</div>'
     pieces.append(
         f'<a class="item-link" href="{esc(play_url)}">'
         f'{thumb_html}'
@@ -189,9 +189,9 @@ def render_video_item(v, i, data_path, view, *, current_idx=-1, tags_map=None,
             f'<form hx-post="/delete" hx-target="closest .item" hx-swap="delete" '
             f'hx-confirm="Delete {esc(v["name"])}?">'
             f'<input type="hidden" name="path" value="{esc(v["path"])}">'
-            f'<button type="submit" class="btn-del" title="Delete" '
+            f'<button type="submit" class="btn-del" title="Delete {esc(v["name"])}" '
             f'aria-label="Delete {esc(v["name"])}">'
-            f'<span aria-hidden="true">\U0001F5D1</span></button>'
+            f'{icon("trash", label="Delete " + v["name"])}</button>'
             f'</form>'
         )
     if tags_map and v['name'] in tags_map:
@@ -203,7 +203,7 @@ def render_video_item(v, i, data_path, view, *, current_idx=-1, tags_map=None,
             tcls = ' suggested' if is_suggested else ''
             prefix = (
                 '<span class="visually-hidden">Suggested tags: </span>'
-                '<span aria-hidden="true">\u2753\u2009</span>'
+                '<span class="badge-suggested" aria-hidden="true">Suggested</span> '
             ) if is_suggested else ''
             pieces.append(f'<div class="item-tags{tcls}">{prefix}{tags_text}</div>')
     pieces.append('</div>')
@@ -353,7 +353,7 @@ def render_related_videos(data, idx, lower_index, view, thumbs=frozenset()):
         if has_thumb:
             thumb_html = f'<img src="{thumb_url}" loading="lazy" class="item-thumb" alt="">'
         else:
-            thumb_html = '<div class="item-thumb item-thumb-placeholder" aria-hidden="true">\U0001F3AC</div>'
+            thumb_html = f'<div class="item-thumb item-thumb-placeholder" aria-hidden="true">{icon("film", cls="item-thumb-placeholder-icon")}</div>'
         pieces.append(
             f'<div class="item item-video">'
             f'<a class="item-link" href="{esc(play_url)}">'
@@ -374,7 +374,7 @@ def render_playlist_item(v, play_url, position, thumbs):
     if v['name'] in thumbs:
         thumb_html = f'<img src="/thumb/{urllib.parse.quote(v["path"])}" loading="lazy" class="playlist-thumb" alt="">'
     else:
-        thumb_html = '<div class="playlist-thumb-placeholder" aria-hidden="true">\U0001F3AC</div>'
+        thumb_html = f'<div class="playlist-thumb-placeholder" aria-hidden="true">{icon("film", cls="item-thumb-placeholder-icon")}</div>'
     cls = ' playing' if is_current else ''
     label = '\u25B6 Now' if is_current else str(position)
     return (

@@ -279,6 +279,7 @@ nav{
   font-size:32px;color:var(--text-faint);
   aspect-ratio:16/9;background:var(--surface-2);
 }
+.item-thumb-placeholder-icon{display:block;flex-shrink:0;color:var(--text-faint)}
 .item-video .item-info{
   display:flex;flex-direction:column;gap:var(--space-1);
   padding:var(--space-2) var(--space-3) var(--space-3);min-width:0;
