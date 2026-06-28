@@ -48,6 +48,7 @@ from simpleparty.render import (
     render_error_page,
     render_locked_page,
     render_play_page,
+    render_tag_manager,
     render_video_tags_inline,
 )
 from simpleparty.state import CONFIG as _config, BROWSER_NATIVE, MIME_TYPES
@@ -798,6 +799,68 @@ def handle_save_tags(handler, root):
     send_html(handler, render_video_tags_inline(rel_path, video_name, tags_list))
 
 
+def _resolve_tag_dir(handler, root, rel_path):
+    """Shared path-safety gate for the tag-management routes. Returns the
+    resolved directory, or None (after sending an error) if invalid."""
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return None
+    resolved = resolve_path(root, rel_path)
+    if not resolved.is_dir():
+        handler.send_error(400, 'Not a directory')
+        return None
+    return resolved
+
+
+def handle_rename_tag(handler, root):
+    """Rename a tag across every video in a directory; renaming onto an
+    existing tag merges them. Keeps the videos. Returns the refreshed panel."""
+    if not _config['allow_tag']:
+        handler.send_error(403, 'Tagging not enabled')
+        return
+    from simpleparty.tagger import rewrite_tags, update_tags
+
+    form = read_form_body(handler)
+    rel_path = form.get('path', '')
+    old = form.get('old', '')
+    new = form.get('new', '').strip()
+    if not old or not new:
+        handler.send_error(400, 'Both old and new tag names are required')
+        return
+    resolved = _resolve_tag_dir(handler, root, rel_path)
+    if resolved is None:
+        return
+
+    updated = update_tags(
+        resolved, lambda t: rewrite_tags(t, {old.lower(): new}),
+    )
+    send_html(handler, render_tag_manager(rel_path, updated))
+
+
+def handle_remove_tag(handler, root):
+    """Remove a tag from every video in a directory, keeping the videos
+    (distinct from /delete-by-tag). Returns the refreshed panel."""
+    if not _config['allow_tag']:
+        handler.send_error(403, 'Tagging not enabled')
+        return
+    from simpleparty.tagger import rewrite_tags, update_tags
+
+    form = read_form_body(handler)
+    rel_path = form.get('path', '')
+    tag = form.get('tag', '')
+    if not tag:
+        handler.send_error(400, 'No tag specified')
+        return
+    resolved = _resolve_tag_dir(handler, root, rel_path)
+    if resolved is None:
+        return
+
+    updated = update_tags(
+        resolved, lambda t: rewrite_tags(t, {tag.lower(): None}),
+    )
+    send_html(handler, render_tag_manager(rel_path, updated))
+
+
 def handle_star_update(handler, root):
     if not _config['allow_tag']:
         handler.send_error(403, 'Tagging not enabled')
@@ -1014,6 +1077,8 @@ POST_ROUTES = {
     '/reject-tags': handle_reject_tags,
     '/reject-tag': handle_reject_tag,
     '/save-tags': handle_save_tags,
+    '/rename-tag': handle_rename_tag,
+    '/remove-tag': handle_remove_tag,
     '/star-update': handle_star_update,
     '/download': handle_download_submit,
     '/download-cancel': handle_download_cancel,

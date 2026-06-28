@@ -283,6 +283,63 @@ def training_entries(tags):
     }
 
 
+def rewrite_tags(tags_map, mapping):
+    """Pure directory-level tag rewrite: rename/merge/remove across all entries.
+
+    `mapping` maps a *lowercased* source tag to either a target string
+    (rename — renaming onto an existing tag merges them) or None (remove). For
+    each video entry a new entry is produced where:
+      - each tag whose lowercased form is a mapping key is replaced by the
+        target (or dropped if None); order is preserved and duplicates are
+        removed case-insensitively (so a merge yields a single tag);
+      - `suggest_scores` keys are rewritten the same way; on a collision the
+        higher score wins, and dropped tags' scores are removed;
+      - `status`, `starred`, and every other field are preserved untouched;
+      - entries are kept even if their `tags` list becomes empty.
+
+    The input is not mutated. Tags not named in `mapping` pass through, so an
+    unknown key is a no-op.
+    """
+    def map_target(tag):
+        """Return (keep, target): keep=False means drop this tag."""
+        key = tag.lower()
+        if key in mapping:
+            target = mapping[key]
+            return (target is not None, target)
+        return (True, tag)
+
+    result = {}
+    for name, entry in tags_map.items():
+        new_entry = dict(entry)
+        if 'tags' in entry:
+            new_tags = []
+            seen = set()
+            for tag in entry['tags']:
+                keep, target = map_target(tag)
+                if not keep:
+                    continue
+                dedup_key = target.lower()
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                new_tags.append(target)
+            new_entry['tags'] = new_tags
+        scores = entry.get('suggest_scores')
+        if isinstance(scores, dict):
+            new_scores = {}
+            for tag, score in scores.items():
+                keep, target = map_target(tag)
+                if not keep:
+                    continue
+                if target in new_scores:
+                    new_scores[target] = max(new_scores[target], score)
+                else:
+                    new_scores[target] = score
+            new_entry['suggest_scores'] = new_scores
+        result[name] = new_entry
+    return result
+
+
 # --- Keyframe extraction ---
 
 def _is_dark_frame(jpeg_path, threshold=20):

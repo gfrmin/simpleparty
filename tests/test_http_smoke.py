@@ -470,6 +470,101 @@ def test_tag_status(srv):
     assert 'tag-progress' in body.decode()
 
 
+# --- Directory tag management (rename / remove) ---
+
+def _write_tags(media_root, mapping):
+    (media_root / '.simpleparty' / 'tags.json').write_text(json.dumps(mapping))
+
+
+def test_browse_surfaces_manage_tags_panel(srv, media_root):
+    # media_root fixture has a.mp4 tagged 'cat' -> panel + a rename/remove row
+    status, _, body = request(srv, 'GET', '/browse')
+    text = body.decode()
+    assert status == 200
+    assert 'Manage tags' in text
+    assert 'id="tag-manager"' in text
+    assert '/rename-tag' in text and '/remove-tag' in text
+
+
+def test_browse_no_manage_panel_when_no_tags(srv, media_root):
+    _write_tags(media_root, {})
+    status, _, body = request(srv, 'GET', '/browse')
+    assert status == 200
+    assert 'Manage tags' not in body.decode()
+
+
+def test_rename_tag_persists(srv, media_root):
+    _write_tags(media_root, {
+        'a.mp4': {'tags': ['scifi'], 'status': 'confirmed'},
+        'b.mp4': {'tags': ['Scifi', 'drama'], 'status': 'confirmed'},
+    })
+    status, _, _ = post_form(
+        srv, '/rename-tag', {'path': '', 'old': 'scifi', 'new': 'science fiction'},
+    )
+    assert status == 200
+    on_disk = json.loads((media_root / '.simpleparty' / 'tags.json').read_text())
+    assert on_disk['a.mp4']['tags'] == ['science fiction']
+    assert on_disk['b.mp4']['tags'] == ['science fiction', 'drama']
+
+
+def test_rename_tag_merges_and_dedups(srv, media_root):
+    _write_tags(media_root, {
+        'a.mp4': {'tags': ['action', 'fight'], 'status': 'confirmed'},
+    })
+    status, _, _ = post_form(
+        srv, '/rename-tag', {'path': '', 'old': 'fight', 'new': 'action'},
+    )
+    assert status == 200
+    on_disk = json.loads((media_root / '.simpleparty' / 'tags.json').read_text())
+    assert on_disk['a.mp4']['tags'] == ['action']
+
+
+def test_remove_tag_persists_keeps_video(srv, media_root):
+    _write_tags(media_root, {
+        'a.mp4': {'tags': ['generic', 'action'], 'status': 'confirmed'},
+    })
+    status, _, _ = post_form(srv, '/remove-tag', {'path': '', 'tag': 'generic'})
+    assert status == 200
+    assert (media_root / 'a.mp4').exists()  # video kept
+    on_disk = json.loads((media_root / '.simpleparty' / 'tags.json').read_text())
+    assert on_disk['a.mp4']['tags'] == ['action']
+
+
+def test_rename_tag_empty_new_is_400(srv, media_root):
+    status, _, _ = post_form(
+        srv, '/rename-tag', {'path': '', 'old': 'cat', 'new': '   '},
+    )
+    assert status == 400
+
+
+def test_rename_tag_disabled_403(srv, media_root):
+    sp_server._config['allow_tag'] = False
+    status, _, _ = post_form(
+        srv, '/rename-tag', {'path': '', 'old': 'cat', 'new': 'feline'},
+    )
+    assert status == 403
+
+
+def test_remove_tag_disabled_403(srv, media_root):
+    sp_server._config['allow_tag'] = False
+    status, _, _ = post_form(srv, '/remove-tag', {'path': '', 'tag': 'cat'})
+    assert status == 403
+
+
+def test_rename_tag_traversal_blocked(srv, media_root):
+    status, _, _ = post_form(
+        srv, '/rename-tag', {'path': '../etc', 'old': 'cat', 'new': 'feline'},
+    )
+    assert status == 400
+
+
+def test_remove_tag_traversal_blocked(srv, media_root):
+    status, _, _ = post_form(
+        srv, '/remove-tag', {'path': '../etc', 'tag': 'cat'},
+    )
+    assert status == 400
+
+
 # --- Static assets ---
 
 def test_static_css(srv):
