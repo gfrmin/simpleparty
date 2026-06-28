@@ -210,11 +210,8 @@ nav{
   padding:1px 8px;border-radius:var(--radius-pill);
 }
 
-/* ---------- Action bar (current browse toolbar container) ---------- */
-.action-bar{
-  grid-column:1/-1;display:flex;gap:var(--space-2);
-  padding-bottom:var(--space-1);flex-wrap:wrap;overflow:hidden;align-items:flex-start;
-}
+/* ---------- Action bar — grid-spanning wrapper for toolbar + status strips ---------- */
+.action-bar{grid-column:1/-1}
 
 /* ---------- File grid ---------- */
 #file-list{
@@ -534,8 +531,8 @@ a:focus-visible,button:focus-visible,select:focus-visible,input:focus-visible,su
 .item-video .btn-del{color:var(--text-muted)}
 /* V4: distinguish sort pills from tag-filter chips */
 .sort-pill{border-radius:var(--radius-sm)}
-/* L5: action-bar items keep natural height (no vertical stretch) */
-.action-bar{align-items:flex-start}
+/* L5: status strips below the toolbar get padding to align with toolbar zones */
+.tag-progress-panel:not(:empty),.download-progress-panel:not(:empty){padding:var(--space-2) var(--space-4)}
 /* L6: keep the tag dropdown inside the viewport */
 .tag-dropdown{max-width:calc(100vw - 24px)}
 /* P5: don't let the position counter grab the controls row */

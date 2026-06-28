@@ -7,6 +7,7 @@ from html import escape as esc
 from pathlib import Path
 
 from simpleparty import __version__, jobs
+from simpleparty.icons import icon
 from simpleparty.library import _compute_related_videos, resolve_path
 from simpleparty.state import CONFIG as _config
 from simpleparty.urls import ViewState, url_for_browse, url_for_play, url_for_shuffle, url_for_video
@@ -45,7 +46,7 @@ def render_page(title, body):
 
 def render_nav(path, encrypted_dir=None):
     parts = path.split('/') if path else []
-    pieces = ['<a class="crumb" href="/">SimpleParty</a>']
+    pieces = ['<a class="crumb brand" href="/">SimpleParty</a>']
     # Build (label, href) for each segment, then collapse the middle on deep
     # paths so the sticky breadcrumb stays compact (and doesn't wrap on phones).
     segs = []
@@ -63,7 +64,7 @@ def render_nav(path, encrypted_dir=None):
         pieces.append(f'<a class="crumb" href="{esc(href)}"{cur}>{esc(label)}</a>')
     pieces.append('<span class="nav-spacer"></span>')
     if _config.get('allow_download'):
-        pieces.append('<a class="btn" href="/download">\u2B07 Downloads</a>')
+        pieces.append(f'<a class="btn" href="/download">{icon("download")} Downloads</a>')
     if encrypted_dir is not None:
         parent = str(Path(encrypted_dir).parent)
         if parent == '.':
@@ -81,7 +82,7 @@ def render_nav(path, encrypted_dir=None):
 def _render_train_btn(path_param, is_busy):
     cls = 'btn btn-train busy' if is_busy else 'btn btn-train'
     disabled = ' disabled' if is_busy else ''
-    label = '\U0001F9E0 Training\u2026' if is_busy else '\U0001F9E0 Train'
+    label = f'{icon("tag")} Training\u2026' if is_busy else f'{icon("tag")} Train'
     return (
         f'<form hx-post="/train" style="display:inline" id="train-form">'
         f'<input type="hidden" name="path" value="{path_param}">'
@@ -105,7 +106,7 @@ def render_coverage_controls(rel_path, coverage, is_busy):
     missing = coverage['missing']
     badge = (
         f'<span class="coverage-badge" title="videos with CLIP embeddings">'
-        f'\U0001F9E0 {embedded}/{total} embedded'
+        f'{icon("embed")} {embedded}/{total} embedded'
         + (f' · {missing} missing' if missing else '')
         + '</span>'
     )
@@ -118,12 +119,12 @@ def render_coverage_controls(rel_path, coverage, is_busy):
             f'<form hx-post="/embed" style="display:inline" id="embed-form">'
             f'<input type="hidden" name="path" value="{path_param}">'
             f'<button class="btn btn-embed" hx-disabled-elt="this">'
-            f'\U0001F9E0 Embed all missing ({missing})</button>'
+            f'{icon("embed")} Embed all missing ({missing})</button>'
             f'</form>'
             f'<input type="hidden" id="embed-path" name="path" value="{path_param}">'
             f'<button class="btn btn-embed-selected" hx-post="/embed" '
             f'hx-include=".embed-check:checked, #embed-path" hx-disabled-elt="this">'
-            f'\U0001F9E0 Embed selected</button>'
+            f'{icon("embed")} Embed selected</button>'
         )
     train_html = _render_train_btn(path_param, is_busy) if embedded else ''
     return (
@@ -231,13 +232,14 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
     shuffle_btn = ''
     if show_shuffle and data['videos']:
         shuffle_url = url_for_shuffle(data['path'], view)
-        shuffle_btn = f'<a class="btn" href="{esc(shuffle_url)}">\u21C5 Shuffle Play</a>'
+        shuffle_btn = f'<a class="btn btn-primary" href="{esc(shuffle_url)}">{icon("shuffle")} Shuffle Play</a>'
     want_action_bar = bool(shuffle_btn) or (
         _config.get('allow_download') and (data['videos'] or data['dirs'])
     )
     embed_missing = frozenset()
     if want_action_bar:
-        tag_html = ''
+        tag_controls_html = ''
+        tag_status_html = ''
         if data['videos'] and _config['allow_tag'] and _config['has_ffmpeg']:
             from simpleparty.embeddings import embedding_coverage
             resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
@@ -248,52 +250,62 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
             # Embed (produce) and Train (consume) are split, coverage-gated, and
             # explicit. Suggesting/accepting tags stay per-video on the play page
             # so a whole-folder pass can't silently bulk-write tags you never saw.
-            tag_html = render_coverage_controls(data['path'], coverage, is_busy)
+            tag_controls_html = render_coverage_controls(data['path'], coverage, is_busy)
             status_url = f'/tag-status?{urllib.parse.urlencode({"path": data["path"]})}'
             poll = 'every 2s' if is_busy else 'every 10s'
-            tag_html += (
+            tag_status_html = (
                 f'<div hx-get="{status_url}" '
                 f'hx-trigger="load,{poll}" hx-swap="outerHTML" '
                 f'class="tag-progress-panel{" active" if is_busy else ""}" '
                 f'role="status" aria-live="polite" id="tag-progress"></div>'
             )
-        download_html = ''
+        download_inner_html = ''
+        download_status_html = ''
         if _config['allow_download']:
             path_q = urllib.parse.urlencode({'path': data['path']})
-            download_html = (
+            download_inner_html = (
                 f'<details class="download-details">'
-                f'<summary class="btn">\u2B07 Download URL</summary>'
+                f'<summary class="btn">{icon("download")} Download URL</summary>'
                 f'<div style="flex-basis:100%">{render_download_form(data["path"], autofocus=False)}</div>'
                 f'</details>'
                 f'<a class="btn" href="/download">Manage</a>'
+            )
+            download_status_html = (
                 f'<div hx-get="/download-status?{path_q}&inline=1" hx-trigger="load" '
                 f'hx-swap="outerHTML" class="download-progress-panel" '
                 f'role="status" aria-live="polite" '
                 f'id="download-progress"></div>'
             )
         sort_html = render_sort_pills(data['path'], view) if data['videos'] else ''
+        # Build toolbar-lib groups (coverage/embed/train | download/manage)
+        lib_groups = ''
+        if tag_controls_html:
+            lib_groups += f'<div class="lib-group">{tag_controls_html}</div>'
+        if download_inner_html:
+            lib_groups += f'<div class="lib-group">{download_inner_html}</div>'
+        toolbar_view = f'<div class="toolbar-view">{shuffle_btn}{sort_html}</div>'
+        toolbar_lib = f'<div class="toolbar-lib">{lib_groups}</div>' if lib_groups else ''
         pieces.append(
             f'<div class="action-bar">'
-            f'{shuffle_btn}'
-            f'{sort_html}'
-            f'{tag_html}'
-            f'{download_html}'
+            f'<div class="toolbar">{toolbar_view}{toolbar_lib}</div>'
+            f'{tag_status_html}'
+            f'{download_status_html}'
             f'</div>'
         )
 
     for d in data['dirs']:
         if d['encrypted'] and not d['unlocked']:
-            icon = '\U0001F512'
+            dir_icon = icon('lock')
             state = ' <span class="visually-hidden">(encrypted, locked)</span>'
         elif d['encrypted']:
-            icon = '\U0001F513'
+            dir_icon = icon('lock-open')
             state = ' <span class="visually-hidden">(encrypted, unlocked)</span>'
         else:
-            icon = '\U0001F4C1'
+            dir_icon = icon('folder')
             state = ''
         pieces.append(
             f'<a class="item" href="{esc(url_for_browse(d["path"]))}">'
-            f'<span class="item-icon" aria-hidden="true">{icon}</span>'
+            f'<span class="item-icon" aria-hidden="true">{dir_icon}</span>'
             f'<span class="item-name">{esc(d["name"])}{state}</span>'
             f'</a>'
         )
