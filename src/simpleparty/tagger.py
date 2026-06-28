@@ -365,26 +365,29 @@ def extract_keyframes(video_path, max_frames=3):
     logger.debug('extracting %d keyframes from %s at positions %s',
                  max_frames, video_path, ['%.1fs' % p for p in positions])
 
-    for idx, pos in enumerate(positions):
-        out_path = os.path.join(tmpdir, f'frame_{idx:02d}.jpg')
-        cmd = [
-            'ffmpeg', '-ss', f'{pos:.2f}',
-            '-t', '30',
-            '-skip_frame', 'nokey',
-            '-i', str(video_path),
-            '-frames:v', '1',
-            '-q:v', '4',
-            out_path,
-        ]
-        try:
-            subprocess.run(
-                cmd, capture_output=True, timeout=timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            pass
+    def _run_pass(keyframes_only):
+        for idx, pos in enumerate(positions):
+            out_path = os.path.join(tmpdir, f'frame_{idx:02d}.jpg')
+            cmd = ['ffmpeg', '-ss', f'{pos:.2f}', '-t', '30']
+            if keyframes_only:
+                cmd += ['-skip_frame', 'nokey']
+            cmd += ['-i', str(video_path), '-frames:v', '1', '-q:v', '4', out_path]
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+            except subprocess.TimeoutExpired:
+                pass
+        return sorted(Path(tmpdir).glob('frame_*.jpg'))
 
-    frames = sorted(Path(tmpdir).glob('frame_*.jpg'))
+    # Fast path: decode only keyframes. But a video with sparse keyframes (e.g.
+    # a short clip whose single keyframe is at t=0) yields NOTHING at any later
+    # seek position, which previously left it permanently "missing". Fall back
+    # to a normal decode (no -skip_frame) so such files still get frames.
+    frames = _run_pass(keyframes_only=True)
+    if not frames:
+        logger.debug('no keyframes near seek positions for %s; '
+                     'retrying without -skip_frame nokey', video_path)
+        frames = _run_pass(keyframes_only=False)
+
     usable = [f for f in frames if not _is_dark_frame(f)]
     logger.debug('keyframes done for %s: %d usable of %d extracted (%.2fs)',
                  video_path, len(usable), len(frames), time.monotonic() - t0)
@@ -410,18 +413,20 @@ def thumb_path(directory_path, video_name):
 
 def extract_frame(video_path, position, out_path, timeout=30):
     """Extract a single full-res frame at *position* seconds. Returns True on success."""
-    cmd = [
-        'ffmpeg', '-y', '-ss', f'{position:.2f}',
-        '-t', '10',
-        '-skip_frame', 'nokey',
-        '-i', str(video_path),
-        '-frames:v', '1',
-        '-q:v', '4',
-        str(out_path),
-    ]
+    def _cmd(keyframes_only):
+        c = ['ffmpeg', '-y', '-ss', f'{position:.2f}', '-t', '10']
+        if keyframes_only:
+            c += ['-skip_frame', 'nokey']
+        c += ['-i', str(video_path), '-frames:v', '1', '-q:v', '4', str(out_path)]
+        return c
+
     try:
         t0 = time.monotonic()
-        subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+        subprocess.run(_cmd(keyframes_only=True), capture_output=True, timeout=timeout, check=False)
+        # Sparse-keyframe videos (e.g. short clips with a single keyframe at t=0)
+        # produce nothing in keyframe-only mode; fall back to a normal decode.
+        if not Path(out_path).exists():
+            subprocess.run(_cmd(keyframes_only=False), capture_output=True, timeout=timeout, check=False)
         ok = Path(out_path).exists() and not _is_dark_frame(out_path)
         logger.debug('extract_frame %s @%.1fs -> %s (%s, %.2fs)',
                      video_path, position, out_path,

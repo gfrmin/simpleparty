@@ -244,3 +244,75 @@ def test_untagged_videos_accepts_prelisted_names(tmp_path):
     names = ['a.mp4', 'b.mp4', '.hidden.mp4', 'c.txt']
     existing = {'a.mp4': {'tags': ['x'], 'status': 'confirmed'}}
     assert untagged_videos(str(tmp_path), existing, names=names) == ['b.mp4']
+
+
+def test_extract_keyframes_falls_back_when_no_keyframes(tmp_path, monkeypatch):
+    """A short clip whose only keyframe is at t=0: `-skip_frame nokey` extracts
+    nothing at later seek positions, so extraction must fall back to decoding
+    the actual frame (no -skip_frame) instead of returning an empty list (which
+    would leave the video permanently 'missing')."""
+    import shutil
+    import subprocess
+    from simpleparty import tagger
+
+    vid = tmp_path / 'clip.mp4'
+    vid.write_bytes(b'fake')
+    monkeypatch.setattr(tagger, '_get_duration', lambda p: 5.6)
+    monkeypatch.setattr(tagger, '_is_dark_frame', lambda p: False)
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        # Emulate a single-keyframe video: the keyframe-only pass writes nothing;
+        # only the fallback (no -skip_frame nokey) produces a frame.
+        if '-skip_frame' not in cmd:
+            Path(cmd[-1]).write_bytes(b'\xff\xd8\xff\xe0fakejpg')
+
+        class _R:
+            returncode = 0
+            stdout = ''
+            stderr = ''
+        return _R()
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+
+    frames = tagger.extract_keyframes(str(vid), max_frames=8)
+    try:
+        assert frames, 'fallback decode should yield frames when no keyframes exist'
+        assert any('-skip_frame' in c for c in calls), 'first pass tries keyframes'
+        assert any('-skip_frame' not in c for c in calls), 'fallback drops -skip_frame'
+    finally:
+        if frames:
+            shutil.rmtree(Path(frames[0]).parent, ignore_errors=True)
+
+
+def test_extract_frame_falls_back_when_no_keyframes(tmp_path, monkeypatch):
+    """The thumbnail extractor shares the keyframe flaw: it must fall back to a
+    normal decode when -skip_frame nokey produces no output."""
+    import subprocess
+    from simpleparty import tagger
+
+    vid = tmp_path / 'clip.mp4'
+    vid.write_bytes(b'fake')
+    out = tmp_path / 'thumb.jpg'
+    monkeypatch.setattr(tagger, '_is_dark_frame', lambda p: False)
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if '-skip_frame' not in cmd:
+            Path(cmd[-1]).write_bytes(b'\xff\xd8\xff\xe0fakejpg')
+
+        class _R:
+            returncode = 0
+            stdout = ''
+            stderr = ''
+        return _R()
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+
+    assert tagger.extract_frame(str(vid), 2.5, str(out)) is True
+    assert out.exists()
+    assert any('-skip_frame' not in c for c in calls), 'fallback drops -skip_frame'
