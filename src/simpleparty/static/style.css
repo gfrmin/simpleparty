@@ -175,6 +175,15 @@ nav{
 }
 .tag-manager-rename input:focus{border-color:var(--accent)}
 .tag-manager-remove{margin:0}
+.tag-manager-remove .btn-del{
+  display:inline-flex;align-items:center;gap:6px;
+  color:var(--danger-text);background:rgba(153,27,27,.18);
+  border:1px solid var(--danger);border-radius:var(--radius-md);
+  padding:8px 12px;min-height:44px;
+  /* reset card-del absolute positioning */
+  position:static;width:auto;height:auto;opacity:1;
+}
+.tag-manager-remove .btn-del:hover{background:var(--danger-strong);color:#fff}
 .tag-pill-x{font-size:10px;opacity:0.7;margin-left:2px}
 .tag-pill-x:hover{opacity:1}
 .tag-clear{color:var(--text-muted);font-size:var(--text-sm);cursor:pointer;text-decoration:underline;padding:4px 8px}

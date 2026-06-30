@@ -717,3 +717,17 @@ def test_css_uses_tokens_not_raw_hex(srv):
     # allow #fff/#000 shorthands; flag 6-digit hex in component rules
     leaks = re.findall(r'#[0-9a-fA-F]{6}', body)
     assert not leaks, f'raw hex outside tokens: {set(leaks)}'
+
+
+def test_tag_manager_remove_button_visible(srv):
+    # The base .btn-del is a grid-thumbnail overlay (position:absolute,
+    # opacity:0, revealed by .item-video:hover). The tag-manager Remove
+    # button reuses .btn-del but lives in a .tag-manager-row, so it needs
+    # an override resetting it to in-flow and visible — otherwise it's
+    # invisible (regression seen in the redesign).
+    text = request(srv, 'GET', '/static/style.css')[2].decode()
+    m = re.search(r'\.tag-manager-remove \.btn-del\{([^}]*)\}', text)
+    assert m, 'missing .tag-manager-remove .btn-del override'
+    rule = m.group(1).replace(' ', '')
+    assert 'position:static' in rule
+    assert 'opacity:1' in rule
