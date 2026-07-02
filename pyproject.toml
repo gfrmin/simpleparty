@@ -42,7 +42,6 @@ simpleparty = ["static/*"]
 [dependency-groups]
 dev = [
     "pytest>=8.3.5",
-    "scrapling[all]>=0.2.8",
     "torch>=2.5.1",
     "torchvision>=0.20.1",
     "yt-dlp>=2024.1.0",
