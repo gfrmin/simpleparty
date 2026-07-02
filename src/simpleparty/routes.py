@@ -911,12 +911,15 @@ def handle_thumb(handler, root):
         handler.send_error(404)
         return
     data = tp.read_bytes()
-    handler.send_response(200)
-    handler.send_header('Content-Type', 'image/jpeg')
-    handler.send_header('Content-Length', str(len(data)))
-    handler.send_header('Cache-Control', 'public, max-age=3600')
-    handler.end_headers()
-    handler.wfile.write(data)
+    try:
+        handler.send_response(200)
+        handler.send_header('Content-Type', 'image/jpeg')
+        handler.send_header('Content-Length', str(len(data)))
+        handler.send_header('Cache-Control', 'public, max-age=3600')
+        handler.end_headers()
+        handler.wfile.write(data)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
 
 
 def handle_download_page(handler, root):
@@ -1039,13 +1042,16 @@ def handle_static(handler, root):
         handler.send_error(404)
         return
     body, ctype = item
-    handler.send_response(200)
-    handler.send_header('Content-Type', ctype)
-    handler.send_header('Content-Length', str(len(body)))
-    handler.send_header('Cache-Control', 'public, max-age=3600')
-    handler.end_headers()
-    if handler.command != 'HEAD':
-        handler.wfile.write(body)
+    try:
+        handler.send_response(200)
+        handler.send_header('Content-Type', ctype)
+        handler.send_header('Content-Length', str(len(body)))
+        handler.send_header('Cache-Control', 'public, max-age=3600')
+        handler.end_headers()
+        if handler.command != 'HEAD':
+            handler.wfile.write(body)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
 
 
 # --- Dispatch ---
