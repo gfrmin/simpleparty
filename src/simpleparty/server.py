@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
 
+from simpleparty import library
 from simpleparty.routes import (
     GET_PREFIXES,
     GET_ROUTES,
@@ -107,8 +108,11 @@ def main():
             features.append('transcode: vlc')
     if _config['allow_delete']:
         features.append('delete: on')
-    if shutil.which('fscrypt'):
-        features.append('fscrypt: on')
+    fscrypt_error = library.fscrypt_tool_error()
+    features.append(
+        'fscrypt: on' if fscrypt_error is None
+        else f'fscrypt: unavailable ({fscrypt_error})'
+    )
     has_torch = False
     if _config['allow_tag']:
         try:
@@ -132,6 +136,11 @@ def main():
         logger.info('  To train a tagger: uvx simpleparty[classifier]==%s', __version__)
     if (not args.no_download) and (not _config['has_ytdlp']):
         logger.info('  To enable downloads: uvx simpleparty[download]==%s', __version__)
+    if fscrypt_error is not None and library.has_encrypted_dir(root):
+        prose, command = library.fscrypt_remedy(fscrypt_error)
+        logger.info('  Encrypted directories found here, but fscrypt is %s so they', fscrypt_error)
+        logger.info('  cannot be unlocked. %s `%s`', prose, command)
+        logger.info('  https://github.com/google/fscrypt')
 
     try:
         server.serve_forever()

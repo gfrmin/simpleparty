@@ -8,7 +8,7 @@ from pathlib import Path
 
 from simpleparty import __version__, jobs
 from simpleparty.icons import icon
-from simpleparty.library import _compute_related_videos, resolve_path
+from simpleparty.library import _compute_related_videos, fscrypt_remedy, resolve_path
 from simpleparty.state import CONFIG as _config
 from simpleparty.urls import ViewState, url_for_browse, url_for_play, url_for_shuffle, url_for_video
 
@@ -716,26 +716,47 @@ def render_browse_page(data, view, tags_map=None, lower_index=None, thumbs=froze
     return render_page(title, body)
 
 
-def render_locked_page(path, encrypted_dir, redirect_path=None, error=None):
+def render_locked_page(path, encrypted_dir, redirect_path=None, error=None,
+                       tool_error=None):
     body = render_nav(path)
     dir_name = encrypted_dir.split('/')[-1] if encrypted_dir else 'directory'
     redir = redirect_path or path
     parent = str(Path(path).parent) if '/' in path else ''
     if parent == '.':
         parent = ''
+    cancel = f'<a class="btn" href="{esc(url_for_browse(parent))}">Cancel</a>'
+
+    if tool_error is not None:
+        # Detection works without the fscrypt binary, unlocking does not. A
+        # passphrase box that can only answer "fscrypt not found" is worse
+        # than none, so say what's actually wrong instead.
+        prose, command = fscrypt_remedy(tool_error)
+        inner = (
+            f'<div class="unlock-warning" role="alert">{icon("warning")}'
+            f'<span>fscrypt is {esc(tool_error)}, so this directory '
+            f'cannot be unlocked.</span></div>'
+            f'<p class="unlock-hint">{esc(prose)} <code>{esc(command)}</code>, '
+            f'then reload this page.<br>'
+            f'<a href="https://github.com/google/fscrypt" rel="noreferrer">'
+            f'github.com/google/fscrypt</a></p>'
+            f'<div class="unlock-actions">{cancel}</div>'
+        )
+    else:
+        inner = (
+            f'<form hx-post="/unlock" hx-target="#unlock-error" hx-swap="innerHTML">'
+            f'<input type="hidden" name="path" value="{esc(encrypted_dir)}">'
+            f'<input type="hidden" name="redirect" value="{esc(url_for_browse(redir))}">'
+            f'<input type="password" name="passphrase" placeholder="Passphrase" '
+            f'aria-label="Passphrase" autofocus>'
+            f'<div id="unlock-error" class="unlock-error" role="alert">{esc(error) if error else ""}</div>'
+            f'<div class="unlock-actions">{cancel}'
+            f'<button class="btn btn-primary" type="submit">{icon("lock-open")} Unlock</button>'
+            f'</div></form>'
+        )
+
     body += (
         f'<main id="main"><div class="unlock-box">'
-        f'<h1>{icon("lock")} Unlock {esc(dir_name)}</h1>'
-        f'<form hx-post="/unlock" hx-target="#unlock-error" hx-swap="innerHTML">'
-        f'<input type="hidden" name="path" value="{esc(encrypted_dir)}">'
-        f'<input type="hidden" name="redirect" value="{esc(url_for_browse(redir))}">'
-        f'<input type="password" name="passphrase" placeholder="Passphrase" '
-        f'aria-label="Passphrase" autofocus>'
-        f'<div id="unlock-error" class="unlock-error" role="alert">{esc(error) if error else ""}</div>'
-        f'<div class="unlock-actions">'
-        f'<a class="btn" href="{esc(url_for_browse(parent))}">Cancel</a>'
-        f'<button class="btn btn-primary" type="submit">{icon("lock-open")} Unlock</button>'
-        f'</div></form></div></main>'
+        f'<h1>{icon("lock")} Unlock {esc(dir_name)}</h1>{inner}</div></main>'
     )
     return render_page('SimpleParty \u2014 Unlock', body)
 

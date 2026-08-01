@@ -20,6 +20,7 @@ from simpleparty.library import (
     filter_videos_by_tags,
     find_video_idx,
     fscrypt_lock,
+    fscrypt_tool_error,
     fscrypt_unlock,
     is_video,
     list_directory,
@@ -143,7 +144,8 @@ def handle_browse(handler, root):
     ctx = get_dir_context(root, rel_path, params)
     data = ctx['data']
     if data.get('locked'):
-        send_html(handler, render_locked_page(rel_path, data['encryptedDir']))
+        send_html(handler, render_locked_page(
+            rel_path, data['encryptedDir'], tool_error=fscrypt_tool_error()))
         return
     if 'error' in data:
         status = 404 if data['error'] == 'Not found' else 400
@@ -185,7 +187,8 @@ def handle_play(handler, root):
     data = ctx['data']
 
     if data.get('locked'):
-        send_html(handler, render_locked_page(dir_path, data['encryptedDir']))
+        send_html(handler, render_locked_page(
+            dir_path, data['encryptedDir'], tool_error=fscrypt_tool_error()))
         return
 
     view = ctx.get('view') or ViewState.from_params(params)
@@ -419,6 +422,11 @@ def handle_unlock(handler, root):
     if not is_safe_rel_path(encrypted_path):
         handler.send_error(400, 'Invalid path')
         return
+    tool_error = fscrypt_tool_error()
+    if tool_error is not None:
+        del passphrase
+        send_html(handler, esc(f'fscrypt is {tool_error}, so this directory cannot be unlocked'))
+        return
     resolved = resolve_path(root, encrypted_path)
     ok, msg = fscrypt_unlock(resolved, passphrase)
     del passphrase
@@ -436,7 +444,9 @@ def handle_lock(handler, root):
         handler.send_error(400, 'Invalid path')
         return
     resolved = resolve_path(root, path)
-    fscrypt_lock(resolved)
+    ok, msg = fscrypt_lock(resolved)
+    if not ok:
+        logger.warning('lock: failed to lock %s: %s', resolved, msg)
     send_hx_redirect(handler, redirect_url)
 
 

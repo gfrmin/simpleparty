@@ -111,7 +111,7 @@ def test_list_directory_cached_until_dir_mtime_changes(tmp_path, monkeypatch):
         return real_listdir(path)
 
     monkeypatch.setattr(library.os, 'listdir', counting_listdir)
-    library._fscrypt_missing = True
+    monkeypatch.setattr(library, '_tool_error', 'not installed')
 
     library.list_directory(str(tmp_path), '')
     second = library.list_directory(str(tmp_path), '')

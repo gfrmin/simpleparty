@@ -553,6 +553,16 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .unlock-box input:focus{border-color:var(--accent)}
 .unlock-actions{display:flex;gap:var(--space-2);justify-content:flex-end;margin-top:var(--space-4)}
 .unlock-error{color:var(--danger);font-size:var(--text-sm);margin-top:10px;min-height:1.2em}
+.unlock-warning{
+  display:flex;align-items:flex-start;gap:var(--space-2);color:var(--danger);
+  font-size:var(--text-sm);line-height:1.5;
+}
+.unlock-warning svg{flex:none;margin-top:2px}
+.unlock-hint{color:var(--text-muted);font-size:var(--text-sm);line-height:1.6;margin-top:var(--space-3)}
+.unlock-hint code{
+  background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:1px 5px;
+}
 .error-page{color:var(--danger);text-align:center;padding:60px 20px;font-size:var(--text-base)}
 /* Error box variant of unlock-box */
 .error-box{text-align:center}

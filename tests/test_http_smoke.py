@@ -24,19 +24,21 @@ from simpleparty.server import RequestHandler, ThreadedServer
 def _config_snapshot():
     """Snapshot/restore mutable server config so tests can flip flags."""
     saved = dict(sp_server._config)
-    saved_fscrypt_missing = sp_library._fscrypt_missing
+    saved_tool_error = sp_library._tool_error
     # Keep tests hermetic and fast: no ffmpeg probing, no fscrypt subprocesses.
+    # Encryption detection itself is pure ioctl and stays live — on a tmp dir
+    # it just reports "not encrypted".
     sp_server._config['has_ffmpeg'] = False
     sp_server._config['has_vlc'] = False
     sp_server._config['allow_transcode'] = False
     sp_server._config['allow_tag'] = True
     sp_server._config['allow_delete'] = True
     sp_server._config['allow_download'] = False
-    sp_library._fscrypt_missing = True
+    sp_library._tool_error = 'not installed'
     yield
     sp_server._config.clear()
     sp_server._config.update(saved)
-    sp_library._fscrypt_missing = saved_fscrypt_missing
+    sp_library._tool_error = saved_tool_error
 
 
 @pytest.fixture
