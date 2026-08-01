@@ -296,10 +296,12 @@ def _probe_fscrypt_tool():
     if shutil.which('fscrypt') is None:
         return FSCRYPT_NOT_INSTALLED
     try:
-        # No argument: lists the filesystems fscrypt knows about, which is the
-        # cheapest call that still fails when /etc/fscrypt.conf is missing.
+        # The path argument matters: bare `fscrypt status` exits 0 even with no
+        # /etc/fscrypt.conf, while every command that needs the config -- unlock
+        # included -- fails. Give it a path and the config check fires.
+        # Verified against fscrypt 0.3.6.
         result = subprocess.run(
-            ['fscrypt', 'status'], capture_output=True, text=True, timeout=5,
+            ['fscrypt', 'status', '/'], capture_output=True, text=True, timeout=5,
         )
     except FileNotFoundError:
         return FSCRYPT_NOT_INSTALLED
@@ -308,10 +310,13 @@ def _probe_fscrypt_tool():
     if result.returncode == 0:
         return None
     output = (result.stdout + result.stderr).lower()
-    if 'config file' in output or 'fscrypt setup' in output:
+    if 'fscrypt.conf' in output or 'fscrypt setup' in output:
         return FSCRYPT_NOT_SET_UP
+    # Some other failure -- possibly just that `/` is a filesystem fscrypt
+    # cannot report on, which says nothing about unlocking elsewhere. Say so,
+    # but leave the unlock form up: a real error beats a guessed one.
     logger.warning('fscrypt status failed: %s', (result.stderr or result.stdout).strip())
-    return 'not working'
+    return None
 
 
 def fscrypt_remedy(tool_error):

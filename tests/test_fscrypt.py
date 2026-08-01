@@ -64,14 +64,42 @@ def test_tool_error_when_binary_absent(monkeypatch):
     assert library._probe_fscrypt_tool() == library.FSCRYPT_NOT_INSTALLED
 
 
+# Verbatim from fscrypt 0.3.6 with /etc/fscrypt.conf absent.
+_NO_CONFIG_STDERR = (
+    '[ERROR] fscrypt status: "/etc/fscrypt.conf" doesn\'t exist\n\n'
+    'Run "sudo fscrypt setup" to create this file.\n'
+)
+
+
 def test_tool_error_when_installed_but_unconfigured(monkeypatch):
     """The state a machine is in between `pacman -S fscrypt` and
     `sudo fscrypt setup` — previously indistinguishable from 'not encrypted'."""
     monkeypatch.setattr(library.shutil, 'which', lambda _: '/usr/bin/fscrypt')
-    monkeypatch.setattr(library.subprocess, 'run', lambda *a, **kw: _completed(
-        1, stderr='fscrypt: global config file does not exist. Run "sudo fscrypt setup".',
-    ))
+    monkeypatch.setattr(library.subprocess, 'run',
+                        lambda *a, **kw: _completed(1, stderr=_NO_CONFIG_STDERR))
     assert library._probe_fscrypt_tool() == library.FSCRYPT_NOT_SET_UP
+
+
+def test_tool_probe_passes_a_path_argument(monkeypatch):
+    """Regression: bare `fscrypt status` exits 0 with no /etc/fscrypt.conf, so
+    a probe without a path reports a healthy tool right up until unlock fails."""
+    seen = []
+    monkeypatch.setattr(library.shutil, 'which', lambda _: '/usr/bin/fscrypt')
+    monkeypatch.setattr(library.subprocess, 'run',
+                        lambda cmd, **kw: seen.append(cmd) or _completed(0))
+    library._probe_fscrypt_tool()
+    assert len(seen[0]) > 2, f'no path argument in probe: {seen[0]}'
+
+
+def test_unrecognised_failure_keeps_unlock_available(monkeypatch, caplog):
+    """`/` may just be a filesystem fscrypt cannot report on, which says nothing
+    about unlocking elsewhere. Warn, but do not withdraw the passphrase form."""
+    monkeypatch.setattr(library.shutil, 'which', lambda _: '/usr/bin/fscrypt')
+    monkeypatch.setattr(library.subprocess, 'run', lambda *a, **kw: _completed(
+        1, stderr='fscrypt status: filesystem "/" does not support encryption'))
+    with caplog.at_level('WARNING', logger='simpleparty.library'):
+        assert library._probe_fscrypt_tool() is None
+    assert 'does not support encryption' in caplog.text
 
 
 def test_no_tool_error_when_status_succeeds(monkeypatch):
