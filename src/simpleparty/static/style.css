@@ -561,7 +561,7 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .unlock-hint{color:var(--text-muted);font-size:var(--text-sm);line-height:1.6;margin-top:var(--space-3)}
 .unlock-hint code{
   background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);
-  padding:1px 5px;
+  padding:1px 5px;white-space:nowrap;/* a command split across lines is not copy-pasteable */
 }
 .error-page{color:var(--danger);text-align:center;padding:60px 20px;font-size:var(--text-base)}
 /* Error box variant of unlock-box */
