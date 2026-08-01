@@ -16,7 +16,7 @@ Easily enjoy your private video collection. Browse and play local video files fr
 - **Manual tagging** - add or edit tags on any video from the player page
 - **Star favourites** - star videos from the player page and filter the browse view to starred only
 - **Tag summary** - see all tags in a directory at a glance, with counts
-- **Encrypted directories** - unlock/lock fscrypt-encrypted folders from the browser (if fscrypt is installed)
+- **Encrypted directories** - locked fscrypt folders are recognised out of the box; unlock/lock them from the browser (unlocking needs fscrypt installed)
 - **Zero dependencies** - pure Python standard library, nothing to install
 
 ## Install
@@ -77,7 +77,7 @@ simpleparty [/path/to/videos] [options]
 These are auto-detected at startup and require no configuration:
 
 - **ffmpeg** or **VLC** - Enables playback of MKV, AVI, and MOV files by transcoding to browser-compatible MP4 on the fly. Install either one: `sudo apt install ffmpeg` / `sudo pacman -S ffmpeg`
-- **fscrypt** - If your video directories use Linux filesystem encryption (fscrypt), SimpleParty will detect locked directories and prompt for the passphrase in the browser
+- **fscrypt** - If your video directories use Linux filesystem encryption (fscrypt), SimpleParty marks locked ones with a padlock and prompts for the passphrase in the browser. Detection asks the kernel directly and needs nothing installed; *unlocking* needs the fscrypt tool, so without it the padlock is still shown and the page explains what to install. Note that installing fscrypt is only half the job — `sudo fscrypt setup` must also have been run, or the tool cannot read its own config
 
 ## URL download
 

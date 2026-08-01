@@ -1,14 +1,21 @@
 """Filesystem listing, fscrypt status, and video sort/filter helpers."""
 
+import errno
+import fcntl
+import logging
 import os
 import random
 import re
+import shutil
+import struct
 import subprocess
 import threading
 import time
 from pathlib import Path
 
 from simpleparty.state import VIDEO_EXTENSIONS
+
+logger = logging.getLogger('simpleparty.library')
 
 
 # --- Filesystem ---
@@ -134,10 +141,126 @@ def list_directory(root, rel_path):
 
 # --- fscrypt ---
 
+# Detection and unlocking pull apart cleanly: the kernel reports encryption
+# state over ioctls that need no userspace tool, while unlocking genuinely
+# needs the fscrypt binary (the passphrase is stretched with argon2id using
+# costs stored in fscrypt's own protector metadata, which the stdlib cannot
+# do). So detection always works; only unlock/lock depend on the CLI.
+
+# Ioctls from <linux/fscrypt.h>, encoded as
+#   _IOWR(type, nr, size) == (3 << 30) | (size << 16) | (ord(type) << 8) | nr
+_FS_IOC_GET_POLICY_EX = (3 << 30) | (9 << 16) | (0x66 << 8) | 22
+_FS_IOC_GET_KEY_STATUS = (3 << 30) | (128 << 16) | (0x66 << 8) | 26
+
+_KEY_SPEC_IDENTIFIER = 2  # v2 policies key off a 16-byte master key identifier
+_KEY_STATUS_PRESENT = 2   # FSCRYPT_KEY_STATUS_PRESENT
+
+# struct fscrypt_get_key_status_arg is 128 bytes, with `status` at offset 64.
+_KEY_STATUS_ARG_SIZE = 128
+_KEY_STATUS_OFFSET = 64
+# Room offered to the kernel for the returned policy; v2 policies need 24.
+_POLICY_BUF_SIZE = 64
+
+# Errnos that mean "nothing is encrypted here" rather than "the query failed":
+# no policy on this directory, or a filesystem that has no encryption support
+# and so doesn't implement the ioctl.
+_NOT_ENCRYPTED_ERRNOS = frozenset({
+    errno.ENODATA, errno.ENOTTY, errno.ENOTSUP, errno.EOPNOTSUPP,
+    errno.EINVAL, errno.ENOENT, errno.EACCES, errno.EPERM,
+})
+
+
+def _unencrypted():
+    """Fresh dict each call: callers treat these as their own to mutate."""
+    return {'encrypted': False, 'unlocked': True}
+
+
+def _probe_kernel_status(dir_path):
+    """Ask the kernel whether dir_path is encrypted and whether its master key
+    is present. Returns a status dict, or None when the question needs the
+    fscrypt CLI to answer.
+
+    FS_IOC_GET_ENCRYPTION_POLICY_EX reports the directory's policy, and
+    FS_IOC_GET_ENCRYPTION_KEY_STATUS reports whether that policy's master key
+    has been added to the filesystem. Both cost about as much as a stat().
+    """
+    try:
+        fd = os.open(dir_path, os.O_RDONLY)
+    except OSError:
+        return _unencrypted()
+    try:
+        # struct fscrypt_get_policy_ex_arg: u64 policy_size, then the policy
+        # union. policy_size goes in as the room available and comes back as
+        # the room used. Kernel structs are native-endian.
+        buf = bytearray(8 + _POLICY_BUF_SIZE)
+        struct.pack_into('=Q', buf, 0, _POLICY_BUF_SIZE)
+        try:
+            fcntl.ioctl(fd, _FS_IOC_GET_POLICY_EX, buf, True)
+        except OSError as e:
+            return _unencrypted() if e.errno in _NOT_ENCRYPTED_ERRNOS else None
+
+        if buf[8] != 2:
+            # v1 policy. Its key may live in a process keyring that this ioctl
+            # does not report on, so let the CLI answer instead.
+            return None
+        # struct fscrypt_policy_v2: 8 header bytes, then master_key_identifier.
+        key = bytes(buf[16:32])
+
+        # struct fscrypt_get_key_status_arg opens with a fscrypt_key_specifier
+        # (u32 type, u32 reserved, then the key bytes).
+        arg = bytearray(_KEY_STATUS_ARG_SIZE)
+        struct.pack_into('=II', arg, 0, _KEY_SPEC_IDENTIFIER, 0)
+        arg[8:8 + len(key)] = key
+        fcntl.ioctl(fd, _FS_IOC_GET_KEY_STATUS, arg, True)
+        status = struct.unpack_from('=I', arg, _KEY_STATUS_OFFSET)[0]
+        return {'encrypted': True, 'unlocked': status == _KEY_STATUS_PRESENT}
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def get_fscrypt_status(dir_path):
+    """Whether dir_path is fscrypt-encrypted, and if so whether it's unlocked.
+
+    The kernel answers this for v2 policies with no fscrypt binary involved.
+    v1 policies fall back to the CLI, and if that is unavailable the directory
+    is reported as plain — the one remaining case that can mislead, which is
+    what fscrypt_tool_error() exists to explain.
+    """
+    status = _probe_kernel_status(dir_path)
+    return status if status is not None else _cli_fscrypt_status(dir_path)
+
+
+def has_encrypted_dir(root):
+    """True if root or one of its immediate children is encrypted. Lets the
+    caller keep advice about installing fscrypt to the people it applies to."""
+    if get_fscrypt_status(root)['encrypted']:
+        return True
+    try:
+        with os.scandir(root) as entries:
+            return any(
+                get_fscrypt_status(e.path)['encrypted']
+                for e in entries
+                if not e.name.startswith('.') and e.is_dir(follow_symlinks=False)
+            )
+    except OSError:
+        return False
+
+
+# --- fscrypt CLI ---
+
 _FSCRYPT_TTL_SEC = 60.0
 _fscrypt_cache = {}
 _fscrypt_cache_lock = threading.Lock()
-_fscrypt_missing = False
+
+_TOOL_ERROR_UNKNOWN = object()
+_tool_error = _TOOL_ERROR_UNKNOWN
+_tool_error_lock = threading.Lock()
+
+# Reasons fscrypt can't be used, phrased to drop into "fscrypt is {reason}".
+FSCRYPT_NOT_INSTALLED = 'not installed'
+FSCRYPT_NOT_SET_UP = 'not set up'
 
 
 def _fscrypt_cache_key(dir_path):
@@ -153,38 +276,96 @@ def _invalidate_fscrypt_cache(dir_path):
         _fscrypt_cache.pop(key, None)
 
 
-def get_fscrypt_status(dir_path):
-    if _fscrypt_missing:
-        return {'encrypted': False, 'unlocked': True}
+def fscrypt_tool_error():
+    """None when the fscrypt CLI can be used, else a short reason why not.
+
+    Probed once and remembered, since installing fscrypt mid-run is not a case
+    worth re-checking on every request.
+    """
+    global _tool_error
+    with _tool_error_lock:
+        if _tool_error is _TOOL_ERROR_UNKNOWN:
+            # Callers report this themselves (startup banner, unlock page), so
+            # a plain "not installed" is not logged here — only anomalies are,
+            # from _probe_fscrypt_tool.
+            _tool_error = _probe_fscrypt_tool()
+        return _tool_error
+
+
+def _probe_fscrypt_tool():
+    if shutil.which('fscrypt') is None:
+        return FSCRYPT_NOT_INSTALLED
+    try:
+        # The path argument matters: bare `fscrypt status` exits 0 even with no
+        # /etc/fscrypt.conf, while every command that needs the config -- unlock
+        # included -- fails. Give it a path and the config check fires.
+        # Verified against fscrypt 0.3.6.
+        result = subprocess.run(
+            ['fscrypt', 'status', '/'], capture_output=True, text=True, timeout=5,
+        )
+    except FileNotFoundError:
+        return FSCRYPT_NOT_INSTALLED
+    except (subprocess.TimeoutExpired, OSError):
+        return 'not responding'
+    if result.returncode == 0:
+        return None
+    output = (result.stdout + result.stderr).lower()
+    if 'fscrypt.conf' in output or 'fscrypt setup' in output:
+        return FSCRYPT_NOT_SET_UP
+    # Some other failure -- possibly just that `/` is a filesystem fscrypt
+    # cannot report on, which says nothing about unlocking elsewhere. Say so,
+    # but leave the unlock form up: a real error beats a guessed one.
+    logger.warning('fscrypt status failed: %s', (result.stderr or result.stdout).strip())
+    return None
+
+
+def fscrypt_remedy(tool_error):
+    """The shortest true instruction for making unlocking work, as
+    (prose, command). The command is None when there isn't one obvious step."""
+    if tool_error == FSCRYPT_NOT_INSTALLED:
+        return 'Install fscrypt, then run', 'sudo fscrypt setup'
+    if tool_error == FSCRYPT_NOT_SET_UP:
+        return 'Finish setting fscrypt up by running', 'sudo fscrypt setup'
+    return 'Check that fscrypt works by running', 'fscrypt status'
+
+
+def _cli_fscrypt_status(dir_path):
+    """Fallback for policies the kernel probe won't answer for (v1)."""
+    if fscrypt_tool_error() is not None:
+        return _unencrypted()
     key = _fscrypt_cache_key(dir_path)
     now = time.monotonic()
     with _fscrypt_cache_lock:
         cached = _fscrypt_cache.get(key)
         if cached and now - cached[1] < _FSCRYPT_TTL_SEC:
-            return cached[0]
+            return dict(cached[0])
     status = _probe_fscrypt_status(dir_path)
     with _fscrypt_cache_lock:
         _fscrypt_cache[key] = (status, now)
-    return status
+    return dict(status)
 
 
 def _probe_fscrypt_status(dir_path):
-    global _fscrypt_missing
     try:
         result = subprocess.run(
             ['fscrypt', 'status', str(dir_path)],
             capture_output=True, text=True, timeout=5,
         )
-        output = result.stdout + result.stderr
-        if 'is encrypted with fscrypt' not in output:
-            return {'encrypted': False, 'unlocked': True}
-        unlocked = bool(re.search(r'Unlocked:\s*Yes', output))
-        return {'encrypted': True, 'unlocked': unlocked}
     except FileNotFoundError:
-        _fscrypt_missing = True
-        return {'encrypted': False, 'unlocked': True}
+        return _unencrypted()
     except subprocess.TimeoutExpired:
-        return {'encrypted': False, 'unlocked': True}
+        logger.warning('fscrypt status timed out for %s', dir_path)
+        return _unencrypted()
+    output = result.stdout + result.stderr
+    # Only reached once the kernel has already said there is a policy here, so
+    # a failed command is an error to report, not evidence of a plain
+    # directory. Reporting it as plain is what hid this from the user before.
+    if result.returncode != 0:
+        logger.warning('fscrypt status failed for %s: %s', dir_path, output.strip())
+        return _unencrypted()
+    if 'is encrypted with fscrypt' not in output:
+        return _unencrypted()
+    return {'encrypted': True, 'unlocked': bool(re.search(r'Unlocked:\s*Yes', output))}
 
 
 def fscrypt_unlock(dir_path, passphrase):
