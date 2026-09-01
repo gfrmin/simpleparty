@@ -17,6 +17,7 @@ CONFIG = {
     'allow_delete': True,
     'allow_transcode': True,
     'allow_tag': True,
+    'has_tagger': False,
     'allow_download': False,
     'yt_dlp_format': None,
 }

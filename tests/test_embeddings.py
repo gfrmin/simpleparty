@@ -8,6 +8,7 @@ changes, the .fail sentinel short-circuits, and pruning drops stale files.
 import os
 from pathlib import Path
 
+import simpleparty.embeddings as embeddings_mod
 from simpleparty.embeddings import (
     CLIP_MODEL_ID,
     embeddings_dir,
@@ -18,6 +19,7 @@ from simpleparty.embeddings import (
     embedding_coverage,
     video_is_embedded,
     get_video_embedding,
+    is_available,
 )
 from simpleparty.tagger import SIMPLEPARTY_DIR
 
@@ -191,3 +193,33 @@ def test_prune_leaves_inflight_temp_files_alone(tmp_path):
 
     assert tmp.exists()       # in-flight temp untouched
     assert not orphan.exists()  # orphan cache entry still pruned
+
+
+def test_is_available_false_when_a_dependency_is_missing(monkeypatch):
+    # Cache is per-process global state; force a fresh probe for this test.
+    monkeypatch.setattr(embeddings_mod, '_deps_probed', False)
+    monkeypatch.setattr(embeddings_mod, '_deps_available', False)
+
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == 'numpy':
+            raise ImportError('simulated: numpy not installed')
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', fake_import)
+    assert is_available() is False
+
+
+def test_is_available_caches_the_probe(monkeypatch):
+    monkeypatch.setattr(embeddings_mod, '_deps_probed', True)
+    monkeypatch.setattr(embeddings_mod, '_deps_available', True)
+
+    import builtins
+
+    def fail_import(name, *args, **kwargs):
+        raise AssertionError('must not re-probe once cached')
+
+    monkeypatch.setattr(builtins, '__import__', fail_import)
+    assert is_available() is True

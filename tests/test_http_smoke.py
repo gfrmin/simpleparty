@@ -32,6 +32,7 @@ def _config_snapshot():
     sp_server._config['has_vlc'] = False
     sp_server._config['allow_transcode'] = False
     sp_server._config['allow_tag'] = True
+    sp_server._config['has_tagger'] = False
     sp_server._config['allow_delete'] = True
     sp_server._config['allow_download'] = False
     sp_library._tool_error = 'not installed'
@@ -246,6 +247,7 @@ def test_browse_has_no_mass_tagging_affordances(srv, media_root):
     # suggest or one-click confirm-all. The tag bar requires ffmpeg + a model,
     # so force both so the assertion isn't vacuous.
     sp_server._config['has_ffmpeg'] = True
+    sp_server._config['has_tagger'] = True
     (media_root / '.simpleparty' / 'model.pt').write_bytes(b'stub')
     (media_root / '.simpleparty' / 'tags.json').write_text(json.dumps({
         'a.mp4': {'tags': ['cat'], 'status': 'confirmed'},
@@ -272,6 +274,7 @@ def test_browse_shows_embed_and_badge_when_videos_missing(srv):
     # No embeddings yet: the tag bar must offer Embed (all missing) + a coverage
     # badge, and must NOT offer Train (nothing embedded to train on).
     sp_server._config['has_ffmpeg'] = True
+    sp_server._config['has_tagger'] = True
     status, _, body = request(srv, 'GET', '/browse?path=')
     text = body.decode()
     assert status == 200
@@ -282,6 +285,7 @@ def test_browse_shows_embed_and_badge_when_videos_missing(srv):
 
 def test_browse_shows_train_when_all_embedded(srv, media_root):
     sp_server._config['has_ffmpeg'] = True
+    sp_server._config['has_tagger'] = True
     _embed_video(media_root, '', 'a.mp4')
     _embed_video(media_root, '', 'b.mp4')
     status, _, body = request(srv, 'GET', '/browse?path=')
@@ -293,13 +297,44 @@ def test_browse_shows_train_when_all_embedded(srv, media_root):
 
 def test_browse_missing_videos_get_embed_checkbox(srv):
     sp_server._config['has_ffmpeg'] = True
+    sp_server._config['has_tagger'] = True
     status, _, body = request(srv, 'GET', '/browse?path=')
     text = body.decode()
     assert 'class="embed-check"' in text
     assert 'name="video" value="a.mp4"' in text
 
 
+def test_browse_hides_embed_when_tagger_unavailable(srv):
+    # ffmpeg is present but open_clip/torch/numpy are not (e.g. the base
+    # install without the `classifier` extra): Embed must not be offered
+    # since selecting it can only ever fail.
+    sp_server._config['has_ffmpeg'] = True
+    sp_server._config['has_tagger'] = False
+    status, _, body = request(srv, 'GET', '/browse?path=')
+    text = body.decode()
+    assert status == 200
+    assert 'class="embed-check"' not in text
+    assert 'Embed all missing' not in text
+    assert 'embedded' not in text  # coverage badge also hidden - never true without the tagger
+
+
+def test_play_page_hides_embed_when_tagger_unavailable(srv):
+    sp_server._config['has_ffmpeg'] = True
+    sp_server._config['has_tagger'] = False
+    status, _, body = request(srv, 'GET', '/play?path=&idx=1&sort=name&dir=asc')
+    text = body.decode()
+    assert status == 200
+    assert 'Embed this video' not in text
+
+
+def test_embed_rejected_when_tagger_unavailable(srv):
+    sp_server._config['has_tagger'] = False
+    status, _, body = post_form(srv, '/embed', {'path': ''})
+    assert status == 403
+
+
 def test_embed_all_missing_dispatches_all(srv, media_root, monkeypatch):
+    sp_server._config['has_tagger'] = True
     import simpleparty.embeddings as emb
     seen = {}
     done = threading.Event()
@@ -318,6 +353,7 @@ def test_embed_all_missing_dispatches_all(srv, media_root, monkeypatch):
 
 
 def test_embed_selected_subset(srv, media_root, monkeypatch):
+    sp_server._config['has_tagger'] = True
     import simpleparty.embeddings as emb
     seen = {}
     done = threading.Event()
@@ -335,6 +371,7 @@ def test_embed_selected_subset(srv, media_root, monkeypatch):
 
 
 def test_embed_ignores_already_embedded(srv, media_root, monkeypatch):
+    sp_server._config['has_tagger'] = True
     import simpleparty.embeddings as emb
     _embed_video(media_root, '', 'a.mp4')  # already done
     seen = {}
@@ -360,6 +397,7 @@ def test_suggest_one_409_on_unembedded_video(srv):
 
 def test_play_page_offers_embed_when_unembedded(srv):
     sp_server._config['has_ffmpeg'] = True
+    sp_server._config['has_tagger'] = True
     status, _, body = request(srv, 'GET', '/play?path=&idx=1&sort=name&dir=asc')
     text = body.decode()
     assert status == 200
@@ -698,6 +736,7 @@ def test_delete_by_tag_honors_starred_filter(srv, media_root):
 
 def test_pages_have_no_emoji(srv):
     sp_server._config['has_ffmpeg'] = True
+    sp_server._config['has_tagger'] = True
     banned = ['⬇','\U0001F5D1','\U0001F9E0','\U0001F3F7','\U0001F52E','⚙',
               '⇅','\U0001F4C1','\U0001F512','\U0001F513','\U0001F3AC','✅',
               '❌','✔','✘','❓','⏳','★','☆','▶']

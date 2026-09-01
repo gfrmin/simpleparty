@@ -488,6 +488,9 @@ def handle_embed(handler, root):
     if not _config['allow_tag']:
         handler.send_error(403, 'Tagging not enabled')
         return
+    if not _config['has_tagger']:
+        handler.send_error(403, 'Tagger dependencies not installed')
+        return
     from simpleparty import embeddings
 
     form = read_form_multi(handler)

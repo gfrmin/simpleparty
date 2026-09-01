@@ -241,7 +241,7 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
     if want_action_bar:
         tag_controls_html = ''
         tag_status_html = ''
-        if data['videos'] and _config['allow_tag'] and _config['has_ffmpeg']:
+        if data['videos'] and _config['allow_tag'] and _config['has_ffmpeg'] and _config['has_tagger']:
             from simpleparty.embeddings import embedding_coverage
             resolved_dir = resolve_path(_config.get('root', '.'), data['path'])
             job = jobs.get_tag_job(str(resolved_dir))
@@ -983,7 +983,7 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
                         f'<button class="btn">{icon("tag")} Suggest ({mode})</button>'
                         f'</form>'
                     )
-        elif _config['has_ffmpeg']:
+        elif _config['has_ffmpeg'] and _config['has_tagger']:
             # Suggest needs an embedding first; embedding is the explicit step.
             self_url = url_for_play(data['path'], idx, view, video=v['name'])
             job = jobs.get_tag_job(str(resolved_dir))

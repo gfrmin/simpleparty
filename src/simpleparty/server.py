@@ -113,14 +113,10 @@ def main():
         'fscrypt: on' if fscrypt_error is None
         else f'fscrypt: unavailable ({fscrypt_error})'
     )
-    has_torch = False
     if _config['allow_tag']:
-        try:
-            import torch
-            has_torch = True
-            features.append('tag: on')
-        except ImportError:
-            features.append('tag: on (tagger unavailable)')
+        from simpleparty.embeddings import is_available as _tagger_available
+        _config['has_tagger'] = _tagger_available()
+        features.append('tag: on' if _config['has_tagger'] else 'tag: on (tagger unavailable)')
     if _config['allow_download']:
         features.append('download: on')
     elif not args.no_download and not _config['has_ytdlp']:
@@ -132,7 +128,7 @@ def main():
     logger.info('  %s', url)
     if features:
         logger.info('  [%s]', ', '.join(features))
-    if _config['allow_tag'] and not has_torch:
+    if _config['allow_tag'] and not _config['has_tagger']:
         logger.info('  To train a tagger: uvx simpleparty[classifier]==%s', __version__)
     if (not args.no_download) and (not _config['has_ytdlp']):
         logger.info('  To enable downloads: uvx simpleparty[download]==%s', __version__)

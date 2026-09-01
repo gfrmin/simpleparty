@@ -174,13 +174,27 @@ _clip_lock = threading.Lock()
 _infer_lock = threading.Lock()
 
 
+_deps_probed = False
+_deps_available = False
+
+
+def is_available():
+    """Are open_clip, torch and numpy importable? Probed once, cached."""
+    global _deps_probed, _deps_available
+    if not _deps_probed:
+        try:
+            import open_clip  # noqa: F401
+            import torch  # noqa: F401
+            import numpy  # noqa: F401
+            _deps_available = True
+        except ImportError:
+            _deps_available = False
+        _deps_probed = True
+    return _deps_available
+
+
 def _require_clip():
-    try:
-        import open_clip  # noqa: F401
-        import torch  # noqa: F401
-        import numpy  # noqa: F401
-        return
-    except ImportError:
+    if not is_available():
         from simpleparty import __version__
         raise RuntimeError(
             'open_clip_torch, torch and numpy are required for tagger features. '
