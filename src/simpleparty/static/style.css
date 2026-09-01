@@ -460,6 +460,14 @@ video{width:100%;max-height:70vh;display:block;background:#000}
 .download-form input:focus{border-color:var(--accent)}
 .download-url-input{flex:2 !important}
 .download-path-input{flex:1}
+/* The dedicated /download page gives this form a full, uncontested row, so
+   at phone widths the URL + subfolder inputs + Queue button just barely fit
+   on one line instead of wrapping like the narrower toolbar copy does —
+   crowd them out into a deliberate stack instead. */
+@media(max-width:480px){
+  .download-form-page{flex-direction:column;align-items:stretch}
+  .download-form-page input,.download-form-page button{width:100%}
+}
 .dl-cancel-form{display:inline}
 .dl-section-form{display:inline;margin-left:var(--space-2)}
 .download-progress-panel{
@@ -545,12 +553,22 @@ video{width:100%;max-height:70vh;display:block;background:#000}
   border-radius:var(--radius-lg);padding:var(--space-5);
 }
 .unlock-box h1{margin-bottom:var(--space-4);font-size:var(--text-lg);font-weight:600;display:flex;align-items:center;gap:var(--space-2)}
-.unlock-box input[type="password"]{
-  width:100%;padding:var(--space-3);background:var(--bg);border:1px solid var(--border);
+.pw-field{position:relative}
+/* Selector targets the class, not [type="password"] — the reveal toggle below
+   flips the input's type attribute at runtime, which would drop this styling
+   if it were keyed off the type. */
+.pw-field .unlock-pass-input{
+  width:100%;padding:var(--space-3);padding-right:64px;background:var(--bg);border:1px solid var(--border);
   border-radius:var(--radius-md);color:var(--text);font-size:16px;outline:none;
 }
 /* 16px (not --text-base=15px): <16px makes iOS Safari auto-zoom on focus — see mobile audit P/no-zoom */
 .unlock-box input:focus{border-color:var(--accent)}
+.pw-toggle{
+  position:absolute;top:0;right:0;bottom:0;padding:0 var(--space-3);
+  background:none;border:none;color:var(--text-muted);
+  font-size:var(--text-xs);font-weight:600;cursor:pointer;border-radius:var(--radius-md);
+}
+.pw-toggle:hover{color:var(--text)}
 .unlock-actions{display:flex;gap:var(--space-2);justify-content:flex-end;margin-top:var(--space-4)}
 .unlock-error{color:var(--danger);font-size:var(--text-sm);margin-top:10px;min-height:1.2em}
 .unlock-warning{
@@ -631,6 +649,9 @@ a:focus-visible,button:focus-visible,select:focus-visible,input:focus-visible,su
   .tag-dropdown a{padding:10px 12px}
   .item-video .btn-del{min-width:40px;min-height:40px;display:flex;align-items:center;justify-content:center}
   nav,.tag-filter,#file-list,.download-board{padding-left:12px;padding-right:12px}
+  /* toolbar-lib wrapping right-aligned under a left-aligned toolbar-view reads as a
+     zig-zag once both wrap to their own rows; keep every row left-to-right. */
+  .toolbar-lib{justify-content:flex-start}
 }
 /* P3: in landscape, don't trap the controls under a viewport-filling video */
 @media(orientation:landscape) and (max-height:520px){

@@ -746,8 +746,19 @@ def render_locked_page(path, encrypted_dir, redirect_path=None, error=None,
             f'<form hx-post="/unlock" hx-target="#unlock-error" hx-swap="innerHTML">'
             f'<input type="hidden" name="path" value="{esc(encrypted_dir)}">'
             f'<input type="hidden" name="redirect" value="{esc(url_for_browse(redir))}">'
-            f'<input type="password" name="passphrase" placeholder="Passphrase" '
-            f'aria-label="Passphrase" autofocus>'
+            f'<div class="pw-field">'
+            f'<input type="password" id="passphrase-input" class="unlock-pass-input" name="passphrase" '
+            f'placeholder="Passphrase" aria-label="Passphrase" autofocus>'
+            f'<button type="button" class="pw-toggle" aria-pressed="false" '
+            f'aria-label="Show passphrase" onclick="'
+            f"var i=document.getElementById('passphrase-input');"
+            f"var show=i.type==='password';"
+            f"i.type=show?'text':'password';"
+            f"this.setAttribute('aria-pressed',show?'true':'false');"
+            f"this.setAttribute('aria-label',show?'Hide passphrase':'Show passphrase');"
+            f"this.textContent=show?'Hide':'Show';"
+            f'">Show</button>'
+            f'</div>'
             f'<div id="unlock-error" class="unlock-error" role="alert">{esc(error) if error else ""}</div>'
             f'<div class="unlock-actions">{cancel}'
             f'<button class="btn btn-primary" type="submit">{icon("lock-open")} Unlock</button>'
@@ -1233,7 +1244,7 @@ def render_download_page(target_rel=''):
     full_form = (
         f'<form hx-post="/download" class="download-form download-form-page">'
         f'<input type="url" name="url" class="download-url-input" placeholder="https://…" aria-label="Download URL" required autofocus>'
-        f'<input type="text" name="path" class="download-path-input" placeholder="subdir/ (blank = root)" aria-label="Target subdirectory" value="{esc(target_rel)}">'
+        f'<input type="text" name="path" class="download-path-input" placeholder="Subfolder" aria-label="Target subdirectory (blank = root)" value="{esc(target_rel)}">'
         f'<button type="submit" class="btn btn-primary">{icon("download")} Queue</button>'
         f'</form>'
     )
