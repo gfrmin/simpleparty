@@ -1123,7 +1123,18 @@ def render_reencode_panel(rel_path, *, video=None):
 
     # Subtree scope. Path.is_relative_to compares components, so a sibling
     # like /a/bc is never matched for /a/b the way str.startswith would.
+    #
+    # The served root is the exception: queued paths are stored resolved, so
+    # anything reached through a symlink out of the root (a library at
+    # ~/yo -> /mnt/yo) is not lexically beneath it and the root panel stayed
+    # blank while an encode was plainly running. Everything in the queue got
+    # there from inside the library, so at the root the scope is simply
+    # everything.
+    at_root = not rel_path
+
     def _in_scope(p):
+        if at_root:
+            return True
         try:
             return Path(p).is_relative_to(resolved_dir)
         except (ValueError, OSError):

@@ -6,6 +6,7 @@ settings in simpleparty.state.CONFIG.
 
 import collections
 import logging
+import os
 import queue
 import threading
 import time
@@ -225,17 +226,32 @@ _reencode_cv = threading.Condition(_reencode_lock)
 reencode_worker = None  # threading.Thread, lazy
 
 
-def enqueue_reencode(path):
-    """Idempotently append `path` to the tail of the reencode queue.
+def enqueue_reencode(path, *, retry=False):
+    """Idempotently append `path` to the tail of the reencode queue. Returns
+    True if it was actually queued.
 
     No-op if `path` already has any status (queued/encoding/done/failed) or
-    is the item currently encoding — terminal states are sticky, there is no
-    automatic retry of a failed encode.
+    is the item currently encoding: terminal states are sticky, so automatic
+    scanning never retries a failed encode in a loop.
+
+    `retry` lifts that for a terminal state only, and exists because the user
+    pressing "Queue all" is explicitly asking for another attempt. Without it
+    that button silently queued nothing while reporting success, which is
+    what a locked-then-unlocked fscrypt directory left behind. Never
+    disturbs the item currently encoding.
     """
     path = str(path)
     with _reencode_lock:
-        if path in reencode_status or path == reencode_current:
-            return
+        if path == reencode_current:
+            return False
+        existing = reencode_status.get(path)
+        if existing is not None and not (
+                retry and existing.get('state') in ('done', 'failed')):
+            return False
+        try:
+            reencode_queue.remove(path)
+        except ValueError:
+            pass
         reencode_queue.append(path)
         reencode_status[path] = {
             'state': 'queued', 'queued_at': time.time(),
@@ -243,6 +259,7 @@ def enqueue_reencode(path):
             'percent': None, 'speed': None, 'eta': None,
         }
         _reencode_cv.notify()
+        return True
 
 
 def prioritize_reencode(path):
@@ -295,6 +312,23 @@ def _reencode_worker_loop():
         finally:
             with _reencode_lock:
                 status = reencode_status.setdefault(path, {})
+                # An *unexplained* failure on a source that is no longer
+                # there isn't worth remembering. Locking an fscrypt directory
+                # replaces every plaintext name in it at once, so a whole
+                # queue "fails" in milliseconds with nothing to report — and
+                # since terminal states are sticky, that left every one of
+                # those videos unqueueable long after the directory was
+                # unlocked again. Forgetting the entry makes them eligible on
+                # the next scan, and costs nothing if the file really was
+                # deleted. A failure that came with an exception or a
+                # recorded reason is a genuine one and is kept either way.
+                unexplained = error is None and not status.get('error')
+                if not ok and unexplained and not os.path.exists(path):
+                    logger.info('reencode: source no longer present, '
+                                'forgetting %s', path)
+                    reencode_status.pop(path, None)
+                    reencode_current = None
+                    continue
                 status['state'] = 'done' if ok else 'failed'
                 status['finished_at'] = time.time()
                 if error is not None:

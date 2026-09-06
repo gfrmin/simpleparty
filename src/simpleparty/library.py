@@ -253,8 +253,13 @@ def walk_video_tree(root, rel_path, stats=None, max_dirs=MAX_WALK_DIRS):
       * Locked fscrypt subtrees are skipped rather than descended into. A
         locked directory is still isdir()-true and listable, but its entries
         are ciphertext names whose contents can't be read.
-      * Symlinked subdirectories are never descended into, so there are no
-        loops and no escaping the tree sideways.
+      * Symlinked subdirectories ARE followed, because the rest of the app
+        already resolves and serves them (is_safe_rel_path is only lexical),
+        and a walk that refused went silently blind to entire libraries — a
+        media root reached via a ~/yo -> /mnt/yo symlink yielded nothing at
+        all. Loops are prevented by identity instead: each real directory is
+        visited at most once, keyed on (st_dev, st_ino) rather than on path,
+        so two links to one directory don't walk it twice either.
 
     `stats`, if given, is mutated in place as the walk proceeds so a caller
     can report live progress: dirs_visited, dirs_locked_skipped,
@@ -269,20 +274,24 @@ def walk_video_tree(root, rel_path, stats=None, max_dirs=MAX_WALK_DIRS):
 
     if not is_safe_rel_path(rel_path):
         return
-    root_resolved = Path(root).resolve()
-    start = resolve_path(root, rel_path)
-    # is_safe_rel_path is only lexical and resolve_path follows symlinks, so
-    # a symlinked rel_path could still land outside root. This walk can cause
-    # writes into many .simpleparty/transcoded/ dirs, so confirm containment.
-    if start != root_resolved and root_resolved not in start.parents:
-        return
 
-    stack = [(rel_path, start)]
+    seen = set()  # (st_dev, st_ino) of directories already walked
+    stack = [(rel_path, resolve_path(root, rel_path))]
     while stack:
         if stats['dirs_visited'] >= max_dirs:
             stats['truncated'] = True
             return
         cur_rel, cur_resolved = stack.pop()
+
+        try:
+            st = cur_resolved.stat()
+        except OSError:
+            stats['dirs_unreadable_skipped'] += 1
+            continue
+        identity = (st.st_dev, st.st_ino)
+        if identity in seen:
+            continue  # a symlink back to somewhere already walked
+        seen.add(identity)
 
         status = get_fscrypt_status(cur_resolved)
         if status['encrypted'] and not status['unlocked']:
@@ -298,12 +307,7 @@ def walk_video_tree(root, rel_path, stats=None, max_dirs=MAX_WALK_DIRS):
         yield cur_rel, cur_resolved, videos
 
         for name in reversed(dir_names):  # reversed so pop() visits in order
-            child = cur_resolved / name
-            try:
-                if child.is_symlink():
-                    continue
-            except OSError:
-                continue
+            child = (cur_resolved / name).resolve()
             stack.append((os.path.join(cur_rel, name) if cur_rel else name, child))
 
 

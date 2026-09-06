@@ -68,16 +68,75 @@ def test_skips_locked_encrypted_subtree(tmp_path, monkeypatch):
     assert stats['dirs_locked_skipped'] == 1
 
 
-def test_does_not_descend_into_symlinked_dirs(tmp_path):
-    _tree(tmp_path)
-    target = tmp_path / 'sub'
-    link = tmp_path / 'loop'
+def _symlink(link, target):
     try:
         link.symlink_to(target, target_is_directory=True)
     except (OSError, NotImplementedError):
         pytest.skip('symlinks unavailable')
-    out, _ = _walk(tmp_path)
-    assert 'loop' not in out
+
+
+def test_descends_into_symlinked_dirs(tmp_path):
+    """The rest of the app resolves symlinks and happily serves what it finds
+    (is_safe_rel_path is purely lexical), so a walk that refused to follow
+    them made the recursive scan silently blind to whole libraries — e.g. a
+    media root reached through a ~/yo -> /mnt/yo symlink."""
+    root = tmp_path / 'root'
+    root.mkdir()
+    _tree(root)
+    outside = tmp_path / 'elsewhere'
+    outside.mkdir()
+    (outside / 'off.mp4').write_bytes(b'x')
+    _symlink(root / 'linked', outside)
+
+    out, stats = _walk(root)
+
+    assert out['linked'] == ['off.mp4']
+    assert stats['dirs_visited'] == 4
+
+
+def test_symlinked_root_path_is_walked(tmp_path):
+    """Serving a root that itself contains a symlink to another filesystem:
+    scanning that subtree must not come back empty."""
+    root = tmp_path / 'root'
+    root.mkdir()
+    outside = tmp_path / 'elsewhere'
+    outside.mkdir()
+    (outside / 'off.mp4').write_bytes(b'x')
+    _symlink(root / 'linked', outside)
+
+    out, stats = _walk(root, rel='linked')
+
+    assert out == {'linked': ['off.mp4']}
+    assert stats['dirs_visited'] == 1
+
+
+def test_symlink_cycle_terminates(tmp_path):
+    """Following symlinks means loops are now possible; each real directory
+    must be visited at most once, identified by (st_dev, st_ino) rather than
+    by path."""
+    root = tmp_path / 'root'
+    root.mkdir()
+    _tree(root)
+    _symlink(root / 'sub' / 'back', root)
+
+    out, stats = _walk(root)
+
+    assert stats['truncated'] is False
+    assert sorted(out) == ['', 'sub', 'sub/deep']
+
+
+def test_two_symlinks_to_the_same_dir_yield_it_once(tmp_path):
+    root = tmp_path / 'root'
+    root.mkdir()
+    outside = tmp_path / 'elsewhere'
+    outside.mkdir()
+    (outside / 'off.mp4').write_bytes(b'x')
+    _symlink(root / 'one', outside)
+    _symlink(root / 'two', outside)
+
+    out, _ = _walk(root)
+
+    assert [k for k in out if k in ('one', 'two')] == ['one']
 
 
 def test_refuses_to_escape_root(tmp_path):

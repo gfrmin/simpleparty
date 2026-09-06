@@ -910,6 +910,26 @@ def test_reencode_status_reports_encoding_progress(srv, media_root, reencode_on)
     assert 'width:42%' in text
 
 
+def test_reencode_status_at_root_sees_symlinked_out_subtrees(srv, media_root, reencode_on):
+    """The served root's panel must cover everything queued from within the
+    library, including subtrees that resolve outside it through a symlink
+    (a media root reached via ~/yo -> /mnt/yo). Scoping the root by
+    is_relative_to left it permanently blank while an encode ran."""
+    outside = media_root.parent / 'elsewhere'
+    outside.mkdir(exist_ok=True)
+    target = str(outside / 'off.avi')
+    with reencode_on._reencode_lock:
+        reencode_on.reencode_status[target] = {
+            'state': 'encoding', 'percent': 42, 'speed': 2.0, 'eta': None,
+            'error': None, 'finished_at': None,
+        }
+        reencode_on.reencode_current = target
+
+    _s, _h, body = request(srv, 'GET', '/reencode-status?path=')
+
+    assert b'off.avi' in body
+
+
 def test_reencode_status_scope_is_not_a_string_prefix(srv, media_root, reencode_on):
     """Regression: subtree scoping must compare path components, so a sibling
     directory sharing a string prefix (foo vs foobar) is never conflated."""
@@ -975,6 +995,45 @@ def test_reencode_scan_cycle(srv, media_root, reencode_on, monkeypatch):
     # the queue as soon as it's enqueued, so the deque is legitimately empty
     # by the time we look. Status is sticky.
     assert str(media_root / 'a.mp4') in reencode_on.reencode_status
+
+
+def test_scan_confirm_retries_previously_failed_videos(srv, media_root, reencode_on, monkeypatch):
+    """After an fscrypt lock flipped a directory's queue to failed, pressing
+    "Queue all" reported "Queued N videos" while queueing none, because
+    terminal states are sticky. The explicit button must actually retry."""
+    from simpleparty import jobs as sp_jobs
+    target = str(media_root / 'a.mp4')
+    job = sp_jobs.new_tree_scan_job()
+    job.update(running=False, found=[target])
+    monkeypatch.setattr(sp_jobs, 'get_tree_scan_job', lambda d: job)
+    with reencode_on._reencode_lock:
+        reencode_on.reencode_status[target] = {
+            'state': 'failed', 'error': None, 'finished_at': 1.0,
+        }
+
+    _s, _h, body = post_form(srv, '/reencode-scan-confirm', {'path': '', 'row': '0'})[0:3]
+
+    assert b'Queued 1 video' in body
+    assert b'Queued 0 videos' not in body
+
+
+def test_scan_confirm_counts_what_it_actually_queued(srv, media_root, reencode_on, monkeypatch):
+    """The item already encoding cannot be re-queued, so it must not be
+    counted — the message has to reflect the queue, not the scan result."""
+    from simpleparty import jobs as sp_jobs
+    busy = str(media_root / 'a.mp4')
+    fresh = str(media_root / 'b.mp4')
+    job = sp_jobs.new_tree_scan_job()
+    job.update(running=False, found=[busy, fresh])
+    monkeypatch.setattr(sp_jobs, 'get_tree_scan_job', lambda d: job)
+    with reencode_on._reencode_lock:
+        reencode_on.reencode_current = busy
+
+    _s, _h, body = post_form(srv, '/reencode-scan-confirm', {'path': '', 'row': '0'})[0:3]
+
+    assert fresh  # the one that can be queued; `busy` is refused
+    assert b'Queued 1 video' in body
+    assert b'Queued 2 videos' not in body
 
 
 def test_reencode_clear_drops_pending(srv, media_root, reencode_on):

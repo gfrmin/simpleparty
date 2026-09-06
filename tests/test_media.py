@@ -2,6 +2,7 @@
 re-encode queue/worker/scan trigger."""
 
 import os
+import pathlib
 import time
 
 import pytest
@@ -170,6 +171,68 @@ def test_worker_survives_exception_and_keeps_processing(monkeypatch, _reencode_s
     assert sp_jobs.reencode_status['good']['state'] == 'done'
 
 
+def test_worker_forgets_a_vanished_source_instead_of_failing_it(
+        tmp_path, monkeypatch, _reencode_state_snapshot):
+    """Locking an fscrypt directory replaces every plaintext name in it, so
+    each queued video "fails" instantly. Terminal states are sticky, so
+    recording those as failed left the whole directory unqueueable long after
+    it was unlocked again — enqueue_reencode no-ops on any known path. A
+    source that isn't there is nothing worth remembering: drop it."""
+    gone = str(tmp_path / 'locked-away.avi')  # never created
+    monkeypatch.setattr(sp_media, '_reencode_video', lambda p: False)
+
+    sp_jobs.enqueue_reencode(gone)
+    sp_jobs.ensure_reencode_worker()
+    _reencode_state_snapshot()
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and gone in sp_jobs.reencode_status:
+        time.sleep(0.02)
+
+    assert gone not in sp_jobs.reencode_status
+    # ...and so it can be queued again once the directory comes back.
+    assert sp_jobs.enqueue_reencode(gone) is True
+
+
+def test_worker_still_records_a_failure_when_the_source_is_present(
+        tmp_path, monkeypatch, _reencode_state_snapshot):
+    present = tmp_path / 'real.avi'
+    present.write_bytes(b'x')
+    monkeypatch.setattr(sp_media, '_reencode_video', lambda p: False)
+
+    sp_jobs.enqueue_reencode(str(present))
+    sp_jobs.ensure_reencode_worker()
+    _reencode_state_snapshot()
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if sp_jobs.reencode_status.get(str(present), {}).get('state') == 'failed':
+            break
+        time.sleep(0.02)
+
+    assert sp_jobs.reencode_status[str(present)]['state'] == 'failed'
+
+
+def test_enqueue_retry_clears_a_terminal_state():
+    """The explicit "Queue all" button is a user asking for a retry; refusing
+    it made the button report "Queued N videos" while queueing none."""
+    sp_jobs.reencode_status['p'] = {'state': 'failed', 'finished_at': 1.0}
+
+    assert sp_jobs.enqueue_reencode('p') is False        # automatic path: sticky
+    assert sp_jobs.enqueue_reencode('p', retry=True) is True
+    assert sp_jobs.reencode_status['p']['state'] == 'queued'
+    assert 'p' in sp_jobs.reencode_queue
+
+
+def test_enqueue_retry_does_not_disturb_the_in_flight_item():
+    sp_jobs.reencode_current = 'busy'
+    try:
+        assert sp_jobs.enqueue_reencode('busy', retry=True) is False
+        assert 'busy' not in sp_jobs.reencode_queue
+    finally:
+        sp_jobs.reencode_current = None
+
+
 # --- _maybe_start_reencode_scan throttling ---
 
 def test_maybe_start_reencode_scan_throttled_by_dir_mtime(tmp_path, monkeypatch):
@@ -223,6 +286,22 @@ def test_maybe_start_reencode_scan_gated_on_pretranscode_flag(tmp_path, monkeypa
     sp_media._maybe_start_reencode_scan(tmp_path, videos)
     time.sleep(0.1)
     assert calls == []
+
+
+def test_reencode_records_why_the_cache_dir_could_not_be_made(tmp_path, monkeypatch):
+    """A locked fscrypt directory (or a full/read-only disk) fails at mkdir.
+    Returning a bare False left the UI saying "Background optimization
+    failed" with no reason at all."""
+    src = tmp_path / 'v.avi'
+    src.write_bytes(b'x')
+    def boom(*a, **kw):
+        raise OSError(126, 'Required key not available')
+
+    monkeypatch.setattr(pathlib.Path, 'mkdir', boom)
+    sp_jobs.reencode_status[str(src)] = {'state': 'encoding', 'error': None}
+
+    assert sp_media._reencode_video(str(src)) is False
+    assert 'Required key not available' in sp_jobs.reencode_status[str(src)]['error']
 
 
 # --- ffmpeg -progress parsing (pure; no ffmpeg involved) ---

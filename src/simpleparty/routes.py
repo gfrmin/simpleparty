@@ -437,11 +437,15 @@ def handle_reencode_scan_confirm(handler, root):
         send_html(handler, render_tree_scan_widget(rel_path, job, row=row))
         return
     found = job.get('found', [])
-    for p in found:
-        jobs.enqueue_reencode(p)  # idempotent; safe if some are already queued
-    if found:
+    # retry=True: this button is the user explicitly asking for another go,
+    # so a previously failed entry (an fscrypt lock flips a whole directory
+    # to failed at once) must not silently block re-queueing. Count what was
+    # actually queued rather than what was found — the item already encoding
+    # is legitimately refused, and reporting it as queued was a lie.
+    queued = sum(1 for p in found if jobs.enqueue_reencode(p, retry=True))
+    if queued:
         jobs.ensure_reencode_worker()
-    job['queued_count'] = len(found)
+    job['queued_count'] = queued
     job['confirmed'] = True
     job['found'] = []  # consumed; don't retain thousands of path strings
     send_html(handler, render_tree_scan_widget(rel_path, job, row=row))

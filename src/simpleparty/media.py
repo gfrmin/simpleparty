@@ -341,7 +341,13 @@ def _reencode_video(path_str):
     dest = _transcoded_path(path.parent, path.name)
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
+    except OSError as e:
+        # Typically a locked fscrypt directory (ENOKEY), a read-only mount or
+        # a full disk. Record why: a bare False left the UI reporting a
+        # failure with no reason at all.
+        reason = f'could not create the transcode cache directory: {e}'
+        logger.warning('reencode failed for %s (%s)', path, reason)
+        jobs.report_reencode_progress(path_str, error=reason)
         return False
 
     duration = _get_duration(path)
