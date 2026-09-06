@@ -304,6 +304,68 @@ def test_reencode_records_why_the_cache_dir_could_not_be_made(tmp_path, monkeypa
     assert 'Required key not available' in sp_jobs.reencode_status[str(src)]['error']
 
 
+# --- abandoned temp-file sweep ---
+
+def _tmpdir(root, name='v.avi'):
+    d = sp_media._transcoded_path(root, name).parent
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def test_sweep_removes_an_abandoned_tmp(tmp_path):
+    """Locking an fscrypt directory mid-encode makes the normal cleanup
+    unlink a plaintext path that no longer resolves; missing_ok swallows it
+    and the partial output — potentially gigabytes — survives under its
+    ciphertext name. Sweep it once the directory is readable again."""
+    d = _tmpdir(tmp_path)
+    orphan = d / 'reencode-abandoned.tmp'
+    orphan.write_bytes(b'partial output')
+    os.utime(orphan, (0, 0))  # long abandoned
+
+    assert sp_media._sweep_stale_transcode_tmps(tmp_path) == 1
+    assert not orphan.exists()
+
+
+def test_sweep_spares_a_live_encode(tmp_path):
+    """ffmpeg rewrites its output continuously, so a fresh mtime means an
+    encode in flight — possibly a second instance sharing the library."""
+    d = _tmpdir(tmp_path)
+    live = d / 'reencode-inflight.tmp'
+    live.write_bytes(b'being written')
+
+    assert sp_media._sweep_stale_transcode_tmps(tmp_path) == 0
+    assert live.exists()
+
+
+def test_sweep_never_touches_the_cached_output(tmp_path):
+    d = _tmpdir(tmp_path)
+    cached = d / 'v.avi.mp4'
+    cached.write_bytes(b'the real cache')
+    os.utime(cached, (0, 0))
+
+    assert sp_media._sweep_stale_transcode_tmps(tmp_path) == 0
+    assert cached.exists()
+
+
+def test_sweep_is_silent_when_there_is_no_cache_dir(tmp_path):
+    assert sp_media._sweep_stale_transcode_tmps(tmp_path / 'nope') == 0
+
+
+def test_browse_scan_sweeps_abandoned_tmps(tmp_path, monkeypatch):
+    """The directory whose lock caused the orphan may have nothing left to
+    encode, so the sweep has to run from the per-directory browse scan too,
+    not only from the next encode."""
+    d = _tmpdir(tmp_path)
+    orphan = d / 'reencode-abandoned.tmp'
+    orphan.write_bytes(b'partial')
+    os.utime(orphan, (0, 0))
+    monkeypatch.setattr(sp_media, '_transcode_plan', lambda p: None)
+
+    sp_media._scan_for_reencode(tmp_path, [], 12345)
+
+    assert not orphan.exists()
+
+
 # --- ffmpeg -progress parsing (pure; no ffmpeg involved) ---
 
 def test_parse_progress_line_accumulates_until_terminator():

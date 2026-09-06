@@ -215,6 +215,8 @@ def _stream_file(handler, path):
 # ffmpeg pipe in _serve_transcoded entirely. Freshness is just "does the
 # cache file exist and is its mtime >= the source's" - no tags.json bookkeeping.
 
+from simpleparty.tagger import SIMPLEPARTY_DIR
+
 TRANSCODED_DIR = 'transcoded'  # sibling of tagger.THUMB_DIR under .simpleparty/
 
 _REENCODE_MIN_TIMEOUT = 60
@@ -286,7 +288,6 @@ def _transcoded_path(directory, name):
     """Where a video's cached re-encode should live. Appends (not replaces)
     the suffix, like tagger.thumb_path, so e.g. movie.mkv -> movie.mkv.mp4
     can't collide with a movie.mp4 that also needed caching."""
-    from simpleparty.tagger import SIMPLEPARTY_DIR
     return Path(directory) / SIMPLEPARTY_DIR / TRANSCODED_DIR / f'{name}.mp4'
 
 
@@ -318,6 +319,52 @@ def discard_cached_transcode(path):
         _transcoded_path(path.parent, path.name).unlink(missing_ok=True)
     except OSError as e:
         logger.warning('could not discard cached transcode for %s: %s', path, e)
+
+
+_TMP_PREFIX = 'reencode-'
+_TMP_SUFFIX = '.tmp'
+_STALE_TMP_AGE = 1800  # seconds untouched before a tmp counts as abandoned
+
+
+def _sweep_stale_transcode_tmps(directory, now=None):
+    """Delete abandoned reencode-*.tmp files from a directory's transcode
+    cache. Returns how many were removed.
+
+    _reencode_video unlinks its own tmp by path, which silently no-ops if the
+    directory was locked underneath it: fscrypt replaces every plaintext name
+    at once, so the unlink hits a path that no longer resolves and missing_ok
+    swallows the FileNotFoundError, leaving a partial file — potentially
+    gigabytes — under its ciphertext name with nothing left to reference it.
+    Rather than race that at unlink time, reclaim them whenever the directory
+    is readable again. This also covers every other way an encode is
+    abandoned: a killed worker, a crash, power loss.
+
+    Only files untouched for _STALE_TMP_AGE are removed. ffmpeg rewrites its
+    output continuously, so a recent mtime means an encode still in flight —
+    possibly a second simpleparty instance sharing the library.
+    """
+    cache_dir = Path(directory) / SIMPLEPARTY_DIR / TRANSCODED_DIR
+    cutoff = (time.time() if now is None else now) - _STALE_TMP_AGE
+    removed = 0
+    try:
+        entries = list(cache_dir.iterdir())
+    except OSError:
+        return 0  # no cache dir yet, or unreadable/locked — nothing to do
+    for entry in entries:
+        if not (entry.name.startswith(_TMP_PREFIX)
+                and entry.name.endswith(_TMP_SUFFIX)):
+            continue
+        try:
+            if entry.stat().st_mtime > cutoff:
+                continue
+            entry.unlink()
+        except OSError as e:
+            logger.warning('could not remove abandoned transcode tmp %s: %s',
+                           entry, e)
+            continue
+        logger.info('removed abandoned transcode tmp %s', entry)
+        removed += 1
+    return removed
 
 
 def _reencode_video(path_str):
@@ -355,6 +402,9 @@ def _reencode_video(path_str):
                if duration > 0 else _REENCODE_TIMEOUT_UNKNOWN_DURATION)
 
     jobs.report_reencode_progress(path_str, percent=0 if duration > 0 else None)
+
+    # Only one encode runs at a time, so anything already here is abandoned.
+    _sweep_stale_transcode_tmps(path.parent)
 
     tmp_fd, tmp_path = tempfile.mkstemp(
         dir=str(dest.parent), suffix='.tmp', prefix='reencode-',
@@ -470,6 +520,7 @@ def _scan_for_reencode(directory, videos, dir_mtime_ns):
     """Background worker: enqueue any video whose transcode plan is
     'reencode' and that doesn't already have a fresh cache."""
     try:
+        _sweep_stale_transcode_tmps(directory)
         for v in videos:
             video_path = Path(directory) / v['name']
             try:
