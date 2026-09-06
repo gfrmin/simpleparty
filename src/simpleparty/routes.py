@@ -15,6 +15,7 @@ from pathlib import Path
 from simpleparty import jobs
 from simpleparty.library import (
     durations_from_tags,
+    get_fscrypt_status,
     is_safe_rel_path,
     filter_videos_by_starred,
     filter_videos_by_tags,
@@ -29,8 +30,12 @@ from simpleparty.library import (
     sort_videos,
 )
 from simpleparty.media import (
+    _cached_transcode,
+    _scan_tree_for_reencode,
+    discard_cached_transcode,
     _is_mpegts,
     _maybe_start_durations,
+    _maybe_start_reencode_scan,
     _maybe_start_thumbs,
     _probe_streams,
     _remux_mpegts,
@@ -42,6 +47,9 @@ from simpleparty.media import (
 from simpleparty.render import (
     render_coverage_controls,
     render_browse_page,
+    render_reencode_panel,
+    render_scan_trigger,
+    render_tree_scan_widget,
     render_playlist,
     render_video_items,
     render_download_page,
@@ -173,6 +181,7 @@ def handle_browse(handler, root):
         ))
         return
     _maybe_start_thumbs(resolved, data['videos'], thumbs=ctx['thumbs'])
+    _maybe_start_reencode_scan(resolved, data['videos'])
     send_html(handler, render_browse_page(
         data, view, tags_map=tags_map,
         lower_index=ctx['lower_index'], thumbs=ctx['thumbs'],
@@ -254,12 +263,22 @@ def handle_play(handler, root):
 
     transcode_plan = None
     if _config['allow_transcode'] and (_config['has_ffmpeg'] or _config['has_vlc']):
+        video_fs_path = None
         try:
             video_fs_path = resolve_path(root, data['videos'][idx]['path'])
             if video_fs_path.is_file():
                 transcode_plan = _transcode_plan(video_fs_path)
         except OSError:
-            pass
+            video_fs_path = None
+
+        if transcode_plan == 'reencode' and video_fs_path is not None:
+            if _cached_transcode(video_fs_path) is not None:
+                # handle_video will serve the cached file directly now;
+                # the live-reencode banner no longer applies.
+                transcode_plan = None
+            elif _config['allow_pretranscode'] and _config['has_ffmpeg']:
+                jobs.ensure_reencode_worker()
+                jobs.prioritize_reencode(str(video_fs_path))
 
     send_html(handler, render_play_page(data, idx, next_url, prev_url, shuffle_url, shuffled, pos_info, view, tags_map=tags_map, lower_index=ctx.get('lower_index'), thumbs=ctx.get('thumbs', frozenset()), play_order=play_order, shuffle_seed=shuffle_seed, transcode_plan=transcode_plan))
 
@@ -276,7 +295,13 @@ def handle_video(handler, root):
         handler.send_error(404)
         return
 
-    if _config['allow_transcode'] and (_config['has_ffmpeg'] or _config['has_vlc']):
+    serve_path = resolved
+    if _config['allow_transcode'] and _config['has_ffmpeg']:
+        cached = _cached_transcode(resolved)
+        if cached is not None:
+            serve_path = cached
+
+    if serve_path is resolved and _config['allow_transcode'] and (_config['has_ffmpeg'] or _config['has_vlc']):
         plan = _transcode_plan(resolved)
         if plan is not None:
             if _is_mpegts(resolved) and _config['has_ffmpeg'] and _remux_mpegts(resolved):
@@ -287,8 +312,8 @@ def handle_video(handler, root):
                 _serve_transcoded(handler, resolved, plan)
                 return
 
-    file_size = resolved.stat().st_size
-    content_type = MIME_TYPES.get(resolved.suffix.lower(), 'application/octet-stream')
+    file_size = serve_path.stat().st_size
+    content_type = MIME_TYPES.get(serve_path.suffix.lower(), 'application/octet-stream')
     range_header = handler.headers.get('Range')
 
     if range_header:
@@ -311,7 +336,7 @@ def handle_video(handler, root):
             handler.send_header('Accept-Ranges', 'bytes')
             handler.end_headers()
             if handler.command != 'HEAD':
-                _stream_range(handler, resolved, start, length)
+                _stream_range(handler, serve_path, start, length)
             return
 
     handler.send_response(200)
@@ -320,7 +345,138 @@ def handle_video(handler, root):
     handler.send_header('Accept-Ranges', 'bytes')
     handler.end_headers()
     if handler.command != 'HEAD':
-        _stream_file(handler, resolved)
+        _stream_file(handler, serve_path)
+
+
+# --- Re-encode progress + recursive scan ---
+
+def _reencode_gate_ok():
+    """Deliberately not gated on allow_pretranscode: that flag disables only
+    the automatic background scanning, while these explicit actions stay
+    available. Re-checked server-side on every route — never trust hidden UI."""
+    return _config['has_ffmpeg'] and _config['allow_transcode']
+
+
+def handle_reencode_status(handler, root):
+    """Poll target for the live progress panel/banner. Deliberately does no
+    directory listing, ffprobe or scan work — it's an in-memory read plus one
+    path resolution, so a 2s cadence stays cheap."""
+    if not _reencode_gate_ok():
+        send_html(handler, '')
+        return
+    params = parse_query(handler.path)
+    rel_path = params.get('path', '')
+    video = params.get('video') or None
+    if not is_safe_rel_path(rel_path):
+        send_html(handler, '')
+        return
+    if video is not None and Path(video).name != video:
+        send_html(handler, '')
+        return
+    send_html(handler, render_reencode_panel(rel_path, video=video))
+
+
+def handle_reencode_scan(handler, root):
+    if not _reencode_gate_ok():
+        handler.send_error(403, 'Transcoding not enabled')
+        return
+    form = read_form_body(handler)
+    rel_path = form.get('path', '')
+    row = form.get('row') == '1'
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return
+    resolved = resolve_path(root, rel_path)
+    if not resolved.is_dir():
+        handler.send_error(400, 'Not a directory')
+        return
+    status = get_fscrypt_status(resolved)
+    if status['encrypted'] and not status['unlocked']:
+        send_html(handler, render_tree_scan_widget(
+            rel_path, {'running': False, 'error': 'This folder is locked.'}, row=row))
+        return
+
+    job = jobs.new_tree_scan_job()
+    if jobs.claim_tree_scan_job(str(resolved), job):
+        threading.Thread(
+            target=_scan_tree_for_reencode, args=(root, rel_path, job), daemon=True,
+        ).start()
+    else:
+        job = jobs.get_tree_scan_job(str(resolved))
+    send_html(handler, render_tree_scan_widget(rel_path, job, row=row))
+
+
+def handle_reencode_scan_status(handler, root):
+    if not _reencode_gate_ok():
+        send_html(handler, '')
+        return
+    params = parse_query(handler.path)
+    rel_path = params.get('path', '')
+    if not is_safe_rel_path(rel_path):
+        send_html(handler, '')
+        return
+    job = jobs.get_tree_scan_job(str(resolve_path(root, rel_path)))
+    send_html(handler, render_tree_scan_widget(
+        rel_path, job, row=params.get('row') == '1'))
+
+
+def handle_reencode_scan_confirm(handler, root):
+    """Enqueue what the scan found. Separate from the scan itself so a
+    misclick on a large tree can't start hours of CPU work unprompted."""
+    if not _reencode_gate_ok():
+        handler.send_error(403, 'Transcoding not enabled')
+        return
+    form = read_form_body(handler)
+    rel_path = form.get('path', '')
+    row = form.get('row') == '1'
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return
+    job = jobs.get_tree_scan_job(str(resolve_path(root, rel_path)))
+    if job is None or job.get('running') or job.get('error'):
+        send_html(handler, render_tree_scan_widget(rel_path, job, row=row))
+        return
+    found = job.get('found', [])
+    for p in found:
+        jobs.enqueue_reencode(p)  # idempotent; safe if some are already queued
+    if found:
+        jobs.ensure_reencode_worker()
+    job['queued_count'] = len(found)
+    job['confirmed'] = True
+    job['found'] = []  # consumed; don't retain thousands of path strings
+    send_html(handler, render_tree_scan_widget(rel_path, job, row=row))
+
+
+def handle_reencode_scan_dismiss(handler, root):
+    """Drop the finished scan result and hand back the trigger button.
+
+    Starting a scan swaps the trigger form out for the result widget, so
+    dismissing has to restore it — otherwise that folder couldn't be
+    re-scanned without a full page reload. Also frees the job's retained
+    path list.
+    """
+    if not _reencode_gate_ok():
+        handler.send_error(403, 'Transcoding not enabled')
+        return
+    form = read_form_body(handler)
+    rel_path = form.get('path', '')
+    row = form.get('row') == '1'
+    if not is_safe_rel_path(rel_path):
+        handler.send_error(400, 'Invalid path')
+        return
+    jobs.drop_tree_scan_job(str(resolve_path(root, rel_path)))
+    send_html(handler, render_scan_trigger(rel_path, row=row))
+
+
+def handle_reencode_clear(handler, root):
+    if not _reencode_gate_ok():
+        handler.send_error(403, 'Transcoding not enabled')
+        return
+    form = read_form_body(handler)
+    redirect_url = form.get('redirect') or url_for_browse('')
+    dropped = jobs.clear_pending_reencodes()
+    logger.info('reencode queue cleared: %d pending dropped', dropped)
+    send_hx_redirect(handler, redirect_url)
 
 
 def handle_delete(handler, root):
@@ -342,6 +498,7 @@ def handle_delete(handler, root):
     except OSError as e:
         handler.send_error(500, str(e))
         return
+    discard_cached_transcode(resolved)
     # Clean up tags entry for deleted video
     if _config['allow_tag']:
         try:
@@ -402,6 +559,7 @@ def handle_delete_by_tag(handler, root):
         except OSError as e:
             logger.warning('delete-by-tag: failed to remove %s: %s', video_path, e)
             continue
+        discard_cached_transcode(video_path)
         removed.add(video['name'])
 
     try:
@@ -1074,6 +1232,8 @@ GET_ROUTES = {
     '/browse': handle_browse,
     '/play': handle_play,
     '/tag-status': handle_tag_status,
+    '/reencode-status': handle_reencode_status,
+    '/reencode-scan-status': handle_reencode_scan_status,
     '/download': handle_download_page,
     '/download-status': handle_download_status,
 }
@@ -1099,6 +1259,10 @@ POST_ROUTES = {
     '/rename-tag': handle_rename_tag,
     '/remove-tag': handle_remove_tag,
     '/star-update': handle_star_update,
+    '/reencode-scan': handle_reencode_scan,
+    '/reencode-scan-confirm': handle_reencode_scan_confirm,
+    '/reencode-scan-dismiss': handle_reencode_scan_dismiss,
+    '/reencode-clear': handle_reencode_clear,
     '/download': handle_download_submit,
     '/download-cancel': handle_download_cancel,
     '/download-clear': handle_download_clear,

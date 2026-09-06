@@ -11,6 +11,7 @@ Easily enjoy your private video collection. Browse and play local video files fr
 - **Dark theme** - comfortable for extended viewing
 - **Mobile friendly** - responsive layout with large tap targets
 - **Auto-transcoding** - MKV/AVI/MOV files are automatically transcoded via ffmpeg or VLC (if installed)
+- **Background pre-transcoding** - videos your browser can't play natively are re-encoded once in the background into a cache beside them, so later playbacks start and seek instantly instead of going through a live transcode; scan a whole folder tree for candidates from the browse page (needs ffmpeg)
 - **URL download** - paste a URL from the browse page or `/download` and yt-dlp fetches it into that directory (opt-in extra)
 - **AI video tagging** - learns from your own tags using a local OpenCLIP model: train a classifier, suggest tags for untagged videos (with zero-shot fallback), and flag likely-mislabeled tags (opt-in `[classifier]` extra)
 - **Manual tagging** - add or edit tags on any video from the player page
@@ -52,6 +53,7 @@ simpleparty [/path/to/videos] [options]
   -b, --bind ADDR       Bind address (default: 0.0.0.0)
   --no-delete           Disable the delete button
   --no-transcode        Disable ffmpeg/VLC transcoding
+  --no-pretranscode     Disable automatic background pre-transcoding
   --no-tag              Disable all tagging features
   --no-download         Disable URL download feature
   --yt-dlp-format FMT   yt-dlp format selector
@@ -77,6 +79,7 @@ simpleparty [/path/to/videos] [options]
 These are auto-detected at startup and require no configuration:
 
 - **ffmpeg** or **VLC** - Enables playback of MKV, AVI, and MOV files by transcoding to browser-compatible MP4 on the fly. Install either one: `sudo apt install ffmpeg` / `sudo pacman -S ffmpeg`
+  With ffmpeg specifically, SimpleParty also pre-transcodes in the background: browsing a folder queues its unplayable videos for a one-off re-encode into `.simpleparty/transcoded/`, opening one jumps it to the front of the queue, and the browse page shows live progress. The originals are never modified, and the cache is deleted along with its video. Use `--no-pretranscode` to keep only live transcoding and the explicit "Find re-encodes" buttons.
 - **fscrypt** - If your video directories use Linux filesystem encryption (fscrypt), SimpleParty marks locked ones with a padlock and prompts for the passphrase in the browser. Detection asks the kernel directly and needs nothing installed; *unlocking* needs the fscrypt tool, so without it the padlock is still shown and the page explains what to install. Note that installing fscrypt is only half the job — `sudo fscrypt setup` must also have been run, or the tool cannot read its own config
 
 ## URL download

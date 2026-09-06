@@ -1,8 +1,11 @@
 """Video serving (transcode/remux/stream) and thumbnail generation."""
 
+import collections
 import logging
 import os
+import re
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -28,6 +31,12 @@ BROWSER_VIDEO_CODECS = frozenset({'h264', 'vp8', 'vp9', 'av1'})
 BROWSER_AUDIO_CODECS = frozenset({'aac', 'mp3', 'opus', 'vorbis'})
 
 _probe_cache = {}
+_probe_cache_lock = threading.Lock()
+# Bounded because a recursive tree scan probes every uncached video in one
+# pass; unbounded, this would retain an entry per video for the process's
+# life. Entries are tiny tuples, so the cap costs ~1MB at worst. Same
+# cap-and-evict-oldest shape as tagger._thumbs_cache.
+_PROBE_CACHE_MAX = 4096
 
 
 def _probe_streams(path):
@@ -37,7 +46,8 @@ def _probe_streams(path):
     except OSError:
         return (None, None)
     key = (str(path), st.st_mtime, st.st_size)
-    cached = _probe_cache.get(key)
+    with _probe_cache_lock:
+        cached = _probe_cache.get(key)
     if cached is not None:
         return cached
 
@@ -55,7 +65,10 @@ def _probe_streams(path):
 
     vcodec = _probe('v:0')
     acodec = _probe('a:0')
-    _probe_cache[key] = (vcodec, acodec)
+    with _probe_cache_lock:
+        _probe_cache[key] = (vcodec, acodec)
+        while len(_probe_cache) > _PROBE_CACHE_MAX:
+            _probe_cache.pop(next(iter(_probe_cache)))
     return (vcodec, acodec)
 
 
@@ -193,6 +206,366 @@ def _stream_file(handler, path):
     except (BrokenPipeError, ConnectionResetError):
         pass
 
+
+# --- Background pre-transcode cache ---
+#
+# Non-destructive: never touches the source. A background job (triggered on
+# browse, prioritized on play) re-encodes 'reencode'-plan videos once into
+# .simpleparty/transcoded/<name>.mp4, so later playbacks skip the live
+# ffmpeg pipe in _serve_transcoded entirely. Freshness is just "does the
+# cache file exist and is its mtime >= the source's" - no tags.json bookkeeping.
+
+TRANSCODED_DIR = 'transcoded'  # sibling of tagger.THUMB_DIR under .simpleparty/
+
+_REENCODE_MIN_TIMEOUT = 60
+_REENCODE_TIMEOUT_PER_SEC = 4.0  # generous: -preset medium on modest hardware
+_REENCODE_TIMEOUT_UNKNOWN_DURATION = 1800
+
+# ffmpeg emits a -progress block roughly every 0.5s; there's no value in
+# updating shared state faster than any client polls it.
+_REENCODE_PROGRESS_MIN_INTERVAL = 1.0
+_REENCODE_STDERR_TAIL = 40  # lines kept for diagnostics
+
+_OUT_TIME_RE = re.compile(r'(-?\d+):(\d{2}):(\d{2})(?:\.(\d+))?')
+_SPEED_RE = re.compile(r'([\d.]+)x')
+
+
+def _parse_progress_line(line, scratch):
+    """Fold one line of `ffmpeg -progress` output into `scratch`, which the
+    caller keeps across calls. Returns the completed block (and clears
+    scratch) once the block-terminating `progress=` key arrives, else None.
+
+    Pure: no I/O, so the parsing is unit-testable without running ffmpeg.
+    """
+    line = line.strip()
+    if not line or '=' not in line:
+        return None
+    key, _, value = line.partition('=')
+    scratch[key] = value
+    if key == 'progress':
+        block = dict(scratch)
+        scratch.clear()
+        return block
+    return None
+
+
+def _progress_block_to_metrics(block):
+    """One completed -progress block -> (elapsed_seconds|None, speed|None).
+
+    Prefers out_time_us, whose name matches its actual unit, and falls back
+    to the out_time "HH:MM:SS.ffffff" string for older builds. out_time_ms is
+    deliberately never read: ffmpeg populates it with MICROseconds despite the
+    name, so trusting it would under-report elapsed time by 1000x.
+    """
+    elapsed = None
+    out_us = block.get('out_time_us')
+    if out_us not in (None, 'N/A'):
+        try:
+            elapsed = int(out_us) / 1_000_000
+        except ValueError:
+            pass
+    if elapsed is None:
+        m = _OUT_TIME_RE.match(block.get('out_time') or '')
+        if m:
+            hours, minutes, seconds, frac = m.groups()
+            elapsed = int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+            if frac:
+                elapsed += int(frac[:6].ljust(6, '0')) / 1_000_000
+
+    speed = None
+    m = _SPEED_RE.match((block.get('speed') or '').strip())
+    if m:
+        try:
+            speed = float(m.group(1))
+        except ValueError:
+            pass
+    return elapsed, speed
+
+
+def _transcoded_path(directory, name):
+    """Where a video's cached re-encode should live. Appends (not replaces)
+    the suffix, like tagger.thumb_path, so e.g. movie.mkv -> movie.mkv.mp4
+    can't collide with a movie.mp4 that also needed caching."""
+    from simpleparty.tagger import SIMPLEPARTY_DIR
+    return Path(directory) / SIMPLEPARTY_DIR / TRANSCODED_DIR / f'{name}.mp4'
+
+
+def _cached_transcode(path):
+    """Return the cached re-encoded Path for `path` if it exists and is at
+    least as new as the source; else None."""
+    cached = _transcoded_path(path.parent, path.name)
+    try:
+        src_mtime = path.stat().st_mtime
+        cached_mtime = cached.stat().st_mtime
+    except OSError:
+        return None
+    if cached_mtime < src_mtime:
+        return None
+    return cached
+
+
+def discard_cached_transcode(path):
+    """Best-effort removal of a video's cached re-encode, for when the source
+    is deleted. Unlinks unconditionally rather than via _cached_transcode: a
+    *stale* cache entry is just as orphaned once the source is gone, and
+    freshness is judged against a source that no longer exists.
+
+    Unlike a thumbnail, this file is a second full copy of the video, so
+    leaving it behind would quietly retain the bytes with nothing left in the
+    UI to ever surface or invalidate them.
+    """
+    try:
+        _transcoded_path(path.parent, path.name).unlink(missing_ok=True)
+    except OSError as e:
+        logger.warning('could not discard cached transcode for %s: %s', path, e)
+
+
+def _reencode_video(path_str):
+    """Background worker body: re-encode into .simpleparty/transcoded/. Uses
+    a slower preset than the live path (media.py's _serve_transcoded) since
+    this isn't latency-constrained, and +faststart since the output is a
+    normal seekable file (served via _stream_range/_stream_file) rather than
+    a live pipe. Never touches the source. Returns True on success."""
+    from simpleparty.tagger import _get_duration
+
+    path = Path(path_str)
+    try:
+        if not path.is_file():
+            return False
+    except OSError:
+        return False
+
+    if _cached_transcode(path) is not None:
+        return True  # already fresh (e.g. a redundant enqueue)
+
+    dest = _transcoded_path(path.parent, path.name)
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+
+    duration = _get_duration(path)
+    timeout = (max(_REENCODE_MIN_TIMEOUT, duration * _REENCODE_TIMEOUT_PER_SEC)
+               if duration > 0 else _REENCODE_TIMEOUT_UNKNOWN_DURATION)
+
+    jobs.report_reencode_progress(path_str, percent=0 if duration > 0 else None)
+
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=str(dest.parent), suffix='.tmp', prefix='reencode-',
+    )
+    os.close(tmp_fd)
+    try:
+        returncode, timed_out, stderr_tail = _run_reencode(
+            path_str, path, tmp_path, duration, timeout)
+        if returncode != 0:
+            if timed_out:
+                reason = f'timed out after {timeout:.0f}s'
+            else:
+                tail = ' '.join(line.strip() for line in stderr_tail)[-200:]
+                reason = f'ffmpeg exited {returncode}' + (f': {tail}' if tail else '')
+            logger.warning('reencode failed for %s (%s)', path, reason)
+            jobs.report_reencode_progress(path_str, error=reason)
+            return False
+        if not path.exists():
+            # Source vanished mid-encode; discard rather than leave an
+            # orphaned cache file with no source left to invalidate it.
+            return False
+        os.replace(tmp_path, str(dest))
+        jobs.report_reencode_progress(path_str, percent=100)
+        return True
+    except OSError as e:
+        logger.warning('reencode OSError for %s: %s', path, e)
+        jobs.report_reencode_progress(path_str, error=str(e) or e.__class__.__name__)
+        return False
+    finally:
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _run_reencode(path_str, path, tmp_path, duration, timeout):
+    """Run the encode, streaming ffmpeg's -progress output into the job's
+    live status. Returns (returncode, timed_out, stderr_tail).
+
+    Both pipes are drained concurrently — stdout here, stderr on a helper
+    thread — because leaving either unread risks filling its OS buffer and
+    deadlocking ffmpeg against a reader blocked on the other one. (The live
+    path in _serve_transcoded leaves stderr undrained; don't copy that.)
+    """
+    cmd = [
+        'ffmpeg', '-i', str(path),
+        '-c:v', 'libx264', '-preset', 'medium', '-pix_fmt', 'yuv420p', '-crf', '23',
+        '-c:a', 'aac', '-b:a', '160k',
+        '-movflags', '+faststart',
+        # -nostats is required alongside -progress: ffmpeg's human-readable
+        # stats line is governed by -stats/-nostats, not by -loglevel.
+        '-f', 'mp4', '-loglevel', 'error', '-nostats',
+        '-progress', 'pipe:1', '-y', tmp_path,
+    ]
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding='utf-8', errors='replace',
+    )
+
+    timed_out = threading.Event()
+
+    def _kill():
+        timed_out.set()
+        proc.kill()
+
+    watchdog = threading.Timer(timeout, _kill)
+    watchdog.daemon = True
+    watchdog.start()
+
+    stderr_tail = collections.deque(maxlen=_REENCODE_STDERR_TAIL)
+
+    def _drain_stderr():
+        try:
+            for line in proc.stderr:
+                stderr_tail.append(line)
+        except (ValueError, OSError):
+            pass
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    scratch = {}
+    last_report = 0.0
+    try:
+        for line in proc.stdout:
+            block = _parse_progress_line(line, scratch)
+            if block is None:
+                continue
+            now = time.monotonic()
+            if now - last_report < _REENCODE_PROGRESS_MIN_INTERVAL:
+                continue
+            last_report = now
+            elapsed, speed = _progress_block_to_metrics(block)
+            percent = None
+            eta = None
+            if elapsed is not None and duration > 0:
+                percent = int(min(99, elapsed * 100 / duration))
+                if speed and speed > 0:
+                    eta = max(0.0, (duration - elapsed) / speed)
+            jobs.report_reencode_progress(
+                path_str, percent=percent, speed=speed, eta=eta)
+    except (ValueError, OSError):
+        pass
+    finally:
+        watchdog.cancel()
+        returncode = proc.wait()
+        stderr_thread.join(timeout=5)
+
+    return returncode, timed_out.is_set(), list(stderr_tail)
+
+
+def _scan_for_reencode(directory, videos, dir_mtime_ns):
+    """Background worker: enqueue any video whose transcode plan is
+    'reencode' and that doesn't already have a fresh cache."""
+    try:
+        for v in videos:
+            video_path = Path(directory) / v['name']
+            try:
+                if not video_path.is_file():
+                    continue
+            except OSError:
+                continue
+            if _cached_transcode(video_path) is not None:
+                continue
+            if _transcode_plan(video_path) != 'reencode':
+                continue
+            jobs.enqueue_reencode(str(video_path))
+        jobs.ensure_reencode_worker()
+    finally:
+        jobs.mark_dir_scanned(str(directory), dir_mtime_ns)
+        jobs.reencode_scan_jobs.discard(str(directory))
+
+
+MAX_TREE_SCAN_VIDEOS = 5000  # the real cost driver: up to 2 ffprobe spawns
+                             # per uncached video
+
+
+def _scan_tree_for_reencode(root, rel_path, job):
+    """Background worker: recursively find videos needing a re-encode across
+    rel_path's whole directory tree, filling `job` in place so the UI can poll
+    live progress. Deliberately never enqueues — confirm-then-queue is a
+    separate, explicit step so a misclick can't start hours of CPU work.
+
+    Only this thread writes to `job` while it runs (guaranteed by
+    claim_tree_scan_job), so no lock is needed — the same convention the
+    tag/download progress dicts already use.
+    """
+    from simpleparty.library import walk_video_tree
+
+    stats = {}
+    try:
+        for _dir_rel, resolved_dir, videos in walk_video_tree(root, rel_path, stats=stats):
+            try:
+                dir_mtime_ns = resolved_dir.stat().st_mtime_ns
+            except OSError:
+                dir_mtime_ns = None
+            dir_complete = True
+            for name, _size, _mtime in videos:
+                if job['scanned_videos'] >= MAX_TREE_SCAN_VIDEOS:
+                    job['truncated'] = True
+                    dir_complete = False
+                    break
+                job['scanned_videos'] += 1
+                video_path = resolved_dir / name
+                if _cached_transcode(video_path) is not None:
+                    continue
+                if _transcode_plan(video_path) != 'reencode':
+                    continue
+                job['found'].append(str(video_path))
+            job['scanned_dirs'] = stats['dirs_visited']
+            # Only record the directory as scanned-at-this-mtime if its whole
+            # video list was inspected, so a truncated scan can't permanently
+            # suppress the automatic scanner from revisiting the tail.
+            if dir_complete and dir_mtime_ns is not None:
+                jobs.mark_dir_scanned(str(resolved_dir), dir_mtime_ns)
+            if job['truncated']:
+                break
+        job['truncated'] = job['truncated'] or stats.get('truncated', False)
+        job['skipped_locked'] = stats.get('dirs_locked_skipped', 0)
+        job['skipped_unreadable'] = stats.get('dirs_unreadable_skipped', 0)
+    except Exception as e:
+        logger.exception('tree reencode scan failed for %s', rel_path)
+        job['error'] = str(e) or e.__class__.__name__
+    finally:
+        job['running'] = False
+        job['finished_at'] = time.time()
+
+
+def _maybe_start_reencode_scan(directory, videos):
+    """Spawn a background scan that enqueues 'reencode'-plan videos lacking a
+    fresh cache. Gated on has_ffmpeg specifically (not vlc), matching how
+    _maybe_start_thumbs gates solely on has_ffmpeg.
+
+    Re-scans are throttled on the directory's own mtime (has anything been
+    added/removed/renamed since the last scan?) rather than re-run on every
+    call: _transcode_plan does a real file read (_is_mpegts) per .mp4 plus
+    ffprobe for anything not yet in _probe_cache, and the browse page's
+    duration-probe-style 4s poll would otherwise re-run that over every
+    video in the directory for as long as any encode is in flight.
+    """
+    if not (_config['has_ffmpeg'] and _config['allow_transcode']
+            and _config.get('allow_pretranscode', True) and videos):
+        return
+    dir_str = str(directory)
+    try:
+        dir_mtime_ns = Path(directory).stat().st_mtime_ns
+    except OSError:
+        return
+    with jobs.job_sets_lock:
+        last = jobs.reencode_scanned_at.get(dir_str)
+    if last == dir_mtime_ns:
+        return  # nothing added/removed since the last scan
+    if not jobs.try_claim(jobs.reencode_scan_jobs, dir_str):
+        return
+    threading.Thread(
+        target=_scan_for_reencode, args=(directory, videos, dir_mtime_ns), daemon=True,
+    ).start()
 
 
 # --- Duration probing ---

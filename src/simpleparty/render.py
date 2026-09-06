@@ -234,9 +234,10 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
         shuffle_url = url_for_shuffle(data['path'], view)
         shuffle_btn = f'<a class="btn btn-primary" href="{esc(shuffle_url)}">{icon("shuffle")} Shuffle Play</a>'
     has_tags = bool(tags_map) and any(e.get('tags') for e in tags_map.values())
+    want_tree_scan = _reencode_gate_ok() and bool(data['videos'] or data['dirs'])
     want_action_bar = bool(shuffle_btn) or (
         _config.get('allow_download') and (data['videos'] or data['dirs'])
-    ) or (_config['allow_tag'] and has_tags)
+    ) or (_config['allow_tag'] and has_tags) or want_tree_scan
     embed_missing = frozenset()
     if want_action_bar:
         tag_controls_html = ''
@@ -295,6 +296,11 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
             lib_groups += f'<div class="lib-group">{download_inner_html}</div>'
         if manage_html:
             lib_groups += f'<div class="lib-group">{manage_html}</div>'
+        if want_tree_scan:
+            lib_groups += (
+                f'<div class="lib-group">'
+                f'{_render_tree_scan_trigger(data["path"])}</div>'
+            )
         toolbar_view = f'<div class="toolbar-view">{shuffle_btn}{sort_html}</div>'
         toolbar_lib = f'<div class="toolbar-lib">{lib_groups}</div>' if lib_groups else ''
         pieces.append(
@@ -306,7 +312,8 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
         )
 
     for d in data['dirs']:
-        if d['encrypted'] and not d['unlocked']:
+        locked = d['encrypted'] and not d['unlocked']
+        if locked:
             dir_icon = icon('lock')
             state = ' <span class="visually-hidden">(encrypted, locked)</span>'
         elif d['encrypted']:
@@ -315,12 +322,19 @@ def render_file_list(data, view, current_idx=-1, show_shuffle=True, tags_map=Non
         else:
             dir_icon = icon('folder')
             state = ''
+        # A div wrapping the link (rather than the whole row being one <a>)
+        # so the per-folder scan button is valid HTML beside it — same shape
+        # render_video_item uses for its delete form.
+        pieces.append('<div class="item item-dir">')
         pieces.append(
-            f'<a class="item" href="{esc(url_for_browse(d["path"]))}">'
+            f'<a class="item-link-dir" href="{esc(url_for_browse(d["path"]))}">'
             f'<span class="item-icon" aria-hidden="true">{dir_icon}</span>'
             f'<span class="item-name">{esc(d["name"])}{state}</span>'
             f'</a>'
         )
+        if _reencode_gate_ok() and not locked:
+            pieces.append(_render_row_scan_trigger(d['path'], d['name']))
+        pieces.append('</div>')
 
     pieces.append(render_video_items(
         data, view, 0,
@@ -706,6 +720,10 @@ def render_browse_page(data, view, tags_map=None, lower_index=None, thumbs=froze
             f'hx-select="#browse-content" hx-swap="outerHTML">'
             f'{icon("clock")} Calculating video lengths\u2026</div>'
         )
+    # Live re-encode progress. Unlike duration_pending above, this polls a
+    # dedicated endpoint rather than re-fetching all of #browse-content \u2014
+    # a whole-list re-render every couple of seconds would be far too heavy.
+    body += render_reencode_panel(data['path'])
     body += render_tag_filter(
         tags_map, view, data['path'],
         filtered_count=len(data['videos']),
@@ -889,14 +907,24 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
     body = render_nav(data['path'], data.get('encryptedDir'))
     body += '<main id="main">'
     if transcode_plan == 'reencode':
-        body += (
-            '<div id="transcode-notice" role="status">'
-            f'<span>{icon("gear")} Re-encoding this video in real time (source codec not '
-            'supported by your browser); start-up and seeking may be slower.</span>'
-            '<button type="button" class="tn-close" aria-label="Dismiss notice" '
-            'onclick="this.parentNode.remove()">\u00d7</button>'
-            '</div>'
-        )
+        # When a background encode is tracked for this video, the live-polling
+        # panel supersedes the static banner (it reports queue position or
+        # percent, and offers a reload once the cache lands).
+        # The panel returns '' when there's no tracked state, so a video
+        # queued explicitly under --no-pretranscode still gets live progress
+        # while an untracked one falls back to the static banner.
+        panel = render_reencode_panel(data['path'], video=v['name'])
+        if panel:
+            body += panel
+        else:
+            body += (
+                '<div id="transcode-notice" role="status">'
+                f'<span>{icon("gear")} Re-encoding this video in real time (source codec not '
+                f'supported by your browser); start-up and seeking may be slower.</span>'
+                '<button type="button" class="tn-close" aria-label="Dismiss notice" '
+                'onclick="this.parentNode.remove()">\u00d7</button>'
+                '</div>'
+            )
     body += (
         f'<div id="player-area">'
         f'<video id="video" src="{esc(video_src)}" controls playsinline autoplay></video>'
@@ -1032,6 +1060,281 @@ def render_play_page(data, idx, next_url, prev_url, shuffle_url, is_shuffled, po
 
     return render_page(f'SimpleParty \u2014 {v["name"]}', body)
 
+
+
+# --- Re-encode progress + recursive scan ---
+
+def _reencode_gate_ok():
+    """Whether re-encode affordances should render at all. Deliberately not
+    gated on allow_pretranscode — that flag only stops *automatic* work; the
+    explicit folder buttons stay available."""
+    return _config.get('has_ffmpeg') and _config.get('allow_transcode')
+
+
+def _reencode_queue_position(order, current, path):
+    """1-based rank of `path` among everything that must finish before it:
+    the currently-encoding item, plus everyone ahead of it in the queue.
+    None if `path` isn't pending (already encoding, done, or unknown)."""
+    try:
+        idx = order.index(path)
+    except ValueError:
+        return None
+    return (1 if current is not None else 0) + idx + 1
+
+
+def _reencode_detail(entry):
+    """The '42% · 1.8x · ETA 1m 12s' line for an encoding item. Falls back to
+    elapsed-free text when duration was unprobeable, rather than inventing a
+    percentage."""
+    bits = []
+    percent = entry.get('percent')
+    if percent is not None:
+        bits.append(f'{percent}%')
+    speed = entry.get('speed')
+    if speed:
+        bits.append(f'{speed:g}x')
+    eta = _render_eta(entry.get('eta'))
+    if eta:
+        bits.append(f'ETA {eta}')
+    return ' · '.join(bits)
+
+
+def render_reencode_panel(rel_path, *, video=None):
+    """Self-polling re-encode progress fragment, shared by the initial page
+    render and every poll of /reencode-status (same idiom as
+    render_download_status).
+
+    rel_path -- directory to scope to. Without `video` this covers the whole
+                subtree, so a parent shows progress for work queued in its
+                descendants.
+    video    -- basename, for the play page's single-video banner.
+    """
+    if not _reencode_gate_ok():
+        return ''
+    order, status, current = jobs.reencode_snapshot()
+    resolved_dir = resolve_path(_config.get('root', '.'), rel_path)
+    status_url = '/reencode-status?' + urllib.parse.urlencode(
+        {'path': rel_path, **({'video': video} if video else {})})
+
+    if video is not None:
+        target = str(Path(resolved_dir) / video)
+        return _render_reencode_banner(
+            status_url, target, order, status.get(target), current)
+
+    # Subtree scope. Path.is_relative_to compares components, so a sibling
+    # like /a/bc is never matched for /a/b the way str.startswith would.
+    def _in_scope(p):
+        try:
+            return Path(p).is_relative_to(resolved_dir)
+        except (ValueError, OSError):
+            return False
+
+    encoding = (current if current is not None
+                and current in status and _in_scope(current) else None)
+    pending = [p for p in order if _in_scope(p)]
+
+    if encoding is None and not pending:
+        return (
+            f'<div id="reencode-progress" class="tag-progress-panel" role="status" '
+            f'aria-live="polite" hx-get="{esc(status_url)}" hx-trigger="every 10s" '
+            f'hx-swap="outerHTML"></div>'
+        )
+
+    if encoding is not None:
+        entry = status.get(encoding, {})
+        name = Path(encoding).name
+        detail = _reencode_detail(entry)
+        more = f' (+{len(pending)} more queued)' if pending else ''
+        percent = entry.get('percent')
+        bar = (
+            f'<div class="tag-progress-bar-wrap">'
+            f'<div class="tag-progress-bar" style="width:{percent}%"></div></div>'
+        ) if percent is not None else ''
+        inner = (
+            f'<span class="tag-progress-phase">{icon("gear")} '
+            f'Optimizing {esc(name)}</span>{bar}'
+            f'<span class="tag-progress-text">{esc(detail + more) if detail else esc("encoding…" + more)}</span>'
+        )
+    else:
+        count = len(pending)
+        label = f'{count} video' + ('' if count == 1 else 's')
+        inner = (
+            f'<span class="tag-progress-phase">{icon("clock")} '
+            f'Optimizing {label} for playback</span>'
+            f'<span class="tag-progress-text">next up: {esc(Path(pending[0]).name)}</span>'
+        )
+
+    clear = (
+        f'<form hx-post="/reencode-clear" style="display:inline" '
+        f'hx-confirm="Clear the entire re-encode queue (all folders)? '
+        f'Anything currently encoding will finish.">'
+        f'<input type="hidden" name="redirect" value="{esc(url_for_browse(rel_path))}">'
+        f'<button type="submit" class="btn">Clear queue</button></form>'
+    ) if pending else ''
+
+    return (
+        f'<div id="reencode-progress" class="tag-progress-panel active" role="status" '
+        f'aria-live="polite" hx-get="{esc(status_url)}" hx-trigger="every 2s" '
+        f'hx-swap="outerHTML">{inner}{clear}</div>'
+    )
+
+
+def _render_reencode_banner(status_url, target, order, entry, current):
+    """The play page's #transcode-notice, driven by one video's state."""
+    close = ('<button type="button" class="tn-close" aria-label="Dismiss notice" '
+             'onclick="this.parentNode.remove()">×</button>')
+    state = (entry or {}).get('state')
+
+    if state == 'done':
+        # Never swap the <video> src mid-session — that would interrupt
+        # playback. Offer the reload instead; on reload handle_play finds the
+        # fresh cache and drops the banner entirely.
+        return (
+            f'<div id="transcode-notice" role="status">'
+            f'<span>{icon("check")} Optimized in the background — it’ll play '
+            f'faster next time you open it.</span> '
+            f'<a class="btn" href="javascript:location.reload()">Reload now</a>'
+            f'{close}</div>'
+        )
+    if state == 'failed':
+        err = (entry or {}).get('error')
+        detail = f' ({esc(err)})' if err else ''
+        return (
+            f'<div id="transcode-notice" role="status">'
+            f'<span>{icon("warning")} Background optimization failed — still '
+            f'playing via live re-encode.{detail}</span>{close}</div>'
+        )
+    if state == 'encoding' and target == current:
+        detail = _reencode_detail(entry or {})
+        percent = (entry or {}).get('percent')
+        bar = (
+            f'<div class="tag-progress-bar-wrap">'
+            f'<div class="tag-progress-bar" style="width:{percent}%"></div></div>'
+        ) if percent is not None else ''
+        return (
+            f'<div id="transcode-notice" role="status" hx-get="{esc(status_url)}" '
+            f'hx-trigger="every 2s" hx-swap="outerHTML">'
+            f'<span>{icon("gear")} Optimizing this video now.</span>{bar}'
+            f'<span class="tag-progress-text">{esc(detail)}</span>{close}</div>'
+        )
+    if state == 'queued':
+        pos = _reencode_queue_position(order, current, target)
+        total = len(order) + (1 if current is not None else 0)
+        where = f' (position {pos} of {total})' if pos else ''
+        return (
+            f'<div id="transcode-notice" role="status" hx-get="{esc(status_url)}" '
+            f'hx-trigger="every 2s" hx-swap="outerHTML">'
+            f'<span>{icon("clock")} Queued for background optimization{where}. '
+            f'Playing via live re-encode meanwhile.</span>{close}</div>'
+        )
+    return ''
+
+
+def _render_tree_scan_trigger(rel_path):
+    return (
+        f'<form class="tree-scan-trigger" hx-post="/reencode-scan" '
+        f'hx-target="this" hx-swap="outerHTML">'
+        f'<input type="hidden" name="path" value="{esc(rel_path)}">'
+        f'<input type="hidden" name="row" value="0">'
+        f'<button type="submit" class="btn" hx-disabled-elt="this">'
+        f'{icon("gear")} Find re-encodes (incl. subfolders)</button></form>'
+    )
+
+
+def _render_row_scan_trigger(rel_path, name):
+    return (
+        f'<form class="tree-scan-trigger row-scan-trigger" hx-post="/reencode-scan" '
+        f'hx-target="this" hx-swap="outerHTML">'
+        f'<input type="hidden" name="path" value="{esc(rel_path)}">'
+        f'<input type="hidden" name="row" value="1">'
+        f'<button type="submit" class="btn-icon-scan" hx-disabled-elt="this" '
+        f'title="Find videos to re-encode in {esc(name)} (incl. subfolders)" '
+        f'aria-label="Find videos to re-encode in {esc(name)} and its subfolders">'
+        f'{icon("gear")}</button></form>'
+    )
+
+
+def render_scan_trigger(rel_path, name='', row=False):
+    """The trigger in whichever form the caller started from — used both for
+    the initial page render and to restore the button after a scan result is
+    dismissed."""
+    return (_render_row_scan_trigger(rel_path, name or Path(rel_path).name or rel_path)
+            if row else _render_tree_scan_trigger(rel_path))
+
+
+def _tree_scan_status_url(rel_path):
+    return '/reencode-scan-status?' + urllib.parse.urlencode({'path': rel_path})
+
+
+def render_tree_scan_widget(rel_path, job, row=False):
+    """Every state of the recursive-scan widget. Self-replaces via
+    hx-target="this", so it doesn't need a page-unique id — important because
+    the action bar and every subfolder row can each have one live at once.
+
+    Dismiss posts back rather than removing the node locally: the trigger form
+    was swapped out to make room for this widget, so a bare .remove() would
+    leave no way to scan that folder again until a full page reload.
+    """
+    status_url = _tree_scan_status_url(rel_path)
+    label = rel_path or 'the whole library'
+    row_flag = '1' if row else '0'
+    dismiss = (
+        f'<form style="display:inline" hx-post="/reencode-scan-dismiss" '
+        f'hx-target="closest .tree-scan-widget" hx-swap="outerHTML">'
+        f'<input type="hidden" name="path" value="{esc(rel_path)}">'
+        f'<input type="hidden" name="row" value="{row_flag}">'
+        f'<button type="submit" class="btn">Dismiss</button></form>'
+    )
+
+    if job is None:
+        return '<div class="tree-scan-widget" hidden></div>'
+    if job.get('error'):
+        return (
+            f'<div class="tree-scan-widget error">{icon("warning")} '
+            f'Scan failed: {esc(job["error"])} {dismiss}</div>'
+        )
+    if job.get('running'):
+        found_n = len(job.get('found', []))
+        so_far = f', {found_n} found so far' if found_n else ''
+        return (
+            f'<div class="tree-scan-widget scanning" hx-get="{esc(status_url)}&amp;row={row_flag}" '
+            f'hx-trigger="every 2s" hx-target="this" hx-swap="outerHTML" '
+            f'role="status" aria-live="polite">{icon("gear")} '
+            f'Scanning {esc(label)}… {job.get("scanned_videos", 0)} videos '
+            f'checked in {job.get("scanned_dirs", 0)} folders{so_far}</div>'
+        )
+    if job.get('confirmed'):
+        n = job.get('queued_count', 0)
+        return (
+            f'<div class="tree-scan-widget queued">{icon("check")} '
+            f'Queued {n} video{"" if n == 1 else "s"} for re-encoding.</div>'
+        )
+
+    notes = []
+    if job.get('skipped_locked'):
+        notes.append(f'{job["skipped_locked"]} locked')
+    if job.get('skipped_unreadable'):
+        notes.append(f'{job["skipped_unreadable"]} unreadable')
+    skipped = f' (skipped {", ".join(notes)})' if notes else ''
+    truncated = (' — stopped early, this tree is larger than the scan limit'
+                 if job.get('truncated') else '')
+    n = len(job.get('found', []))
+    if n == 0:
+        return (
+            f'<div class="tree-scan-widget done">{icon("check")} '
+            f'No videos need re-encoding in {esc(label)}{skipped}{truncated}. '
+            f'{dismiss}</div>'
+        )
+    return (
+        f'<div class="tree-scan-widget found">{icon("gear")} '
+        f'Found {n} video{"" if n == 1 else "s"} needing re-encode in '
+        f'{esc(label)}{skipped}{truncated}. '
+        f'<form style="display:inline" hx-post="/reencode-scan-confirm" '
+        f'hx-target="closest .tree-scan-widget" hx-swap="outerHTML">'
+        f'<input type="hidden" name="path" value="{esc(rel_path)}">'
+        f'<button type="submit" class="btn btn-primary" hx-disabled-elt="this">'
+        f'Queue all</button></form> {dismiss}</div>'
+    )
 
 
 def render_download_form(target_rel='', *, autofocus=False):

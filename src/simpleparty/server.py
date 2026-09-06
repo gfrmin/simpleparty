@@ -57,6 +57,9 @@ def main():
     parser.add_argument('-b', '--bind', default='0.0.0.0', help='Bind address (default: 0.0.0.0)')
     parser.add_argument('--no-delete', action='store_true', help='Disable video deletion')
     parser.add_argument('--no-transcode', action='store_true', help='Disable ffmpeg/VLC transcoding')
+    parser.add_argument('--no-pretranscode', action='store_true',
+                        help='Disable automatic background pre-transcoding. Live transcoding '
+                             'and the explicit per-folder re-encode buttons still work.')
     parser.add_argument('--no-tag', action='store_true', help='Disable all tagging features')
     parser.add_argument('--max-tags', type=int, default=10, help='Max tags per video when suggesting (default: 10)')
     parser.add_argument('--no-download', action='store_true', help='Disable URL download feature')
@@ -86,6 +89,7 @@ def main():
     _config['has_vlc'] = shutil.which('cvlc') is not None
     _config['allow_delete'] = not args.no_delete
     _config['allow_transcode'] = not args.no_transcode
+    _config['allow_pretranscode'] = not args.no_pretranscode
 
     _config['root'] = root
     _config['max_tags'] = args.max_tags
@@ -104,6 +108,8 @@ def main():
     if _config['allow_transcode']:
         if _config['has_ffmpeg']:
             features.append('transcode: ffmpeg')
+            if _config['allow_pretranscode']:
+                features.append('pretranscode: on')
         elif _config['has_vlc']:
             features.append('transcode: vlc')
     if _config['allow_delete']:

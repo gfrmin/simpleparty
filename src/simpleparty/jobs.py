@@ -4,6 +4,7 @@ All cross-thread mutable state lives here, separate from the write-once
 settings in simpleparty.state.CONFIG.
 """
 
+import collections
 import logging
 import queue
 import threading
@@ -20,17 +21,34 @@ _tag_jobs_lock = threading.Lock()
 
 thumb_jobs = set()  # directories currently generating thumbs
 duration_jobs = set()  # directories currently probing durations
-_job_sets_lock = threading.Lock()
+reencode_scan_jobs = set()  # directories currently being scanned for reencode candidates
+reencode_scanned_at = {}  # dir str -> dir mtime_ns as of the last completed scan
+job_sets_lock = threading.Lock()
+
+
+_SCANNED_AT_MAX = 4096  # one entry per directory ever scanned; a recursive
+                        # tree scan can add thousands in a single request
 
 
 def try_claim(job_set, key):
     """Atomically claim a job slot. Returns False if already claimed —
     prevents concurrent requests from spawning duplicate workers."""
-    with _job_sets_lock:
+    with job_sets_lock:
         if key in job_set:
             return False
         job_set.add(key)
         return True
+
+
+def mark_dir_scanned(dir_str, mtime_ns):
+    """Record a directory as fully scanned at `mtime_ns`, evicting the oldest
+    entries past the cap. Losing an old entry only costs a redundant re-scan
+    later, so oldest-first is safe."""
+    with job_sets_lock:
+        reencode_scanned_at.pop(dir_str, None)  # re-insert so it counts as newest
+        reencode_scanned_at[dir_str] = mtime_ns
+        while len(reencode_scanned_at) > _SCANNED_AT_MAX:
+            reencode_scanned_at.pop(next(iter(reencode_scanned_at)))
 
 download_queue = None          # queue.Queue[str], lazy
 download_jobs = {}             # job_id -> job dict (see new_download_job)
@@ -190,3 +208,237 @@ def snapshot_download_jobs():
 
 def any_download_running(jobs):
     return any(j.get('running') for j in jobs.values())
+
+
+# --- Background re-encode queue ---
+#
+# A deque (not queue.Queue) so a video can be reprioritized to the front
+# when someone opens it, without disturbing the rest of the pending order.
+# Single worker by design: re-encoding is CPU-heavy, and running several at
+# once would just make every one of them slower.
+
+reencode_queue = collections.deque()  # pending path strs, head = next up
+reencode_status = {}  # path str -> {'state','queued_at','started_at','finished_at','error'}
+reencode_current = None  # path str currently encoding, or None
+_reencode_lock = threading.Lock()
+_reencode_cv = threading.Condition(_reencode_lock)
+reencode_worker = None  # threading.Thread, lazy
+
+
+def enqueue_reencode(path):
+    """Idempotently append `path` to the tail of the reencode queue.
+
+    No-op if `path` already has any status (queued/encoding/done/failed) or
+    is the item currently encoding — terminal states are sticky, there is no
+    automatic retry of a failed encode.
+    """
+    path = str(path)
+    with _reencode_lock:
+        if path in reencode_status or path == reencode_current:
+            return
+        reencode_queue.append(path)
+        reencode_status[path] = {
+            'state': 'queued', 'queued_at': time.time(),
+            'started_at': None, 'finished_at': None, 'error': None,
+            'percent': None, 'speed': None, 'eta': None,
+        }
+        _reencode_cv.notify()
+
+
+def prioritize_reencode(path):
+    """Move `path` to the head of the queue, inserting it fresh if it hasn't
+    been seen before. No-op if it's already encoding (no mid-encode
+    preemption) or already done/failed."""
+    path = str(path)
+    with _reencode_lock:
+        if path == reencode_current:
+            return
+        status = reencode_status.get(path)
+        if status is not None and status['state'] in ('done', 'failed'):
+            return
+        try:
+            reencode_queue.remove(path)
+        except ValueError:
+            pass
+        reencode_queue.appendleft(path)
+        if status is None:
+            reencode_status[path] = {
+                'state': 'queued', 'queued_at': time.time(),
+                'started_at': None, 'finished_at': None, 'error': None,
+                'percent': None, 'speed': None, 'eta': None,
+            }
+        else:
+            status['state'] = 'queued'
+        _reencode_cv.notify()
+
+
+def _reencode_worker_loop():
+    global reencode_current
+    from simpleparty import media as _media
+    while True:
+        with _reencode_lock:
+            while not reencode_queue:
+                _reencode_cv.wait()
+            path = reencode_queue.popleft()
+            reencode_current = path
+            reencode_status.setdefault(path, {})
+            reencode_status[path]['state'] = 'encoding'
+            reencode_status[path]['started_at'] = time.time()
+
+        ok = False
+        error = None
+        try:
+            ok = _media._reencode_video(path)
+        except Exception as e:
+            logger.exception('reencode worker: unexpected failure for %s', path)
+            error = str(e) or e.__class__.__name__
+        finally:
+            with _reencode_lock:
+                status = reencode_status.setdefault(path, {})
+                status['state'] = 'done' if ok else 'failed'
+                status['finished_at'] = time.time()
+                if error is not None:
+                    status['error'] = error
+                elif ok:
+                    status['error'] = None
+                # else: an ordinary False return, not an exception. Leave
+                # whatever _reencode_video recorded via
+                # report_reencode_progress() instead of clobbering the only
+                # explanation the UI has for the failure.
+                reencode_current = None
+                _evict_reencode_status()
+
+
+def ensure_reencode_worker():
+    """Create the daemon worker on first use (mirrors ensure_download_worker)."""
+    global reencode_worker
+    with _reencode_lock:
+        if reencode_worker is None or not reencode_worker.is_alive():
+            t = threading.Thread(target=_reencode_worker_loop, daemon=True)
+            reencode_worker = t
+            t.start()
+
+
+def report_reencode_progress(path, *, percent=None, speed=None, eta=None, error=None):
+    """Update live progress fields for an in-flight re-encode.
+
+    `None` means "leave unchanged" — a given encode's duration is either known
+    or unknown for its whole run, so callers never need to clear a field back
+    to None mid-stream.
+
+    Called from media._reencode_video on the single re-encode worker thread,
+    so there is never a write-write race; the lock is held so HTTP reader
+    threads in reencode_snapshot() never see a half-updated set of fields.
+    No-op for an unknown path (defensive: the worker always creates the entry
+    before calling into the encoder).
+    """
+    path = str(path)
+    with _reencode_lock:
+        status = reencode_status.get(path)
+        if status is None:
+            return
+        if percent is not None:
+            status['percent'] = percent
+        if speed is not None:
+            status['speed'] = speed
+        if eta is not None:
+            status['eta'] = eta
+        if error is not None:
+            status['error'] = error
+
+
+def reencode_snapshot():
+    """Consistent snapshot of the re-encode queue, mirroring
+    snapshot_download_jobs() so render.py never touches the lock itself.
+
+    Returns (order, status, current):
+      order   -- pending path strs in queue order, head first (excludes the
+                 path currently encoding)
+      status  -- deep-ish copy of reencode_status (each value dict copied)
+      current -- the path presently encoding, or None
+    """
+    with _reencode_lock:
+        order = list(reencode_queue)
+        status = {p: dict(s) for p, s in reencode_status.items()}
+        current = reencode_current
+    return order, status, current
+
+
+_REENCODE_STATUS_MAX = 500  # finished (done/failed) entries retained
+
+
+def _evict_reencode_status():
+    """Drop the oldest finished entries beyond the cap. Caller holds
+    _reencode_lock. Queued/encoding entries are never evicted, however many
+    there are — only completed history is trimmed."""
+    finished = [(p, s) for p, s in reencode_status.items()
+                if s.get('state') in ('done', 'failed')]
+    excess = len(finished) - _REENCODE_STATUS_MAX
+    if excess <= 0:
+        return
+    finished.sort(key=lambda kv: kv[1].get('finished_at') or 0)
+    for p, _ in finished[:excess]:
+        reencode_status.pop(p, None)
+
+
+# --- Recursive tree-scan jobs ---
+#
+# Deliberately a separate store from the single-directory reencode_scan_jobs
+# set: the automatic per-directory scan and an explicit tree scan of the same
+# directory must be able to run concurrently without contending for a claim.
+
+_tree_scan_jobs = {}  # resolved root dir str -> job dict
+_tree_scan_jobs_lock = threading.Lock()
+_TREE_SCAN_JOBS_MAX = 32  # entries can hold thousands of path strings
+
+
+def new_tree_scan_job():
+    return {
+        'running': True, 'started_at': time.time(), 'finished_at': None,
+        'scanned_dirs': 0, 'scanned_videos': 0, 'found': [],
+        'skipped_locked': 0, 'skipped_unreadable': 0, 'truncated': False,
+        'error': None, 'confirmed': False, 'queued_count': 0,
+    }
+
+
+def get_tree_scan_job(resolved_dir):
+    with _tree_scan_jobs_lock:
+        return _tree_scan_jobs.get(str(resolved_dir))
+
+
+def claim_tree_scan_job(resolved_dir, job):
+    """Install `job` unless a scan is already running for this directory.
+    Returns False when one is (render the existing job instead of spawning a
+    second thread). Re-scanning a directory whose previous scan finished is
+    allowed — clicking again after dismissing should get a fresh result, not
+    a replayed stale one."""
+    key = str(resolved_dir)
+    with _tree_scan_jobs_lock:
+        existing = _tree_scan_jobs.get(key)
+        if existing and existing.get('running'):
+            return False
+        _tree_scan_jobs[key] = job
+        while len(_tree_scan_jobs) > _TREE_SCAN_JOBS_MAX:
+            _tree_scan_jobs.pop(next(iter(_tree_scan_jobs)))
+        return True
+
+
+def drop_tree_scan_job(resolved_dir):
+    """Forget a finished scan's result (and its retained path list)."""
+    with _tree_scan_jobs_lock:
+        _tree_scan_jobs.pop(str(resolved_dir), None)
+
+
+def clear_pending_reencodes():
+    """Drop every queued (not-yet-started) re-encode, returning how many.
+
+    The item currently encoding is left to finish: _reencode_video has no
+    cooperative-cancellation hook, so stopping it would mean killing an
+    ffmpeg subprocess mid-write.
+    """
+    with _reencode_lock:
+        dropped = list(reencode_queue)
+        reencode_queue.clear()
+        for p in dropped:
+            reencode_status.pop(p, None)
+        return len(dropped)

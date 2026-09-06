@@ -16,6 +16,7 @@ CONFIG = {
     'has_ytdlp': False,
     'allow_delete': True,
     'allow_transcode': True,
+    'allow_pretranscode': True,
     'allow_tag': True,
     'has_tagger': False,
     'allow_download': False,

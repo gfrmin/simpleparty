@@ -232,6 +232,81 @@ def get_fscrypt_status(dir_path):
     return status if status is not None else _cli_fscrypt_status(dir_path)
 
 
+MAX_WALK_DIRS = 20000  # pathological-tree guard; a directory costs one
+                       # listdir + stat + ioctl, so normal libraries never
+                       # come close.
+
+
+def walk_video_tree(root, rel_path, stats=None, max_dirs=MAX_WALK_DIRS):
+    """Walk rel_path and every descendant directory beneath it, yielding
+    (dir_rel_path, resolved_dir, videos) per directory actually visited.
+    `videos` is scan_directory()'s [(name, size, mtime), ...].
+
+    The rest of the app lists one directory per request and lets the browser
+    recurse by clicking, so this is the only recursive traversal in the
+    codebase — and it has to hand-roll three things a bare os.walk gets
+    wrong:
+
+      * Dot-directories are skipped (via scan_directory), keeping
+        .simpleparty/{transcoded,frames,thumbs} and .git out of the walk.
+        Without this a re-encode scan would find its own output.
+      * Locked fscrypt subtrees are skipped rather than descended into. A
+        locked directory is still isdir()-true and listable, but its entries
+        are ciphertext names whose contents can't be read.
+      * Symlinked subdirectories are never descended into, so there are no
+        loops and no escaping the tree sideways.
+
+    `stats`, if given, is mutated in place as the walk proceeds so a caller
+    can report live progress: dirs_visited, dirs_locked_skipped,
+    dirs_unreadable_skipped, truncated.
+    """
+    if stats is None:
+        stats = {}
+    stats.setdefault('dirs_visited', 0)
+    stats.setdefault('dirs_locked_skipped', 0)
+    stats.setdefault('dirs_unreadable_skipped', 0)
+    stats.setdefault('truncated', False)
+
+    if not is_safe_rel_path(rel_path):
+        return
+    root_resolved = Path(root).resolve()
+    start = resolve_path(root, rel_path)
+    # is_safe_rel_path is only lexical and resolve_path follows symlinks, so
+    # a symlinked rel_path could still land outside root. This walk can cause
+    # writes into many .simpleparty/transcoded/ dirs, so confirm containment.
+    if start != root_resolved and root_resolved not in start.parents:
+        return
+
+    stack = [(rel_path, start)]
+    while stack:
+        if stats['dirs_visited'] >= max_dirs:
+            stats['truncated'] = True
+            return
+        cur_rel, cur_resolved = stack.pop()
+
+        status = get_fscrypt_status(cur_resolved)
+        if status['encrypted'] and not status['unlocked']:
+            stats['dirs_locked_skipped'] += 1
+            continue
+
+        scanned = scan_directory(cur_resolved)
+        if scanned is None:
+            stats['dirs_unreadable_skipped'] += 1
+            continue
+        videos, dir_names = scanned
+        stats['dirs_visited'] += 1
+        yield cur_rel, cur_resolved, videos
+
+        for name in reversed(dir_names):  # reversed so pop() visits in order
+            child = cur_resolved / name
+            try:
+                if child.is_symlink():
+                    continue
+            except OSError:
+                continue
+            stack.append((os.path.join(cur_rel, name) if cur_rel else name, child))
+
+
 def has_encrypted_dir(root):
     """True if root or one of its immediate children is encrypted. Lets the
     caller keep advice about installing fscrypt to the people it applies to."""

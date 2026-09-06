@@ -257,14 +257,39 @@ nav{
   gap:var(--space-3);
 }
 
-/* Directory rows — span all grid columns */
+/* Directory rows — span all grid columns. A div wrapping an inner link
+   (rather than the row being one big <a>) so a per-folder action button can
+   sit beside it as valid HTML. */
 .item:not(.item-video){
   grid-column:1/-1;display:flex;align-items:center;gap:var(--space-3);
   background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);
   padding:var(--space-3) var(--space-4);min-height:48px;width:100%;
   transition:background .15s,border-color .15s;min-width:0;overflow:hidden;
+  flex-wrap:wrap;
 }
 .item:not(.item-video):hover{background:var(--surface-hover);border-color:var(--border-hover)}
+.item-link-dir{
+  display:flex;align-items:center;gap:var(--space-3);flex:1;min-width:0;
+  text-decoration:none;color:inherit;overflow:hidden;
+}
+
+/* Recursive re-encode scan: trigger + status widget */
+.tree-scan-trigger{display:inline-flex}
+.row-scan-trigger{margin-left:auto;flex-shrink:0}
+.btn-icon-scan{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:32px;height:32px;border:1px solid var(--border);border-radius:var(--radius-sm);
+  background:none;color:var(--text-muted);cursor:pointer;flex-shrink:0;
+}
+.btn-icon-scan:hover{background:var(--surface-hover);color:var(--accent-hover)}
+.tree-scan-widget{
+  display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap;flex-basis:100%;
+  font-size:var(--text-sm);color:var(--text-muted);
+}
+.tree-scan-widget.done,.tree-scan-widget.found{color:var(--text)}
+.tree-scan-widget.error{color:var(--danger)}
+#reencode-progress:empty{display:none}
+#reencode-progress:not(:empty){padding:var(--space-2) var(--space-4)}
 .item-icon{font-size:20px;flex-shrink:0;line-height:1;color:var(--accent-hover)}
 .item-name{
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;

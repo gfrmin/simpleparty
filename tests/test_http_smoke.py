@@ -8,8 +8,10 @@ ThreadedServer bound to an ephemeral port on a tmp directory.
 
 import http.client
 import json
+import os
 import re
 import threading
+import time
 import urllib.parse
 from functools import partial
 
@@ -449,6 +451,67 @@ def test_video_missing_404(srv):
     assert status == 404
 
 
+def _write_cache(media_root, mtime):
+    cache_dir = media_root / '.simpleparty' / 'transcoded'
+    cache_dir.mkdir(parents=True)
+    cache_file = cache_dir / 'a.mp4.mp4'
+    cache_file.write_bytes(b'\xff' * 4096)
+    os.utime(cache_file, (mtime, mtime))
+    return cache_file
+
+
+def test_video_serves_fresh_cache(srv, media_root, monkeypatch):
+    from simpleparty import routes as sp_routes
+    sp_server._config['has_ffmpeg'] = True
+    sp_server._config['allow_transcode'] = True
+
+    def _boom(*a, **k):
+        raise AssertionError('_serve_transcoded should not run when a fresh cache exists')
+    # routes.py did `from simpleparty.media import _serve_transcoded`, which
+    # bound its own name, so it must be patched there, not on media itself.
+    monkeypatch.setattr(sp_routes, '_serve_transcoded', _boom)
+
+    _write_cache(media_root, time.time() + 10)
+
+    status, headers, body = request(srv, 'GET', '/video/a.mp4')
+    assert status == 200
+    assert headers['Content-Length'] == '4096'
+    assert headers['Content-Type'] == 'video/mp4'
+    assert body == b'\xff' * 4096
+
+
+def test_video_serves_fresh_cache_range(srv, media_root):
+    sp_server._config['has_ffmpeg'] = True
+    sp_server._config['allow_transcode'] = True
+
+    _write_cache(media_root, time.time() + 10)
+
+    status, headers, body = request(
+        srv, 'GET', '/video/a.mp4', headers={'Range': 'bytes=0-99'},
+    )
+    assert status == 206
+    assert headers['Content-Range'] == 'bytes 0-99/4096'
+    assert len(body) == 100
+    assert body == b'\xff' * 100
+
+
+def test_video_ignores_stale_cache(srv, media_root, monkeypatch):
+    from simpleparty import routes as sp_routes
+    sp_server._config['has_ffmpeg'] = True
+    sp_server._config['allow_transcode'] = True
+    # Isolate "stale cache is ignored" from real codec-detection logic.
+    # routes.py did `from simpleparty.media import _transcode_plan`, which
+    # bound its own name, so it must be patched there, not on media itself.
+    monkeypatch.setattr(sp_routes, '_transcode_plan', lambda path: None)
+
+    _write_cache(media_root, 0)  # far older than a.mp4
+
+    status, headers, body = request(srv, 'GET', '/video/a.mp4')
+    assert status == 200
+    assert headers['Content-Length'] == '1024'
+    assert body == b'\x00' * 1024
+
+
 # --- Unknown routes ---
 
 def test_unknown_get_404(srv):
@@ -482,6 +545,35 @@ def test_delete_disabled_403(srv, media_root):
 def test_delete_invalid_path_400(srv):
     status, _, _ = post_form(srv, '/delete', {'path': 'nope.mp4'})
     assert status == 400
+
+
+def test_delete_removes_the_cached_transcode(srv, media_root):
+    """A pre-transcode cache entry is a whole second copy of the video, so
+    leaving it behind after a delete silently keeps the bytes on disk with no
+    source left to ever invalidate or surface it."""
+    from simpleparty import media as sp_media
+    cached = sp_media._transcoded_path(media_root, 'b.mp4')
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(b'\x00' * 64)
+
+    status, _, _ = post_form(srv, '/delete', {'path': 'b.mp4', 'redirect': '/'})
+
+    assert status == 200
+    assert not (media_root / 'b.mp4').exists()
+    assert not cached.exists()
+
+
+def test_delete_by_tag_removes_the_cached_transcode(srv, media_root):
+    from simpleparty import media as sp_media
+    cached = sp_media._transcoded_path(media_root, 'a.mp4')
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(b'\x00' * 64)
+
+    status, _, _ = post_form(srv, '/delete-by-tag', {'path': '', 'tags': 'cat'})
+
+    assert status == 200
+    assert not (media_root / 'a.mp4').exists()
+    assert not cached.exists()
 
 
 # --- Tags ---
@@ -772,3 +864,205 @@ def test_tag_manager_remove_button_visible(srv):
     rule = m.group(1).replace(' ', '')
     assert 'position:static' in rule
     assert 'opacity:1' in rule
+
+
+# --- Re-encode progress + recursive scan ---
+
+@pytest.fixture
+def reencode_on(monkeypatch):
+    """Enable the re-encode affordances and isolate global queue state."""
+    from simpleparty import jobs as sp_jobs
+    sp_server._config['has_ffmpeg'] = True
+    sp_server._config['allow_transcode'] = True
+    sp_server._config['allow_pretranscode'] = True
+    with sp_jobs._reencode_lock:
+        saved = (list(sp_jobs.reencode_queue), dict(sp_jobs.reencode_status),
+                 sp_jobs.reencode_current)
+        sp_jobs.reencode_queue.clear()
+        sp_jobs.reencode_status.clear()
+        sp_jobs.reencode_current = None
+    yield sp_jobs
+    with sp_jobs._reencode_lock:
+        sp_jobs.reencode_queue.clear()
+        sp_jobs.reencode_queue.extend(saved[0])
+        sp_jobs.reencode_status.clear()
+        sp_jobs.reencode_status.update(saved[1])
+        sp_jobs.reencode_current = saved[2]
+
+
+def test_reencode_status_empty_when_transcode_disabled(srv):
+    status, _h, body = request(srv, 'GET', '/reencode-status?path=')
+    assert status == 200 and body == b''
+
+
+def test_reencode_status_reports_encoding_progress(srv, media_root, reencode_on):
+    target = str(media_root / 'a.mp4')
+    with reencode_on._reencode_lock:
+        reencode_on.reencode_status[target] = {
+            'state': 'encoding', 'percent': 42, 'speed': 1.8, 'eta': 30.0,
+            'error': None, 'finished_at': None,
+        }
+        reencode_on.reencode_current = target
+    status, _h, body = request(srv, 'GET', '/reencode-status?path=')
+    text = body.decode()
+    assert status == 200
+    assert 'a.mp4' in text and '42%' in text and '1.8x' in text
+    assert 'width:42%' in text
+
+
+def test_reencode_status_scope_is_not_a_string_prefix(srv, media_root, reencode_on):
+    """Regression: subtree scoping must compare path components, so a sibling
+    directory sharing a string prefix (foo vs foobar) is never conflated."""
+    foo = media_root / 'foo'
+    foobar = media_root / 'foobar'
+    foo.mkdir()
+    foobar.mkdir()
+    (foobar / 'x.mp4').write_bytes(b'x')
+    target = str(foobar / 'x.mp4')
+    with reencode_on._reencode_lock:
+        reencode_on.reencode_queue.append(target)
+        reencode_on.reencode_status[target] = {
+            'state': 'queued', 'percent': None, 'speed': None, 'eta': None,
+            'error': None, 'finished_at': None,
+        }
+
+    _s, _h, in_scope = request(srv, 'GET', '/reencode-status?path=foobar')
+    assert 'x.mp4' in in_scope.decode()
+
+    _s, _h, out_of_scope = request(srv, 'GET', '/reencode-status?path=foo')
+    assert 'x.mp4' not in out_of_scope.decode()
+
+
+def test_reencode_status_single_video_offers_reload_when_done(srv, media_root, reencode_on):
+    target = str(media_root / 'a.mp4')
+    with reencode_on._reencode_lock:
+        reencode_on.reencode_status[target] = {
+            'state': 'done', 'percent': 100, 'speed': None, 'eta': None,
+            'error': None, 'finished_at': 1.0,
+        }
+    _s, _h, body = request(srv, 'GET', '/reencode-status?path=&video=a.mp4')
+    text = body.decode()
+    # Never hot-swaps the <video> src mid-playback; offers a reload instead.
+    assert 'Reload now' in text
+    assert 'location.reload()' in text
+
+
+def test_reencode_scan_cycle(srv, media_root, reencode_on, monkeypatch):
+    from simpleparty import routes as sp_routes
+
+    def fake_scan(root, rel_path, job):
+        job['found'] = [str(media_root / 'a.mp4')]
+        job['scanned_dirs'] = 1
+        job['scanned_videos'] = 1
+        job['running'] = False
+
+    monkeypatch.setattr(sp_routes, '_scan_tree_for_reencode', fake_scan)
+
+    _s, _h, body = post_form(srv, '/reencode-scan', {'path': ''})
+    deadline = time.time() + 5
+    while time.time() < deadline and b'Found' not in body:
+        _s, _h, body = request(srv, 'GET', '/reencode-scan-status?path=')
+        time.sleep(0.02)
+    text = body.decode()
+    assert 'Found 1 video' in text
+    assert 'Queue all' in text
+    # Scanning alone must not enqueue anything.
+    assert list(reencode_on.reencode_queue) == []
+
+    _s, _h, body = post_form(srv, '/reencode-scan-confirm', {'path': ''})
+    assert 'Queued 1 video' in body.decode()
+    # Assert on the status entry, not the queue: the worker starts draining
+    # the queue as soon as it's enqueued, so the deque is legitimately empty
+    # by the time we look. Status is sticky.
+    assert str(media_root / 'a.mp4') in reencode_on.reencode_status
+
+
+def test_reencode_clear_drops_pending(srv, media_root, reencode_on):
+    with reencode_on._reencode_lock:
+        reencode_on.reencode_queue.append('p')
+        reencode_on.reencode_status['p'] = {'state': 'queued', 'finished_at': None}
+    status, headers, _b = post_form(srv, '/reencode-clear', {'redirect': '/'})
+    assert status == 200 and headers.get('HX-Redirect') == '/'
+    assert list(reencode_on.reencode_queue) == []
+
+
+def test_scan_triggers_hidden_without_ffmpeg(srv):
+    _s, _h, body = request(srv, 'GET', '/')
+    assert b'/reencode-scan' not in body
+
+
+def test_scan_triggers_survive_no_pretranscode(srv, reencode_on):
+    """--no-pretranscode stops only the automatic work; the explicit buttons
+    must stay available."""
+    sp_server._config['allow_pretranscode'] = False
+    _s, _h, body = request(srv, 'GET', '/')
+    text = body.decode()
+    assert '/reencode-scan' in text
+    assert 'Find re-encodes' in text
+
+
+def test_scan_refused_for_locked_folder(srv, media_root, reencode_on, monkeypatch):
+    locked = media_root / 'sub'
+
+    def fake_status(p):
+        if str(p) == str(locked.resolve()):
+            return {'encrypted': True, 'unlocked': False}
+        return {'encrypted': False, 'unlocked': True}
+
+    # routes.py binds library functions by name at import, so patch the
+    # binding in routes, not in library.
+    from simpleparty import routes as sp_routes
+    monkeypatch.setattr(sp_routes, 'get_fscrypt_status', fake_status)
+    _s, _h, body = post_form(srv, '/reencode-scan', {'path': 'sub'})
+    assert b'locked' in body.lower()
+
+
+def test_scan_dismiss_restores_the_trigger(srv, media_root, reencode_on, monkeypatch):
+    """Starting a scan swaps the trigger form out for the result widget, so
+    Dismiss must hand the trigger back — otherwise that folder can't be
+    re-scanned without a full page reload."""
+    from simpleparty import routes as sp_routes
+
+    def fake_scan(root, rel_path, job):
+        job['found'] = []
+        job['running'] = False
+
+    monkeypatch.setattr(sp_routes, '_scan_tree_for_reencode', fake_scan)
+
+    _s, _h, body = post_form(srv, '/reencode-scan', {'path': 'sub', 'row': '1'})
+    for _ in range(50):
+        if b'No videos' in body or b'Found' in body:
+            break
+        _s, _h, body = request(srv, 'GET', '/reencode-scan-status?path=sub&row=1')
+        time.sleep(0.02)
+    assert b'Dismiss' in body
+    assert b'/reencode-scan-dismiss' in body
+
+    _s, _h, body = post_form(srv, '/reencode-scan-dismiss', {'path': 'sub', 'row': '1'})
+    text = body.decode()
+    # Back to the per-row gear trigger, ready to scan again.
+    assert 'btn-icon-scan' in text
+    assert 'hx-post="/reencode-scan"' in text
+    assert 'name="row" value="1"' in text
+
+
+def test_scan_dismiss_returns_toolbar_trigger_for_non_row(srv, reencode_on, monkeypatch):
+    from simpleparty import routes as sp_routes
+    monkeypatch.setattr(sp_routes, '_scan_tree_for_reencode',
+                        lambda root, rel, job: job.update(found=[], running=False))
+    post_form(srv, '/reencode-scan', {'path': '', 'row': '0'})
+    _s, _h, body = post_form(srv, '/reencode-scan-dismiss', {'path': '', 'row': '0'})
+    text = body.decode()
+    assert 'Find re-encodes' in text
+    assert 'btn-icon-scan' not in text
+
+
+def test_scan_dismiss_frees_the_job(srv, media_root, reencode_on, monkeypatch):
+    from simpleparty import jobs as sp_jobs
+    from simpleparty import routes as sp_routes
+    monkeypatch.setattr(sp_routes, '_scan_tree_for_reencode',
+                        lambda root, rel, job: job.update(found=[], running=False))
+    post_form(srv, '/reencode-scan', {'path': 'sub'})
+    assert sp_jobs.get_tree_scan_job(str((media_root / 'sub').resolve())) is not None
+    post_form(srv, '/reencode-scan-dismiss', {'path': 'sub'})
+    assert sp_jobs.get_tree_scan_job(str((media_root / 'sub').resolve())) is None
