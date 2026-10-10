@@ -824,6 +824,33 @@ def test_delete_by_tag_honors_starred_filter(srv, media_root):
     assert (media_root / 'b.mp4').exists()
 
 
+def test_delete_by_tag_spares_ai_suggested_matches(srv, media_root):
+    # b.mp4's "cat" is only an unreviewed suggestion: the filter shows it, but
+    # the bulk delete (and its count) must not treat it as tagged.
+    tags_file = media_root / '.simpleparty' / 'tags.json'
+    tags_file.write_text(json.dumps({
+        'a.mp4': {'tags': ['cat'], 'status': 'confirmed'},
+        'b.mp4': {'tags': ['cat'], 'status': 'suggested'},
+    }))
+    _, _, body = request(srv, 'GET', '/browse?path=&tags=cat')
+    assert 'Delete all (1)' in body.decode()
+    assert '1 shown with only AI-suggested tags will be kept' in body.decode()
+    status, _, _ = post_form(srv, '/delete-by-tag', {'path': '', 'tags': 'cat'})
+    assert status == 200
+    assert not (media_root / 'a.mp4').exists()
+    assert (media_root / 'b.mp4').exists()
+
+
+def test_delete_by_tag_without_tag_data_deletes_nothing(srv, media_root):
+    # The browse filter treats "no tag data" as "show everything"; a bulk
+    # delete must treat it as "matches nothing".
+    (media_root / '.simpleparty' / 'tags.json').unlink()
+    status, _, _ = post_form(srv, '/delete-by-tag', {'path': '', 'tags': 'cat'})
+    assert status == 200
+    assert (media_root / 'a.mp4').exists()
+    assert (media_root / 'b.mp4').exists()
+
+
 # --- Design-system guard tests ---
 
 def test_pages_have_no_emoji(srv):

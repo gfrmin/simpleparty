@@ -8,7 +8,7 @@ from pathlib import Path
 
 from simpleparty import __version__, jobs
 from simpleparty.icons import icon
-from simpleparty.library import _compute_related_videos, fscrypt_remedy, resolve_path
+from simpleparty.library import _compute_related_videos, bulk_delete_targets, fscrypt_remedy, resolve_path
 from simpleparty.state import CONFIG as _config
 from simpleparty.urls import ViewState, url_for_browse, url_for_play, url_for_shuffle, url_for_video
 
@@ -557,7 +557,7 @@ def render_tag_manager(rel_path, tags_map):
     return ''.join(pieces)
 
 
-def render_tag_filter(tags_map, view, path, filtered_count=None, lower_index=None):
+def render_tag_filter(tags_map, view, path, filtered_count=None, lower_index=None, delete_count=None):
     """Render tag filter: selected pills + searchable dropdown of viable tags."""
     if not tags_map:
         return ''
@@ -610,12 +610,19 @@ def render_tag_filter(tags_map, view, path, filtered_count=None, lower_index=Non
         pieces.append(
             f'<a class="tag-clear" href="{esc(clear_href)}" {_hx_browse(clear_href)}>Clear all</a>'
         )
-        if _config.get('allow_delete') and filtered_count:
+        if delete_count is None:
+            delete_count = filtered_count
+        if _config.get('allow_delete') and delete_count:
             tags_csv = ','.join(view.tags)
             tags_label = ', '.join(view.tags)
+            kept = (filtered_count or 0) - delete_count
+            kept_note = (
+                f' {kept} shown with only AI-suggested tags will be kept.'
+                if kept > 0 else ''
+            )
             confirm = (
-                f'Delete all {filtered_count} video'
-                f'{"" if filtered_count == 1 else "s"} tagged "{tags_label}"? '
+                f'Delete all {delete_count} video'
+                f'{"" if delete_count == 1 else "s"} tagged "{tags_label}"?{kept_note} '
                 'This cannot be undone.'
             )
             pieces.append(
@@ -626,7 +633,7 @@ def render_tag_filter(tags_map, view, path, filtered_count=None, lower_index=Non
                 + ('<input type="hidden" name="starred" value="1">' if view.starred else '') +
                 f'<button type="submit" class="btn-del" '
                 f'title="Delete all videos with these tags">'
-                f'{icon("trash")} Delete all ({filtered_count})</button>'
+                f'{icon("trash")} Delete all ({delete_count})</button>'
                 f'</form>'
             )
         pieces.append('</div>')
@@ -728,6 +735,9 @@ def render_browse_page(data, view, tags_map=None, lower_index=None, thumbs=froze
         tags_map, view, data['path'],
         filtered_count=len(data['videos']),
         lower_index=lower_index,
+        delete_count=len(bulk_delete_targets(
+            data['videos'], tags_map, lower_index, view.tags, view.starred,
+        )),
     )
     body += render_file_list(data, view, tags_map=tags_map, thumbs=thumbs)
     body += '</div></main>'

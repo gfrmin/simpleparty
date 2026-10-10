@@ -17,6 +17,7 @@ from simpleparty.library import (
     durations_from_tags,
     get_fscrypt_status,
     is_safe_rel_path,
+    bulk_delete_targets,
     filter_videos_by_starred,
     filter_videos_by_tags,
     find_video_idx,
@@ -552,8 +553,7 @@ def handle_delete_by_tag(handler, root):
 
     from simpleparty.tagger import load_tags_index, update_tags
     tags_map, lower_index = load_tags_index(resolved_dir)
-    targets = filter_videos_by_tags(data['videos'], lower_index, selected_tags)
-    targets = filter_videos_by_starred(targets, tags_map, starred_only)
+    targets = bulk_delete_targets(data['videos'], tags_map, lower_index, selected_tags, starred_only)
 
     removed = set()
     for video in targets:

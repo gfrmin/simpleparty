@@ -572,6 +572,28 @@ def filter_videos_by_starred(videos, tags_map, starred_only):
     return [v for v in videos if tags_map.get(v['name'], {}).get('starred')]
 
 
+def bulk_delete_targets(videos, tags_map, lower_index, selected_tags, starred_only):
+    """The videos a delete-by-tag may remove: those that really carry every
+    selected tag (and are starred, if that filter is on).
+
+    Stricter than the browse filter on purpose. A video whose tags are only
+    unreviewed AI suggestions is shown when filtering, but a suggestion is not
+    the user saying the video has that tag, so it is never deleted for it.
+    And no selected tags, or no tag data at all, matches nothing -- the browse
+    filter treats those as "show everything", which here would mean "delete
+    everything".
+    """
+    if not selected_tags or not tags_map or not lower_index:
+        return []
+    selected_lower = {t.lower() for t in selected_tags}
+    return [
+        v for v in videos
+        if selected_lower <= lower_index.get(v['name'], frozenset())
+        and tags_map.get(v['name'], {}).get('status', 'confirmed') != 'suggested'
+        and (not starred_only or tags_map.get(v['name'], {}).get('starred'))
+    ]
+
+
 def _compute_related_videos(data, idx, lower_index, max_results=8):
     """Return list of (video_index, shared_tag_count) for videos sharing tags with current."""
     if not lower_index:
