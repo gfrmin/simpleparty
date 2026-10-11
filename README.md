@@ -1,5 +1,9 @@
 # SimpleParty
 
+> **Archived (October 2026).** SimpleParty is no longer maintained. Its author now uses
+> [Stash](https://github.com/stashapp/stash), which does browsing, playback, tagging and
+> transcoding better. The last release, 0.13.1, is still on PyPI and still works.
+
 Easily enjoy your private video collection. Browse and play local video files from any device on your network. Zero dependencies.
 
 ## Features
